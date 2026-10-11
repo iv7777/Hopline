@@ -61,7 +61,7 @@ async function handleWebSocketProxy(request, cfg) {
     try {
       // 面板关闭 VLESS 后服务端也不再接受 VLESS 连接（XHTTP 走独立入口，由 enableXhttp 控制）
       if (cfg.enableVless === false) throw new Error('VLESS 协议未启用');
-      parsed = parseVlessHeader(pending, cfg);
+      parsed = parseVssProtoHeader(pending, cfg);
     } catch (err) {
       if (/头部过短/.test(err.message || '')) return;   // 等下一个分片
       throw err;
@@ -149,7 +149,7 @@ async function handleXhttpProxy(request, cfg) {
     const chunk = await bodyReader.read();
     if (chunk.done) return new Response('empty', { status: 400 });
     buf = buf.byteLength ? concatBytes(buf, chunk.value) : chunk.value;
-    try { parsed = parseVlessHeader(buf, cfg); }
+    try { parsed = parseVssProtoHeader(buf, cfg); }
     catch (err) {
       if (!/头部过短/.test(err.message || '')) throw err;
       if (buf.byteLength > 65536) throw new Error('握手头超过 64KB');

@@ -267,6 +267,10 @@ npm run lint            # eslint 静态检查（通过 npx 获取，仓库本身
 
 ## 更新日志
 
+### V2.5.2
+
+- 内部重构：函数 `vlessNode` / `parseVlessHeader` 更名为 `vssProtoNode` / `parseVssProtoHeader`，无功能变化；`vless://` 链接、各客户端配置里的协议名、配置字段 `enableVless` 均保持不变
+
 ### V2.5.1
 
 - **不再识别旧版短环境变量名**（不兼容变更）：`U`、`D`、`S`、`K`、`ECH`、`OUTBOUND` 与小写 `admin` 不再生效，升级前请把 Worker / Pages 中的变量改为 `UUID`、`PATH`、`OUTBOUND_PROXY`、`CONFIG_KV`、`ENABLE_ECH`、`ADMIN`；否则会因缺少必填项（`PATH` / `ADMIN`）或未绑定 KV 而无法打开面板

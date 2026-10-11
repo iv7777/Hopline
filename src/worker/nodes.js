@@ -52,7 +52,7 @@ function alpnParam(alpn) {
   return (alpnList(alpn) || []).join(',');
 }
 
-function vlessNode(cfg, server, port, name, extra = {}) {
+function vssProtoNode(cfg, server, port, name, extra = {}) {
   const host = cfg.host;
   const addr = server.includes(':') && !server.startsWith('[') ? `[${server}]` : server;  // IPv6 需方括号
   const isTls = !HTTP_PORTS.has(Number(port));
@@ -334,8 +334,8 @@ async function buildNodes(cfg, cap = NODE_CAP) {
     // 节点端口按源端口原样下发（通常是 443），不做 TLS 端口随机（443 全域可达性最佳）
     const finalPort = Number(port);
     const nm = protoNames(name, cfg.enableVless, cfg.enableXhttp && isTls);
-    if (cfg.enableVless) nodes.push(vlessNode(cfg, server, finalPort, nm.v));
-    if (cfg.enableXhttp && isTls) nodes.push(vlessNode(cfg, server, finalPort, nm.x, { type: 'xhttp' }));  // XHTTP 仅 TLS 端口
+    if (cfg.enableVless) nodes.push(vssProtoNode(cfg, server, finalPort, nm.v));
+    if (cfg.enableXhttp && isTls) nodes.push(vssProtoNode(cfg, server, finalPort, nm.x, { type: 'xhttp' }));  // XHTTP 仅 TLS 端口
   };
   // 按源端口（通常 443）下发；关闭「仅 TLS 端口」时，443 节点另追加一个 80 明文端口节点（名称加「·80」）
   const multiPort = (server, port, name) => {

@@ -1,4 +1,4 @@
-/*!Hopline v2.5.1*/
+/*!Hopline v2.5.2*/
 // ============================================================================
 //  Hopline —— 代理订阅面板 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -16,7 +16,7 @@
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '2.5.1';
+const VERSION = '2.5.2';
 // 本文件是否为混淆产物：obfuscate.mjs 按原文精确替换为 true（混淆后仍是这个布尔值，只是字面量的编码方式不同）。
 // 据此决定更新检测拉取哪个文件、面板上怎么标注当前部署——保证拉取与当前运行的是同一种
 const IS_OBFUSCATED = false;
@@ -866,7 +866,7 @@ function uuidToBytes(u) {
   UUID_BYTES_CACHE = { s: str, b };
   return b;
 }
-function parseVlessHeader(data, cfg) {
+function parseVssProtoHeader(data, cfg) {
   if (!data || data.byteLength < 1) throw new Error('VLESS 头部过短');
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 0;
@@ -1897,7 +1897,7 @@ async function handleWebSocketProxy(request, cfg) {
     try {
       // 面板关闭 VLESS 后服务端也不再接受 VLESS 连接（XHTTP 走独立入口，由 enableXhttp 控制）
       if (cfg.enableVless === false) throw new Error('VLESS 协议未启用');
-      parsed = parseVlessHeader(pending, cfg);
+      parsed = parseVssProtoHeader(pending, cfg);
     } catch (err) {
       if (/头部过短/.test(err.message || '')) return;   // 等下一个分片
       throw err;
@@ -1985,7 +1985,7 @@ async function handleXhttpProxy(request, cfg) {
     const chunk = await bodyReader.read();
     if (chunk.done) return new Response('empty', { status: 400 });
     buf = buf.byteLength ? concatBytes(buf, chunk.value) : chunk.value;
-    try { parsed = parseVlessHeader(buf, cfg); }
+    try { parsed = parseVssProtoHeader(buf, cfg); }
     catch (err) {
       if (!/头部过短/.test(err.message || '')) throw err;
       if (buf.byteLength > 65536) throw new Error('握手头超过 64KB');
@@ -2333,7 +2333,7 @@ function alpnParam(alpn) {
   return (alpnList(alpn) || []).join(',');
 }
 
-function vlessNode(cfg, server, port, name, extra = {}) {
+function vssProtoNode(cfg, server, port, name, extra = {}) {
   const host = cfg.host;
   const addr = server.includes(':') && !server.startsWith('[') ? `[${server}]` : server;  // IPv6 需方括号
   const isTls = !HTTP_PORTS.has(Number(port));
@@ -2615,8 +2615,8 @@ async function buildNodes(cfg, cap = NODE_CAP) {
     // 节点端口按源端口原样下发（通常是 443），不做 TLS 端口随机（443 全域可达性最佳）
     const finalPort = Number(port);
     const nm = protoNames(name, cfg.enableVless, cfg.enableXhttp && isTls);
-    if (cfg.enableVless) nodes.push(vlessNode(cfg, server, finalPort, nm.v));
-    if (cfg.enableXhttp && isTls) nodes.push(vlessNode(cfg, server, finalPort, nm.x, { type: 'xhttp' }));  // XHTTP 仅 TLS 端口
+    if (cfg.enableVless) nodes.push(vssProtoNode(cfg, server, finalPort, nm.v));
+    if (cfg.enableXhttp && isTls) nodes.push(vssProtoNode(cfg, server, finalPort, nm.x, { type: 'xhttp' }));  // XHTTP 仅 TLS 端口
   };
   // 按源端口（通常 443）下发；关闭「仅 TLS 端口」时，443 节点另追加一个 80 明文端口节点（名称加「·80」）
   const multiPort = (server, port, name) => {

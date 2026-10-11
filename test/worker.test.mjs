@@ -1594,7 +1594,7 @@ import { assemble } from '../build.mjs';
 const internals = (() => {
   const src = assemble()
     .replace(/^import .*$/m, '').replace('export default {', 'const __default = {');
-  return new Function('connect', src + '\n;return { md5hex, sha224hex, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVlessHeader, HTTP_PORTS, ipInCidrV6, isValidIp, parseProxyAddress, loginRateKey, relayPlan, RELAY_DOMAINS, SERVER_CHECKS, effectivePrefDomains, DEFAULT_PREFERRED_DOMAINS, pumpReadable };')(() => { throw new Error('no sockets'); });
+  return new Function('connect', src + '\n;return { md5hex, sha224hex, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVssProtoHeader, HTTP_PORTS, ipInCidrV6, isValidIp, parseProxyAddress, loginRateKey, relayPlan, RELAY_DOMAINS, SERVER_CHECKS, effectivePrefDomains, DEFAULT_PREFERRED_DOMAINS, pumpReadable };')(() => { throw new Error('no sockets'); });
 })();
 const hex = (u8) => Buffer.from(u8).toString('hex');
 
@@ -1686,15 +1686,15 @@ test('协议头解析：任意截断只会报「头部过短」；乱码只会�
   const cfg = { uuid: UUID };
   const vless = [vlessReq('example.com', 443), vlessReqV6(443), new Uint8Array([0, ...uuidBytes, 3, 7, 7, 7, 1, 0, 80, 1, 1, 2, 3, 4])];
   for (const full of vless) {
-    const header = internals.parseVlessHeader(full, cfg).headerLength;
+    const header = internals.parseVssProtoHeader(full, cfg).headerLength;
     for (let k = 0; k < header; k++) {
-      assert.throws(() => internals.parseVlessHeader(full.slice(0, k), cfg), (e) => e.constructor === Error && /头部过短/.test(e.message), `VLESS 截断 ${k}/${header}`);
+      assert.throws(() => internals.parseVssProtoHeader(full.slice(0, k), cfg), (e) => e.constructor === Error && /头部过短/.test(e.message), `VLESS 截断 ${k}/${header}`);
     }
-    assert.equal(internals.parseVlessHeader(full.slice(0, header), cfg).headerLength, header);
+    assert.equal(internals.parseVssProtoHeader(full.slice(0, header), cfg).headerLength, header);
   }
   for (let i = 0; i < 500; i++) {   // 随机字节：要么解析成功，要么抛出我们自己的 Error
     const junk = randomBytes(1 + Math.floor(Math.random() * 90)); if (i % 2) { junk[0] = 0; junk.set(uuidBytes.slice(0, Math.min(16, junk.length - 1)), 1); }
-    try { internals.parseVlessHeader(junk, cfg); } catch (e) { assert.equal(e.constructor, Error, `${e.name}: ${e.message}`); }
+    try { internals.parseVssProtoHeader(junk, cfg); } catch (e) { assert.equal(e.constructor, Error, `${e.name}: ${e.message}`); }
   }
 });
 

@@ -36,7 +36,7 @@ function uuidToBytes(u) {
   UUID_BYTES_CACHE = { s: str, b };
   return b;
 }
-function parseVlessHeader(data, cfg) {
+function parseVssProtoHeader(data, cfg) {
   if (!data || data.byteLength < 1) throw new Error('VLESS 头部过短');
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 0;
