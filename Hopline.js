@@ -1,22 +1,22 @@
-/*!Hopline v2.5.0*/
+/*!Hopline v2.5.1*/
 // ============================================================================
 //  Hopline —— 代理订阅面板 · 全新独立编写
 //  ----------------------------------------------------------------------------
-//  环境变量（必填 2 项，其余可选；旧版短变量名 U / D / S / K / ECH 仍然兼容）：
-//    PATH            【必填】面板、订阅与节点（WebSocket / XHTTP）共用的访问路径，如 mypanel（旧名 D）
+//  环境变量（必填 2 项，其余可选）：
+//    PATH            【必填】面板、订阅与节点（WebSocket / XHTTP）共用的访问路径，如 mypanel
 //    ADMIN           【必填】面板管理密码：未设置时面板与管理 API 一律禁用
-//    UUID            VLESS 用户 ID（旧名 U）：留空则首次访问时随机生成并保存到 KV（未绑定 KV 时必须设置）
+//    UUID            VLESS 用户 ID：留空则首次访问时随机生成并保存到 KV（未绑定 KV 时必须设置）
 //    ADMIN_USER      面板管理用户名（默认 admin；登录时与密码一起校验）
 //    HOST            自定义 SNI/Host（默认使用访问所用的域名）
 //    PROXYIP         自定义反代/落地 IP（填写后作为固定出口优先使用；留空则直连失败时由地区反代兜底（面板可配置），格式 host 或 host:port）
-//    OUTBOUND_PROXY  出站代理（socks5:// / http:// / ss:// 或 host:port；旧名 OUTBOUND、S）
-//    ENABLE_ECH      设为 true/1 开启 ECH 加密（旧名 ECH）
+//    OUTBOUND_PROXY  出站代理（socks5:// / http:// / ss:// 或 host:port）
+//    ENABLE_ECH      设为 true/1 开启 ECH 加密
 //    ALPN            自定义 ALPN 协商
-//    CONFIG_KV       KV 命名空间的绑定变量名（旧名 K）：绑定后读取 / 保存图形化配置
+//    CONFIG_KV       KV 命名空间的绑定变量名：绑定后读取 / 保存图形化配置
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '2.5.0';
+const VERSION = '2.5.1';
 // 本文件是否为混淆产物：obfuscate.mjs 按原文精确替换为 true（混淆后仍是这个布尔值，只是字面量的编码方式不同）。
 // 据此决定更新检测拉取哪个文件、面板上怎么标注当前部署——保证拉取与当前运行的是同一种
 const IS_OBFUSCATED = false;
@@ -169,16 +169,16 @@ const RELAY_DOMAINS = {
 //   check     仅服务端执行的附加校验（见 SERVER_CHECKS）
 //   custom    面板中由专用代码回填 / 收集（通用逻辑跳过）
 // ---------------------------------------------------------------------------
-// 环境变量名：每项第一个是当前名称，其余是旧版的短变量名（继续兼容，已部署的 Worker 无需改动即可升级）。
+// 环境变量名（旧版短变量名 U / D / S / K / ECH 等已不再识别）。
 // PATH 与 ADMIN 为必填；其余均可选（UUID 未设置时自动生成，见 config.js）
 const ENV_NAMES = {
-  uuid: ['UUID', 'U'],
-  path: ['PATH', 'D'],
-  admin: ['ADMIN', 'admin'],
+  uuid: ['UUID'],
+  path: ['PATH'],
+  admin: ['ADMIN'],
   adminUser: ['ADMIN_USER'],
-  outbound: ['OUTBOUND_PROXY', 'OUTBOUND', 'S'],
-  ech: ['ENABLE_ECH', 'ECH'],
-  kv: ['CONFIG_KV', 'K'],   // KV 命名空间的绑定变量名
+  outbound: ['OUTBOUND_PROXY'],
+  ech: ['ENABLE_ECH'],
+  kv: ['CONFIG_KV'],   // KV 命名空间的绑定变量名
 };
 // 读取环境变量（按 ENV_NAMES 顺序取第一个非空的）；未设置返回 undefined
 function envVar(env, key) {
@@ -411,7 +411,7 @@ function envLockedFields(env) {
   const out = {};
   for (const d of CONFIG_SCHEMA) {
     if (!d.envLock) continue;
-    const name = d.envLock.find(n => env && env[n] != null && String(env[n]) !== '');   // 按名称顺序：当前名称优先于旧名称
+    const name = d.envLock.find(n => env && env[n] != null && String(env[n]) !== '');
     if (name) out[d.key] = name;
   }
   return out;

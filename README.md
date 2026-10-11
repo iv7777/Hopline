@@ -98,22 +98,22 @@
 
 > 优先级：**KV 配置 > 环境变量 > 默认值**。环境变量只在面板里没有改成别的值时生效：面板保存时，与环境变量相同的值不会写入 KV（之后修改环境变量立即生效），改成不同的值才保存为覆盖。`PATH`、`ADMIN`、`ADMIN_USER` 设置后在面板中只读。
 >
-> **必填只有 `PATH` 与 `ADMIN` 两项**，其余全部可选。旧版的短变量名（`U`、`D`、`S`、`K`、`ECH`）仍然兼容；新旧名称同时存在时新名称优先。
+> **必填只有 `PATH` 与 `ADMIN` 两项**，其余全部可选。V2.5.1 起不再识别旧版短变量名（`U`、`D`、`S`、`K`、`ECH`、`OUTBOUND`、小写 `admin`），请改用下表中的名称。
 
 ### 3.1 环境变量
 
 | 变量 | 值 | 说明 |
 |---|---|---|
-| `PATH`（旧名 `D`） | 访问路径 | **必需**。面板、订阅（`/<PATH>/sub`）与节点（WebSocket / XHTTP）共用此路径；只能含字母、数字及 `. _ ~ -`，不能是 `login`、`version`；首尾的 `/` 自动去掉。修改后节点路径随之改变，客户端需重新更新订阅 |
-| `ADMIN`（旧名 `admin`） | 管理密码 | **必需**，未设置时面板与管理接口一律禁用 |
-| `UUID`（旧名 `U`） | 你的 UUID | 可选，VLESS 用户 ID（节点身份）。**留空则首次访问时随机生成并保存到 KV**，之后一直沿用，可在面板查看与修改；未绑定 KV 时没有地方保存，必须手动设置。面板里修改后以面板为准 |
+| `PATH` | 访问路径 | **必需**。面板、订阅（`/<PATH>/sub`）与节点（WebSocket / XHTTP）共用此路径；只能含字母、数字及 `. _ ~ -`，不能是 `login`、`version`；首尾的 `/` 自动去掉。修改后节点路径随之改变，客户端需重新更新订阅 |
+| `ADMIN` | 管理密码 | **必需**，未设置时面板与管理接口一律禁用 |
+| `UUID` | 你的 UUID | 可选，VLESS 用户 ID（节点身份）。**留空则首次访问时随机生成并保存到 KV**，之后一直沿用，可在面板查看与修改；未绑定 KV 时没有地方保存，必须手动设置。面板里修改后以面板为准 |
 | `ADMIN_USER` | 管理用户名 | 可选，登录时与密码一起校验（区分大小写），默认 `admin` |
 | `HOST` | 自定义 SNI / Host | 可选，节点的 SNI 与 WS Host；留空用访问所用的域名 |
-| `CONFIG_KV`（旧名 `K`） | KV 命名空间绑定 | 可选（推荐），在 Worker / Pages 设置里绑定 KV 命名空间时使用的变量名；绑定后面板配置才能保存 |
-| `ENABLE_ECH`（旧名 `ECH`） | true / 1 | 启用 ECH 加密客户端握手（开启后自动仅 TLS 端口） |
+| `CONFIG_KV` | KV 命名空间绑定 | 可选（推荐），在 Worker / Pages 设置里绑定 KV 命名空间时使用的变量名；绑定后面板配置才能保存 |
+| `ENABLE_ECH` | true / 1 | 启用 ECH 加密客户端握手（开启后自动仅 TLS 端口） |
 | `ALPN` | h2 / http/1.1 | ALPN 协商（逗号分隔），VLESS / XHTTP 链接、Clash、Sing-box 均按此下发；留空时 ws 用 http/1.1、XHTTP 用 h2 |
 | `PROXYIP` | host 或 host:port | 反代 / 落地 IP：填写后作为固定出口优先使用；留空则直连失败后由地区反代兜底 |
-| `OUTBOUND_PROXY`（旧名 `OUTBOUND`、`S`） | `socks5://` / `http(s)://` / `ss://` 地址，或 `user:pass@host:port` | 出站代理（SOCKS5 / HTTP(S) / Shadowsocks） |
+| `OUTBOUND_PROXY` | `socks5://` / `http(s)://` / `ss://` 地址，或 `user:pass@host:port` | 出站代理（SOCKS5 / HTTP(S) / Shadowsocks） |
 
 ### 3.2 面板配置项（保存于 KV，也是 `/api/config` 的字段名）
 
@@ -266,6 +266,10 @@ npm run lint            # eslint 静态检查（通过 npx 获取，仓库本身
 ---
 
 ## 更新日志
+
+### V2.5.1
+
+- **不再识别旧版短环境变量名**（不兼容变更）：`U`、`D`、`S`、`K`、`ECH`、`OUTBOUND` 与小写 `admin` 不再生效，升级前请把 Worker / Pages 中的变量改为 `UUID`、`PATH`、`OUTBOUND_PROXY`、`CONFIG_KV`、`ENABLE_ECH`、`ADMIN`；否则会因缺少必填项（`PATH` / `ADMIN`）或未绑定 KV 而无法打开面板
 
 ### V2.5.0
 

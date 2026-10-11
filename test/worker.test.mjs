@@ -340,29 +340,25 @@ test('UUID 可选的前提：没有 KV 就没处保存自动生成的 UUID，必
   assert.equal((await call(ok, `/${UUID}/api/config`, { cookie })).status, 200);
 });
 
-test('环境变量新名称与旧版短变量名都生效，新名称优先；面板提示锁定的是实际使用的变量名', async () => {
-  const names = { uuid: UUID2, PATH: 'newpath', OUTBOUND_PROXY: 'socks5://1.2.3.4:1080', ENABLE_ECH: 'true' };
-  const legacy = { U: UUID2, D: 'oldpath', S: 'socks5://5.6.7.8:1080', ECH: 'true' };
+test('环境变量：使用当前名称；旧版短变量名（U / D / S / K / ECH / OUTBOUND / admin）不再识别', async () => {
   const read = async (env, path) => {
     const cookie = await login(env, 'pw', path);
     return (await (await call(env, `/${path}/api/config`, { cookie })).json()).data;
   };
   const base = { UUID: undefined, PATH: undefined, ADMIN: 'pw', CONFIG_KV: kv() };
-  const a = await read({ ...base, UUID: UUID2, PATH: 'newpath', OUTBOUND_PROXY: names.OUTBOUND_PROXY, ENABLE_ECH: 'true' }, 'newpath');
+  const a = await read({ ...base, UUID: UUID2, PATH: 'newpath', OUTBOUND_PROXY: 'socks5://1.2.3.4:1080', ENABLE_ECH: 'true' }, 'newpath');
   assert.equal(a.uuid, UUID2); assert.equal(a.outboundProxy, 'socks5://1.2.3.4:1080'); assert.equal(a.ech, true);
   assert.equal(a.envLocked.path, 'PATH');
-  const b = await read({ ...base, ...legacy }, 'oldpath');
-  assert.equal(b.uuid, UUID2); assert.equal(b.outboundProxy, 'socks5://5.6.7.8:1080'); assert.equal(b.ech, true);
-  assert.equal(b.envLocked.path, 'D');
-  // 同时设置：新名称优先（OUTBOUND 是旧版别名）
-  const c = await read({ ...base, UUID: UUID2, U: UUID, PATH: 'newpath', D: 'oldpath', OUTBOUND_PROXY: 'socks5://1.1.1.1:1', OUTBOUND: 'socks5://2.2.2.2:2', S: 'socks5://3.3.3.3:3' }, 'newpath');
-  assert.equal(c.uuid, UUID2); assert.equal(c.outboundProxy, 'socks5://1.1.1.1:1');
-  const d = await read({ ...base, UUID: UUID2, PATH: 'p1', OUTBOUND: 'socks5://2.2.2.2:2' }, 'p1');
-  assert.equal(d.outboundProxy, 'socks5://2.2.2.2:2', '旧别名 OUTBOUND 仍然支持');
-  // KV 绑定：新旧变量名都可用
+  // 旧名称被忽略：UUID 另行生成、出站代理与 ECH 保持默认
+  const b = await read({ ...base, PATH: 'p1', U: UUID2, OUTBOUND: 'socks5://2.2.2.2:2', S: 'socks5://3.3.3.3:3', ECH: 'true' }, 'p1');
+  assert.notEqual(b.uuid, UUID2); assert.equal(b.outboundProxy, ''); assert.equal(b.ech, false);
+  // 旧名 D / admin 不再提供 PATH / ADMIN：面板仍未配置，无法登录
+  const unconfigured = baseEnv({ PATH: undefined, ADMIN: undefined, D: 'oldpath', admin: 'pw', CONFIG_KV: kv() });
+  assert.equal((await call(unconfigured, '/oldpath', {})).status === 200, false);
+  // KV 绑定只认 CONFIG_KV：旧名 K 不再绑定，面板显示未绑定
   const viaOld = baseEnv({ CONFIG_KV: undefined, K: kv({ config: { alpn: 'h2' } }) });
-  assert.equal((await read(viaOld, UUID)).alpn, 'h2');
-  assert.equal((await read(viaOld, UUID)).kv, true);
+  const o = await read(viaOld, UUID);
+  assert.equal(o.kv, false); assert.equal(o.alpn, '');
 });
 
 test('环境变量锁定的字段在面板只读、保存时忽略（问题 3）', async () => {

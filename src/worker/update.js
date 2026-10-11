@@ -1,4 +1,4 @@
-const VERSION = '2.5.0';
+const VERSION = '2.5.1';
 // 本文件是否为混淆产物：obfuscate.mjs 按原文精确替换为 true（混淆后仍是这个布尔值，只是字面量的编码方式不同）。
 // 据此决定更新检测拉取哪个文件、面板上怎么标注当前部署——保证拉取与当前运行的是同一种
 const IS_OBFUSCATED = false;

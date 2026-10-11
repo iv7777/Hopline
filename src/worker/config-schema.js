@@ -21,16 +21,16 @@
 //   check     仅服务端执行的附加校验（见 SERVER_CHECKS）
 //   custom    面板中由专用代码回填 / 收集（通用逻辑跳过）
 // ---------------------------------------------------------------------------
-// 环境变量名：每项第一个是当前名称，其余是旧版的短变量名（继续兼容，已部署的 Worker 无需改动即可升级）。
+// 环境变量名（旧版短变量名 U / D / S / K / ECH 等已不再识别）。
 // PATH 与 ADMIN 为必填；其余均可选（UUID 未设置时自动生成，见 config.js）
 const ENV_NAMES = {
-  uuid: ['UUID', 'U'],
-  path: ['PATH', 'D'],
-  admin: ['ADMIN', 'admin'],
+  uuid: ['UUID'],
+  path: ['PATH'],
+  admin: ['ADMIN'],
   adminUser: ['ADMIN_USER'],
-  outbound: ['OUTBOUND_PROXY', 'OUTBOUND', 'S'],
-  ech: ['ENABLE_ECH', 'ECH'],
-  kv: ['CONFIG_KV', 'K'],   // KV 命名空间的绑定变量名
+  outbound: ['OUTBOUND_PROXY'],
+  ech: ['ENABLE_ECH'],
+  kv: ['CONFIG_KV'],   // KV 命名空间的绑定变量名
 };
 // 读取环境变量（按 ENV_NAMES 顺序取第一个非空的）；未设置返回 undefined
 function envVar(env, key) {
@@ -263,7 +263,7 @@ function envLockedFields(env) {
   const out = {};
   for (const d of CONFIG_SCHEMA) {
     if (!d.envLock) continue;
-    const name = d.envLock.find(n => env && env[n] != null && String(env[n]) !== '');   // 按名称顺序：当前名称优先于旧名称
+    const name = d.envLock.find(n => env && env[n] != null && String(env[n]) !== '');
     if (name) out[d.key] = name;
   }
   return out;
