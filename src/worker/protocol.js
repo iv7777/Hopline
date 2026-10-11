@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// VLESS / Trojan 请求头解析
+// VLESS 请求头解析
 // ---------------------------------------------------------------------------
 function readAddress(data, view, offset, atyp) {
   // 数据不足一律抛「头部过短」：WS / XHTTP 据此继续等待后续分片，而不是因越界异常直接断开连接
@@ -63,40 +63,7 @@ function parseVlessHeader(data, cfg) {
   };
 }
 
-// Trojan 请求头：Password+CRLF(56) | Cmd(1) | Port(2) | Atyp(1) | Addr | CRLF(2)
-function parseTrojanHeader(data) {
-  if (!data || data.byteLength < 58 + 8) throw new Error('Trojan 头部过短');
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  let offset = 58;                             // 56 字节 SHA224 hex + CRLF
-  const command = view.getUint8(offset); offset += 1;   // CMD
-  const atyp = view.getUint8(offset); offset += 1;      // ATYP（Trojan 用 SOCKS5 编码：1=IPv4, 3=域名, 4=IPv6）
-  let addr, len;
-  const need = (n) => { if (offset + n > data.byteLength) throw new Error('Trojan 头部过短'); };
-  if (atyp === 1) {
-    need(4);
-    addr = `${view.getUint8(offset)}.${view.getUint8(offset + 1)}.${view.getUint8(offset + 2)}.${view.getUint8(offset + 3)}`;
-    len = 4;
-  } else if (atyp === 3) {
-    need(1);
-    const l = view.getUint8(offset);
-    need(1 + l);
-    addr = TD.decode(data.subarray(offset + 1, offset + 1 + l));
-    len = 1 + l;
-  } else if (atyp === 4) {
-    need(16);
-    addr = formatIPv6(data.subarray(offset, offset + 16));
-    len = 16;
-  } else {
-    throw new Error('无法识别的地址类型');
-  }
-  offset += len;
-  need(4);                                              // DST.PORT(2) + 尾部 CRLF(2)
-  const port = view.getUint16(offset); offset += 2;     // DST.PORT
-  offset += 2;                                    // 尾部 CRLF
-  return { command, port, addr, password: TD.decode(data.subarray(0, 56)), headerLength: offset };
-}
-
-// Trojan 协议密码使用 SHA-224（56 字节 hex）——Cloudflare WebCrypto 不支持 SHA-224，手写实现（SHA-256 结构 + SHA-224 初始值）
+// SHA-224（用于由 UUID 派生 Clash 配置的密钥）——Cloudflare WebCrypto 不支持 SHA-224，手写实现（SHA-256 结构 + SHA-224 初始值）
 const SHA256_K = [
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -149,19 +116,6 @@ function sha224hex(str) {
     hex += (v & 255).toString(16).padStart(2, '0');
   }
   return hex;
-}
-// Trojan 密码 SHA-224 摘要缓存：同一密码只计算一次，避免 WebSocket 每帧连接重复跑完整 SHA-224
-let _trojanPassC = '', _trojanHashC = '';
-function trojanPasswordHash(pass) {
-  if (pass !== _trojanPassC) { _trojanPassC = pass; _trojanHashC = sha224hex(pass); }
-  return _trojanHashC;
-}
-// Trojan 头判定：56 字节 SHA224 hex + CRLF；密码匹配或纯 hex 特征均可识别
-function detectTrojan(pending, cfg) {
-  if (!cfg.enableTrojan || !pending || pending.byteLength < 58) return false;
-  const head = pending.subarray(0, 56);
-  // 仅密码哈希匹配才视为 Trojan（不能放行任意 56 位十六进制）
-  return TD.decode(head).toLowerCase() === trojanPasswordHash(cfg.trojanPassword || cfg.uuid);
 }
 
 // DoH 端点池（UDP/DNS → DoH 转换用，使 V2rayNG 关闭「本地 DNS」时远端 DNS 仍可用）

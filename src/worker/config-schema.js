@@ -30,7 +30,6 @@ const ENV_NAMES = {
   adminUser: ['ADMIN_USER'],
   outbound: ['OUTBOUND_PROXY', 'OUTBOUND', 'S'],
   ech: ['ENABLE_ECH', 'ECH'],
-  trojan: ['ENABLE_TROJAN', 'TROJAN'],
   kv: ['CONFIG_KV', 'K'],   // KV 命名空间的绑定变量名
 };
 // 读取环境变量（按 ENV_NAMES 顺序取第一个非空的）；未设置返回 undefined
@@ -67,8 +66,6 @@ const CONFIG_SCHEMA = [
     pattern: HOSTNAME_PATTERN, hint: '请填写域名，如 node.example.com' },
   // ---- 协议开关 ----
   { key: 'enableVless', type: 'bool', def: true, el: 'en-vless', label: 'VLESS 协议' },
-  { key: 'enableTrojan', type: 'bool', def: false, el: 'en-trojan', label: 'Trojan 协议' },
-  { key: 'trojanPassword', type: 'string', def: '', el: 'tp-pass', label: 'Trojan 密码', trim: false, maxLen: 256, noExport: true },   // noExport：面板「导出配置」不含此项（与管理密码一样不落进备份文件）
   { key: 'enableXhttp', type: 'bool', def: true, el: 'en-xhttp', label: 'XHTTP 协议' },
   // ---- 传输参数 ----
   { key: 'alpn', type: 'string', def: '', el: 'alpn', label: 'ALPN', maxLen: 64,
@@ -311,7 +308,7 @@ function sanitizeConfigPatch(body, env) {
 // 跨字段校验（作用于合并后的完整配置）
 function crossCheckConfig(cfg) {
   const errors = [];
-  if (!cfg.enableVless && !cfg.enableTrojan && !cfg.enableXhttp) {
+  if (!cfg.enableVless && !cfg.enableXhttp) {
     errors.push({ field: 'enableVless', label: '协议开关', msg: '至少启用一种协议，否则订阅中没有任何节点' });
   }
   if (cfg.relay && cfg.relay.mode === 'custom' && !String(cfg.relay.custom || '').trim()) {

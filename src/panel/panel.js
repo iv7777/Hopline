@@ -235,7 +235,6 @@ function protoText(){
   if (!CFG) return '—';
   var a = [];
   if (CFG.enableVless !== false) a.push('VLESS');
-  if (CFG.enableTrojan) a.push('Trojan');
   if (CFG.enableXhttp) a.push('XHTTP');
   return a.length ? a.join(' / ') : '未启用';
 }
@@ -639,10 +638,10 @@ function loadRawPreview(){
       else if (/json/i.test(type)) n = (body.match(/"tag"/g) || []).length;
       else {
         var t = body;
-        if (!/^(vless|trojan|ss|xhttp):\/\//m.test(t)) {
+        if (!/^(vless|ss|xhttp):\/\//m.test(t)) {
           try { t = atob(t); } catch (e) { /* 保持原样 */ }
         }
-        n = t.split('\n').filter(function(l){ return /^(vless|trojan|ss|xhttp):\/\//.test(l.trim()); }).length;
+        n = t.split('\n').filter(function(l){ return /^(vless|ss|xhttp):\/\//.test(l.trim()); }).length;
       }
       $('prevCount').textContent = n + ' 个节点';
       $('prevBody').textContent = body.length > 2600 ? body.slice(0, 2600) + '\n…（已截断，完整内容请下载）' : body;
@@ -651,11 +650,11 @@ function loadRawPreview(){
 }
 // 解析单条节点链接：名称（# 后）、协议标签、地址:端口
 function parseNodeLink(link){
-  var m = /^(vless|trojan):\/\/[^@]*@(\[[^\]]+\]|[^:?#\/]+):(\d+)/.exec(link);
+  var m = /^vless:\/\/[^@]*@(\[[^\]]+\]|[^:?#\/]+):(\d+)/.exec(link);
   if (!m) return null;
   var hash = link.indexOf('#'), name = '';
   if (hash >= 0) { try { name = decodeURIComponent(link.slice(hash + 1)); } catch (e) { name = link.slice(hash + 1); } }
-  var proto = m[1] === 'trojan' ? 'Trojan' : (/[?&]type=xhttp(&|#|$)/.test(link) ? 'XHTTP' : 'VLESS');
+  var proto = /[?&]type=xhttp(&|#|$)/.test(link) ? 'XHTTP' : 'VLESS';
   return { link: link, name: name || (m[2] + ':' + m[3]), proto: proto, addr: m[2] + ':' + m[3] };
 }
 function loadNodeList(){

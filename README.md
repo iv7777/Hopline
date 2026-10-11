@@ -1,6 +1,6 @@
 # Hopline · 代理订阅面板
 
-> **Hopline —— 部署在 Cloudflare Workers / Pages 的代理订阅面板**，单文件同时实现 VLESS / Trojan / XHTTP 多协议代理与图形化配置：`/<PATH>` 进入面板，`/sub` 输出订阅；内置优选域名与在线优选 IP 来源、ECH 加密、落地与出站代理（含可配置的地区反代）及地区 / 运营商 / IP 版本多维筛选，只需设置 `PATH` 与 `ADMIN` 两个环境变量即可部署（UUID 等其余均可选），绑定 KV 后改完即生效。
+> **Hopline —— 部署在 Cloudflare Workers / Pages 的代理订阅面板**，单文件同时实现 VLESS / XHTTP 多协议代理与图形化配置：`/<PATH>` 进入面板，`/sub` 输出订阅；内置优选域名与在线优选 IP 来源、ECH 加密、落地与出站代理（含可配置的地区反代）及地区 / 运营商 / IP 版本多维筛选，只需设置 `PATH` 与 `ADMIN` 两个环境变量即可部署（UUID 等其余均可选），绑定 KV 后改完即生效。
 
 ---
 
@@ -8,21 +8,21 @@
 
 | 功能 | 说明 |
 |---|---|
-| **多协议** | VLESS / Trojan / XHTTP 三协议独立开关，可同时启用；Trojan 密码留空默认使用 UUID |
+| **多协议** | VLESS / XHTTP 两协议独立开关，可同时启用 |
 | **图形化面板** | 仪表盘 / 节点配置 / 优选配置 / 面板设置 / 关于项目，保存即生效，主题默认跟随系统，也可一键切换日间 / 夜间（见「四、面板使用」） |
 | **地址来源** | 原生地址、优选域名、在线优选 IP（HostMonit / uouin / 微测网 / 自定义 API），各自独立开关（见「五、地址来源与优选」） |
 | **地区与筛选** | 地区（全部 / 香港 / 台湾 / 美国 / 新加坡 / 日本 / 韩国 / 德国）+ IP 版本（IPv4 / IPv6）+ 运营商（移动 / 联通 / 电信）组合筛选；只剔除名称明确标记为未选项的节点，通用节点保留；筛选后为空时按 运营商 → IP 类型 → 地区 逐级放宽 |
 | **落地与出站** | 反代 / 落地 IP（填写后作为固定出口优先使用）+ 出站代理（SOCKS5 / HTTP(S) / Shadowsocks）+ 出站模式（默认 / 直连优先 / 仅走代理）；直连与出站都不通时由地区反代兜底 |
 | **地区反代** | 直连不通时使用：内置（按 Worker 机房自动选，可固定首选 / 次选地区）/ 仅使用自己的反代列表 / 关闭 |
 | **ECH 加密** | 自定义 ECH 域名 / ECH DNS（DoH），开启后自动进入仅 TLS 节点模式；链接类订阅与 Clash 订阅带 ECH 参数，Sing-box / Surge / Loon / Quantumult X 订阅不含 ECH |
-| **多客户端** | Clash / Mihomo、Sing-box、Surge、Surfboard、Loon、Quantumult X、v2rayN / Shadowrocket / Nekoray 等链接类客户端、Stash，按 UA 自动识别；订阅地址追加 `/clash`、`/stash`（同为 Clash 配置）、`/singbox`、`/surge`、`/surfboard`、`/loon`、`/quanx`、`/v2ray`、`/plain` 等后缀可强制指定格式 |
+| **多客户端** | Clash / Mihomo、Sing-box、Surge、Loon、Quantumult X、v2rayN / Shadowrocket / Nekoray 等链接类客户端、Stash，按 UA 自动识别；订阅地址追加 `/clash`、`/stash`（同为 Clash 配置）、`/singbox`、`/surge`、`/loon`、`/quanx`、`/v2ray`、`/plain` 等后缀可强制指定格式 |
 | **安全** | 加盐摘要的管理密码、登录限速、会话自动失效、安全响应头、路径伪装（见「六、性能与安全」） |
 
 ### 节点下发规则
 
 - **来源**：节点全部来自「原生地址（默认关）+ 优选域名 + 在线优选 IP」，IP 一律只保留 Cloudflare 段地址，不生成随机 IP，也不内置静态 IP 池
 - **端口**：默认只下发 TLS 端口节点（「节点配置 → 仅 TLS 端口」）；关闭后每个 443 节点另追加一个 80 明文节点（名称带「·80」），来源自带的 8080 / 2052 等明文端口原样下发；自定义域名使用明文节点需在 Cloudflare 关闭「始终使用 HTTPS」；开启 ECH 时始终只下发 TLS 端口节点
-- **XHTTP**：只出现在链接类与 Clash 订阅中；Sing-box / Surge / Surfboard / Loon / Quantumult X 没有 XHTTP 传输，一律不含。官方 sing-box 内核同样不支持 XHTTP
+- **XHTTP**：只出现在链接类与 Clash 订阅中；Sing-box / Surge / Loon / Quantumult X 没有 XHTTP 传输，一律不含。官方 sing-box 内核同样不支持 XHTTP
 - **Sing-box**：生成 sing-box 1.12+ 格式配置（二进制 .srs 规则集经 jsDelivr 下载）；GUI.for.SingBox 请用其「导入 sing-box 配置」插件导入订阅
 - **数量**：单次订阅最多 500 个节点（按免费计划 10ms CPU 限制设定），来源不足时按实际数量下发，不补足；不做轮询换新，来源数据不变时每次下发相同的节点
 
@@ -98,7 +98,7 @@
 
 > 优先级：**KV 配置 > 环境变量 > 默认值**。环境变量只在面板里没有改成别的值时生效：面板保存时，与环境变量相同的值不会写入 KV（之后修改环境变量立即生效），改成不同的值才保存为覆盖。`PATH`、`ADMIN`、`ADMIN_USER` 设置后在面板中只读。
 >
-> **必填只有 `PATH` 与 `ADMIN` 两项**，其余全部可选。旧版的短变量名（`U`、`D`、`S`、`K`、`ECH`、`TROJAN`）仍然兼容；新旧名称同时存在时新名称优先。
+> **必填只有 `PATH` 与 `ADMIN` 两项**，其余全部可选。旧版的短变量名（`U`、`D`、`S`、`K`、`ECH`）仍然兼容；新旧名称同时存在时新名称优先。
 
 ### 3.1 环境变量
 
@@ -111,9 +111,7 @@
 | `HOST` | 自定义 SNI / Host | 可选，节点的 SNI 与 WS Host；留空用访问所用的域名 |
 | `CONFIG_KV`（旧名 `K`） | KV 命名空间绑定 | 可选（推荐），在 Worker / Pages 设置里绑定 KV 命名空间时使用的变量名；绑定后面板配置才能保存 |
 | `ENABLE_ECH`（旧名 `ECH`） | true / 1 | 启用 ECH 加密客户端握手（开启后自动仅 TLS 端口） |
-| `ENABLE_TROJAN`（旧名 `TROJAN`） | true / 1 | 启用 Trojan 协议（默认禁用） |
-| `TROJAN_PASSWORD` | 自定义密码 | Trojan 密码，留空用 UUID |
-| `ALPN` | h2 / http/1.1 | ALPN 协商（逗号分隔），VLESS / Trojan / XHTTP 链接、Clash、Sing-box 均按此下发；留空时 ws 用 http/1.1、XHTTP 用 h2 |
+| `ALPN` | h2 / http/1.1 | ALPN 协商（逗号分隔），VLESS / XHTTP 链接、Clash、Sing-box 均按此下发；留空时 ws 用 http/1.1、XHTTP 用 h2 |
 | `PROXYIP` | host 或 host:port | 反代 / 落地 IP：填写后作为固定出口优先使用；留空则直连失败后由地区反代兜底 |
 | `OUTBOUND_PROXY`（旧名 `OUTBOUND`、`S`） | `socks5://` / `http(s)://` / `ss://` 地址，或 `user:pass@host:port` | 出站代理（SOCKS5 / HTTP(S) / Shadowsocks） |
 
@@ -125,8 +123,7 @@
 |---|---|
 | `uuid` / `adminUser` / `admin` / `host` | UUID / 管理用户名 / 管理密码 / 自定义 SNI·Host（同环境变量，面板可视化编辑；`admin` 只写不回显） |
 | `subUrl` | 自定义订阅路径：`/<别名>/sub` 输出订阅（别名下不开放面板与管理接口）；留空为 `/<UUID>/sub`。面板路径下的 `/sub` 始终可用 |
-| `enableVless` / `enableTrojan` / `enableXhttp` | 协议开关 VLESS / Trojan / XHTTP（默认 VLESS 与 XHTTP 开、Trojan 关） |
-| `trojanPassword` | Trojan 密码 |
+| `enableVless` / `enableXhttp` | 协议开关 VLESS / XHTTP（默认均开） |
 | `alpn` / `tlsOnly` | ALPN 协商 / 仅 TLS 端口节点（默认开启；关闭后 443 节点追加 80 明文节点） |
 | `ech` / `echHost` / `echDns` | ECH 开关 / 自定义 ECH 域名 / ECH DoH |
 | `filter.region` | 地区（多选数组）：`['all']` 或 HK / TW / US / SG / JP / KR / DE 的组合 |
@@ -145,7 +142,7 @@
 | 视图 | 说明 |
 |---|---|
 | **仪表盘** | 快速开始、订阅地址（格式选择 / 复制 / 二维码 / 下载 / 预览）、地区与线路筛选、运行状态 |
-| **节点配置** | 协议开关（VLESS / Trojan / XHTTP）、TLS 与 ALPN、ECH、落地与出站、内置地区反代 |
+| **节点配置** | 协议开关（VLESS / XHTTP）、TLS 与 ALPN、ECH、落地与出站、内置地区反代 |
 | **优选配置** | 优选域名（自定义 / 内置列表、测试）、优选 IP 来源（HostMonit / uouin / 微测网 / 自定义优选 API 1 / 2）及各来源的「测试」按钮 |
 | **面板设置** | UUID / 面板路径（由环境变量 `PATH` 提供，只读）/ 订阅路径别名 / 管理用户名 / 管理密码 / 绑定域名、配置导出导入、退出登录、重置 |
 | **关于项目** | 调用的外部接口清单 |
@@ -186,7 +183,7 @@
 
 ### 5.3 节点命名与地区
 
-- 同时开启多种协议时，同一地址的 Trojan 节点名加「.T」、XHTTP 加「.X」（VLESS 保持原名）；不同地址同名时依次加「·2」「·3」，所有格式的节点名唯一
+- 同时开启多种协议时，同一地址的 XHTTP 节点名加「.X」（VLESS 保持原名）；不同地址同名时依次加「·2」「·3」，所有格式的节点名唯一
 - 优选域名节点命名为「优选域名-XX」；优选 IP 来源中无法确定地区的统一为「优选IP-XX」（IPv6 域名解析结果为「优选IP-V6-XX」）；数据源自定义名称（如 `JP-A-147`）原样保留
 - 带地区标记的数据行（如「IP:端口#地区随机 \| 香港 HK」）显示中文地区名：香港 / 台湾 / 日本 / 美国 / 新加坡 / 韩国 / 德国
 - 「节点地区」筛选只剔除名称明确标记为其它地区的节点。内置来源都是不带地区的 Cloudflare 任播 IP / 域名（落地机房取决于客户端网络），地区筛选通常不改变其节点构成；需要按地区挑选请让自定义优选 API 返回带地区名的来源
@@ -229,7 +226,7 @@
 | 路径 | 内容 |
 |---|---|
 | `src/worker.js` | 入口：环境变量说明与 `// @include worker/xxx.js` 清单，构建时按顺序拼接 |
-| `src/worker/*.js` | 服务端逻辑，按主题拆分：`config-schema`（字段表 `CONFIG_SCHEMA`）、`config`（加载 / 保存）、`protocol`（VLESS / Trojan 头、DoH）、`outbound-proxies` / `relay`（出站与反代）、`proxy`（WS / XHTTP）、`ip-sources` / `nodes`（优选来源与节点生成）、`formats`（各客户端格式）、`subscription`、`router`（鉴权、路由、管理 API）等 |
+| `src/worker/*.js` | 服务端逻辑，按主题拆分：`config-schema`（字段表 `CONFIG_SCHEMA`）、`config`（加载 / 保存）、`protocol`（VLESS 头、DoH）、`outbound-proxies` / `relay`（出站与反代）、`proxy`（WS / XHTTP）、`ip-sources` / `nodes`（优选来源与节点生成）、`formats`（各客户端格式）、`subscription`、`router`（鉴权、路由、管理 API）等 |
 | `src/panel/panel.html` | 管理面板页面结构（`@include` 引入样式与脚本） |
 | `src/panel/panel.css` | 面板样式（日间 / 夜间主题） |
 | `src/panel/panel.js` | 面板前端脚本（由字段表驱动的表单回填、收集、校验与错误提示） |
@@ -269,6 +266,12 @@ npm run lint            # eslint 静态检查（通过 npx 获取，仓库本身
 ---
 
 ## 更新日志
+
+### V2.5.0
+
+- **移除 Trojan 协议**（不兼容变更）：服务端不再接受 Trojan 连接，订阅与所有客户端格式中不再生成 `trojan://` 节点；面板的 Trojan 开关与密码、环境变量 `ENABLE_TROJAN`（旧名 `TROJAN`）与 `TROJAN_PASSWORD`、配置字段 `enableTrojan` / `trojanPassword` 一并删除。KV 里遗留的这两个字段与这些环境变量会被忽略，无需清理；仍在使用 Trojan 节点的客户端更新订阅后需改用 VLESS（或 XHTTP）
+- **移除 Surfboard 订阅格式**：该格式只能使用 Trojan 节点，没有 Trojan 后无节点可下发，因此 `/surfboard` 与 UA 自动识别一并删除（`/sub/surfboard` 与未知后缀一样回落为通用链接列表）
+- 同一地址同时启用 VLESS 与 XHTTP 时，节点名规则不变（XHTTP 加「.X」）；「至少启用一种协议」的校验改为 VLESS 或 XHTTP 至少一个
 
 ### V2.4.6
 

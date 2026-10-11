@@ -76,7 +76,7 @@ test('GET /api/config 返回字段表默认值（与旧 DEFAULT_CONFIG 一致）
   const d = r.data;
   // 默认值（filter.region 为 ['all']，src 为面板保存的地址来源默认值）；XHTTP 默认开启，IP 类型默认只有 IPv4
   const legacy = {
-    host: '', enableVless: true, enableTrojan: false, trojanPassword: '', enableXhttp: true,
+    host: '', enableVless: true, enableXhttp: true,
     alpn: '', ech: false, echHost: 'cloudflare-ech.com', echDns: '', tlsOnly: true,
     proxyIP: '', outboundProxy: '', outboundMode: '',
     filter: { region: ['all'], ipType: ['IPv4'], isp: ['移动', '联通', '电信'] },
@@ -127,7 +127,7 @@ test('字段校验：范围、枚举、格式、全部协议关闭', async () =>
     [{ outboundProxy: 'ss://rc4:pw@1.2.3.4:8388' }, 'outboundProxy'],
     [{ prefDomains: 'a.example.com:443' }, 'prefDomains'],
     [{ filter: { region: ['XX'] } }, 'filter.region'],
-    [{ enableVless: false, enableTrojan: false, enableXhttp: false }, 'enableVless'],
+    [{ enableVless: false, enableXhttp: false }, 'enableVless'],
   ];
   for (const [body, field] of cases) {
     const res = await call(env, `/${UUID}/api/config`, { method: 'POST', cookie, body });
@@ -289,9 +289,9 @@ test('面板路径只认 PATH：节点路径为 /<PATH>，UUID 仅作节点身�
 
 test('绑定域名留空时 SNI / Host 取访问域名；填写后用绑定域名（链接、Clash、sing-box 均如此）', async () => {
   const sub = (env, ua, fmt = '') => withFetch(nodesFetch, async () => (await (await call(env, `/${UUID}/sub${fmt}`, { ua })).text()));
-  const blank = baseEnv({ CONFIG_KV: kv({ config: customCfg({ enableTrojan: true }) }) });
-  const links = (await sub(blank, 'v2rayN/7.0')).split('\n').filter(l => /^(vless|trojan):\/\//.test(l));
-  assert.ok(links.some(l => l.startsWith('vless://')) && links.some(l => l.startsWith('trojan://')));
+  const blank = baseEnv({ CONFIG_KV: kv({ config: customCfg() }) });
+  const links = (await sub(blank, 'v2rayN/7.0')).split('\n').filter(l => /^vless:\/\//.test(l));
+  assert.ok(links.length > 0);
   for (const l of links) {
     assert.match(l, /[?&]sni=node\.example\.com(&|#)/, l);
     assert.match(l, /[?&]host=node\.example\.com(&|#)/, l);
@@ -341,18 +341,18 @@ test('UUID 可选的前提：没有 KV 就没处保存自动生成的 UUID，必
 });
 
 test('环境变量新名称与旧版短变量名都生效，新名称优先；面板提示锁定的是实际使用的变量名', async () => {
-  const names = { uuid: UUID2, PATH: 'newpath', OUTBOUND_PROXY: 'socks5://1.2.3.4:1080', ENABLE_ECH: 'true', ENABLE_TROJAN: '1' };
-  const legacy = { U: UUID2, D: 'oldpath', S: 'socks5://5.6.7.8:1080', ECH: 'true', TROJAN: 'true' };
+  const names = { uuid: UUID2, PATH: 'newpath', OUTBOUND_PROXY: 'socks5://1.2.3.4:1080', ENABLE_ECH: 'true' };
+  const legacy = { U: UUID2, D: 'oldpath', S: 'socks5://5.6.7.8:1080', ECH: 'true' };
   const read = async (env, path) => {
     const cookie = await login(env, 'pw', path);
     return (await (await call(env, `/${path}/api/config`, { cookie })).json()).data;
   };
   const base = { UUID: undefined, PATH: undefined, ADMIN: 'pw', CONFIG_KV: kv() };
-  const a = await read({ ...base, UUID: UUID2, PATH: 'newpath', OUTBOUND_PROXY: names.OUTBOUND_PROXY, ENABLE_ECH: 'true', ENABLE_TROJAN: '1' }, 'newpath');
-  assert.equal(a.uuid, UUID2); assert.equal(a.outboundProxy, 'socks5://1.2.3.4:1080'); assert.equal(a.ech, true); assert.equal(a.enableTrojan, true);
+  const a = await read({ ...base, UUID: UUID2, PATH: 'newpath', OUTBOUND_PROXY: names.OUTBOUND_PROXY, ENABLE_ECH: 'true' }, 'newpath');
+  assert.equal(a.uuid, UUID2); assert.equal(a.outboundProxy, 'socks5://1.2.3.4:1080'); assert.equal(a.ech, true);
   assert.equal(a.envLocked.path, 'PATH');
   const b = await read({ ...base, ...legacy }, 'oldpath');
-  assert.equal(b.uuid, UUID2); assert.equal(b.outboundProxy, 'socks5://5.6.7.8:1080'); assert.equal(b.ech, true); assert.equal(b.enableTrojan, true);
+  assert.equal(b.uuid, UUID2); assert.equal(b.outboundProxy, 'socks5://5.6.7.8:1080'); assert.equal(b.ech, true);
   assert.equal(b.envLocked.path, 'D');
   // 同时设置：新名称优先（OUTBOUND 是旧版别名）
   const c = await read({ ...base, UUID: UUID2, U: UUID, PATH: 'newpath', D: 'oldpath', OUTBOUND_PROXY: 'socks5://1.1.1.1:1', OUTBOUND: 'socks5://2.2.2.2:2', S: 'socks5://3.3.3.3:3' }, 'newpath');
@@ -508,19 +508,19 @@ test('检测更新（混淆部署）：按部署类型自动切换为仓库 obf_
 });
 
 // ---------------- 优选 IP 来源与下发 ----------------
-const subLinks = async (env) => (await (await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).text()).split('\n').filter(l => /^(vless|trojan):\/\//.test(l));
+const subLinks = async (env) => (await (await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).text()).split('\n').filter(l => /^vless:\/\//.test(l));
 const hostOf = (l) => l.match(/@(\[[^\]]+\]|[^:?]+)/)[1];
 const nameOf = (l) => decodeURIComponent(l.slice(l.indexOf('#') + 1));
 
 test('单次订阅最多下发 500 个节点，每次下发相同（不再轮询换新）', async () => {
-  // 两个自定义 API 各提供 200 个 CF IP，VLESS + Trojan 共 800 个节点：截断到 500
+  // 两个自定义 API 各提供 200 个 CF IP，VLESS + XHTTP 共 800 个节点：截断到 500
   const pool = (n) => Array.from({ length: 200 }, (_, i) => '104.16.' + n + '.' + (i + 1)).join('\n');
   const offline = globalThis.fetch;
   globalThis.fetch = async (url) => {
     const m = String(url).match(/^https:\/\/pool\.example\.com\/cap(\d)\.txt$/);
     return m ? new Response(pool(10 + Number(m[1]))) : new Response('Not Found', { status: 404 });
   };
-  const env = baseEnv({ CONFIG_KV: kv({ config: { enableTrojan: true, filter: { ipType: ['IPv4'] }, src: { prefDomain: false },
+  const env = baseEnv({ CONFIG_KV: kv({ config: { enableXhttp: true, filter: { ipType: ['IPv4'] }, src: { prefDomain: false },
     ipsrc: { hostmonit: false, uouin: false, api1: true, api1Url: 'https://pool.example.com/cap1.txt', api2: true, api2Url: 'https://pool.example.com/cap2.txt' } } }) });
   try {
     const a = await subLinks(env);
@@ -1106,17 +1106,16 @@ test('明文端口 WebSocket（http://）不再被重定向到 https；普通 ht
   assert.equal(page.status, 301);
 });
 
-test('订阅：TLS ws 节点带 ed=2048、ALPN 随面板下发；多协议时 Trojan / XHTTP 名称加 .T / .X，节点名全局唯一', async () => {
+test('订阅：TLS ws 节点带 ed=2048、ALPN 随面板下发；多协议时 XHTTP 名称加 .X，节点名全局唯一', async () => {
   // 优选 API 返回的两条地址dup（名称按来源原样使用）
-  const env = baseEnv({ CONFIG_KV: kv({ config: fixedNodes('104.16.9.1:443#dup\n104.16.9.2:443#dup', { enableTrojan: true, enableXhttp: true, alpn: 'h2, http/1.1' }) }) });
+  const env = baseEnv({ CONFIG_KV: kv({ config: fixedNodes('104.16.9.1:443#dup\n104.16.9.2:443#dup', { enableXhttp: true, alpn: 'h2, http/1.1' }) }) });
   const get = (fmt) => withFetch(nodesFetch, async () => (await call(env, `/${UUID}/sub/${fmt}`, { ua: 'x' })).text());
   const links = (await get('plain')).split('\n').filter(Boolean);
-  assert.deepEqual(links.map(nameOf), ['dup', 'dup.T', 'dup.X', 'dup·2', 'dup.T·2', 'dup.X·2']);
-  const [v, t, x] = links;
+  assert.deepEqual(links.map(nameOf), ['dup', 'dup.X', 'dup·2', 'dup.X·2']);
+  const [v, x] = links;
   assert.match(v, /path=%2F[0-9a-f-]+%3Fed%3D2048&/, 'VLESS ws 带 ed=2048');
-  assert.match(t, /path=%2F[0-9a-f-]+%3Fed%3D2048/, 'Trojan ws 带 ed=2048');
   assert.ok(!/ed%3D2048/.test(x), 'XHTTP 不带 ed');
-  for (const l of [v, t, x]) assert.match(l, /&alpn=h2,http\/1\.1(&|#)/, 'ALPN 原样逗号分隔');
+  for (const l of [v, x]) assert.match(l, /&alpn=h2,http\/1\.1(&|#)/, 'ALPN 原样逗号分隔');
   // Clash：ws-opts.path 带 ed=2048，alpn 取面板设置，GEOSITE 数据源与规则
   const clash = await get('clash');
   assert.match(clash, /path: "\/[0-9a-f-]+\?ed=2048"/);
@@ -1126,7 +1125,7 @@ test('订阅：TLS ws 节点带 ed=2048、ALPN 随面板下发；多协议时 Tr
   // sing-box：tag 唯一、无 xhttp（官方内核不支持）、early data 用字段声明而非 path、二进制规则集
   const sb = JSON.parse(await get('singbox'));
   const nodes = sb.outbounds.filter(o => o.server);
-  assert.deepEqual(nodes.map(o => o.tag), ['dup', 'dup.T', 'dup·2', 'dup.T·2']);
+  assert.deepEqual(nodes.map(o => o.tag), ['dup', 'dup·2']);
   const tags = sb.outbounds.map(o => o.tag);
   assert.equal(new Set(tags).size, tags.length, 'outbound tag 不重复');
   assert.ok(nodes.every(o => o.transport.type === 'ws' && o.transport.max_early_data === 2048 && !o.transport.path.includes('?')));
@@ -1140,8 +1139,8 @@ test('订阅：TLS ws 节点带 ed=2048、ALPN 随面板下发；多协议时 Tr
 const subOf = (env, fmt, ua = 'x') => withFetch(nodesFetch, async () => call(env, `/${UUID}/sub/${fmt}`, { ua }));
 const customCfg = (extra) => fixedNodes('104.16.9.1:443#a', extra);   // 一个固定节点「a」
 
-test('明文端口 Trojan 节点在 Clash / sing-box / QuanX / Surge 中不启用 TLS（security=none）', async () => {
-  const env = baseEnv({ CONFIG_KV: kv({ config: customCfg({ enableVless: false, enableTrojan: true, tlsOnly: false }) }) });
+test('明文端口节点在 Clash / sing-box / QuanX / Surge 中不启用 TLS（security=none）', async () => {
+  const env = baseEnv({ CONFIG_KV: kv({ config: customCfg({ enableXhttp: false, tlsOnly: false }) }) });
   const clash = await (await subOf(env, 'clash')).text();
   const block = clash.split('\n  - name:').find(b => b.includes('a·80'));
   assert.ok(block && /port: 80\n/.test(block));
@@ -1151,26 +1150,14 @@ test('明文端口 Trojan 节点在 Clash / sing-box / QuanX / Surge 中不启�
   assert.equal(sb.outbounds.find(o => o.server_port === 80).tls.enabled, false);
   assert.equal(sb.outbounds.find(o => o.server_port === 443).tls.enabled, true);
   const qx = await (await subOf(env, 'quanx')).text();
-  assert.match(qx, /trojan=104\.16\.9\.1:80, password=[^,]+, over-tls=false, obfs=ws,/);
-  assert.match(qx, /trojan=104\.16\.9\.1:443, password=[^,]+, over-tls=true,/);
+  assert.match(qx, /vless=104\.16\.9\.1:80, method=none, password=[^,]+, obfs=ws,/);
+  assert.match(qx, /vless=104\.16\.9\.1:443, method=none, password=[^,]+, obfs=wss,/);
   const surge = await (await subOf(env, 'surge')).text();
-  assert.match(surge, /a·80 = trojan, 104\.16\.9\.1, 80, .*tls=false/);
-});
-
-test('Surfboard：只输出 Trojan TLS 节点并使用服务端的 Trojan 密码；未启用 Trojan 时明确报错', async () => {
-  const on = baseEnv({ CONFIG_KV: kv({ config: customCfg({ enableVless: true, enableTrojan: true, trojanPassword: 'tp-secret' }) }) });
-  const body = await (await subOf(on, 'surfboard')).text();
-  const proxies = body.split('[Proxy]\n')[1].split('\n\n')[0].split('\n');
-  assert.equal(proxies.length, 1, '不再把 VLESS 节点改写成 Trojan 重复下发');
-  assert.match(proxies[0], /^a\.T = trojan, 104\.16\.9\.1, 443, password=tp-secret,/);
-  const off = baseEnv({ CONFIG_KV: kv({ config: customCfg({ enableTrojan: false }) }) });
-  const res = await subOf(off, 'surfboard');
-  assert.equal(res.status, 500);
-  assert.match(await res.text(), /Surfboard 只支持 Trojan/);
+  assert.match(surge, /a·80 = vless, 104\.16\.9\.1, 80, .*tls=false/);
 });
 
 test('sing-box：仅启用 XHTTP（无可用节点）时报错，而不是输出空 selector 的无效配置', async () => {
-  const env = baseEnv({ CONFIG_KV: kv({ config: customCfg({ enableVless: false, enableTrojan: false, enableXhttp: true }) }) });
+  const env = baseEnv({ CONFIG_KV: kv({ config: customCfg({ enableVless: false, enableXhttp: true }) }) });
   const res = await subOf(env, 'singbox');
   assert.equal(res.status, 500);
   assert.match(await res.text(), /不支持 XHTTP/);
@@ -1180,10 +1167,10 @@ test('sing-box：仅启用 XHTTP（无可用节点）时报错，而不是输出
   assert.ok(sb.outbounds[0].outbounds.length > 0);
 });
 
-test('原生地址节点同样遵循多协议命名（Trojan .T / XHTTP .X）', async () => {
-  const env = baseEnv({ CONFIG_KV: kv({ config: { enableTrojan: true, enableXhttp: true, src: { native: true, prefDomain: false, prefIp: false }, filter: { ipType: ['IPv4'] } } }) });
+test('原生地址节点同样遵循多协议命名（XHTTP .X）', async () => {
+  const env = baseEnv({ CONFIG_KV: kv({ config: { enableXhttp: true, src: { native: true, prefDomain: false, prefIp: false }, filter: { ipType: ['IPv4'] } } }) });
   const links = (await (await subOf(env, 'plain')).text()).split('\n').filter(Boolean);
-  assert.deepEqual(links.filter(l => nameOf(l).startsWith('原生地址')).map(nameOf), ['原生地址', '原生地址.T', '原生地址.X']);
+  assert.deepEqual(links.filter(l => nameOf(l).startsWith('原生地址')).map(nameOf), ['原生地址', '原生地址.X']);
 });
 
 const ipv6Bytes = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];   // 2001:db8::1
@@ -1217,7 +1204,7 @@ test('出站代理：密码含未编码 @ 时主机名解析正确；SOCKS5 对 
   assert.match(Buffer.from(log[0].written[0]).toString(), /^CONNECT \[2001:db8::1\]:443 HTTP\/1\.1\r\nHost: \[2001:db8::1\]:443\r\n/);
 });
 
-test('协议头：地址被截断时等待后续分片（不按错误地址建连、不断开）；Trojan UDP / VLESS MUX 命令被拒绝', async () => {
+test('协议头：地址被截断时等待后续分片（不按错误地址建连、不断开）；VLESS MUX 命令被拒绝；Trojan 握手不再被接受', async () => {
   const log = fakeNet({ 'split.example': { delay: 5 } });
   await withFetch(relayDoh, async () => {
     // 域名只到一半：旧实现会把截断的域名当目标
@@ -1237,24 +1224,31 @@ test('协议头：地址被截断时等待后续分片（不按错误地址建�
     await w2.emit('message', { data: mux.buffer });
     assert.equal(w2.closed.code, 1011);
     assert.match(w2.closed.reason, /不支持的命令/);
-    // Trojan UDP ASSOCIATE（cmd=3）
+    // Trojan 已移除：即使客户端发来密码哈希正确的 Trojan 握手也只会被当作无效的 VLESS 头而拒绝，不建立任何出站连接
     const hex = createHash('sha224').update(UUID).digest('hex');
-    const trojan = (cmd) => new Uint8Array([...Buffer.from(hex + '\r\n'), cmd, 3, 9, ...Buffer.from('x.example'), 1, 187, 13, 10, ...TLS_HELLO]);
-    const envT = baseEnv({ CONFIG_KV: kv({ config: { enableTrojan: true } }) });
-    const w3 = await openWs(envT);
-    await w3.emit('message', { data: trojan(3).buffer });
-    assert.equal(w3.closed.code, 1011);
+    const trojan = new Uint8Array([...Buffer.from(hex + '\r\n'), 1, 3, 9, ...Buffer.from('x.example'), 1, 187, 13, 10, ...TLS_HELLO]);
     const n = log.length;
-    const w4 = await openWs(envT);   // TCP（cmd=1）仍正常
-    await w4.emit('message', { data: trojan(1).buffer });
-    await until(() => log.length > n);
-    assert.equal(log[n].hostname, 'x.example');
+    const w3 = await openWs(baseEnv());
+    await w3.emit('message', { data: trojan.buffer });
+    assert.equal(w3.closed.code, 1011);
+    assert.equal(log.length, n);
   });
 });
 
-test('面板关闭 VLESS 后服务端不再接受 VLESS WebSocket 连接（Trojan 不受影响）', async () => {
+test('Trojan 已移除：KV 中遗留的 enableTrojan / trojanPassword 与旧环境变量被忽略，订阅里没有 trojan 节点，配置接口不再返回这些字段', async () => {
+  const env = baseEnv({ ENABLE_TROJAN: 'true', TROJAN: 'true', TROJAN_PASSWORD: 'x',
+    CONFIG_KV: kv({ config: customCfg({ enableTrojan: true, trojanPassword: 'legacy' }) }) });
+  const body = await withFetch(nodesFetch, async () => (await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).text());
+  assert.ok(body.includes('vless://') && !body.includes('trojan'));
+  const data = (await (await call(env, `/${UUID}/api/config`, { cookie: await login(env) })).json()).data;
+  assert.equal('enableTrojan' in data, false);
+  assert.equal('trojanPassword' in data, false);
+  assert.equal((await subOf(env, 'surfboard')).status, 200, 'Surfboard 专用格式已移除：与未知后缀一样回落为通用链接列表');
+});
+
+test('面板关闭 VLESS 后服务端不再接受 VLESS WebSocket 连接', async () => {
   const log = fakeNet({ 'x.example': { delay: 5 } });
-  const env = baseEnv({ CONFIG_KV: kv({ config: { enableVless: false, enableTrojan: true } }) });
+  const env = baseEnv({ CONFIG_KV: kv({ config: { enableVless: false } }) });
   const ws = await openWs(env);
   await ws.emit('message', { data: vlessReq('x.example', 443, TLS_HELLO).buffer });
   assert.equal(ws.closed.code, 1011);
@@ -1394,14 +1388,14 @@ test('登录加固：/login 与 /version 对不知道面板路径的人返回 40
 });
 
 test('环境变量提供的值不会因为一次保存被固化进 KV；面板改成不同的值才保存为覆盖', async () => {
-  const env = baseEnv({ ADMIN: undefined, PROXYIP: 'relay.example.com:443', TROJAN: 'true', TROJAN_PASSWORD: 'env-tp', ALPN: 'h2',
+  const env = baseEnv({ ADMIN: undefined, PROXYIP: 'relay.example.com:443', ALPN: 'h2',
     CONFIG_KV: kv({ config: { admin: 'pw' } }) });
   const first = await call(env, `/${UUID}/api/config`, { method: 'POST', cookie: await login(env), body: { tlsOnly: false } });
   const r = await first.json();
   assert.equal(r.ok, true);
   const cookie = first.headers.get('Set-Cookie').split(';')[0];   // 旧版明文密码升级为摘要后登录态重新签发
   const s = stored(env);
-  for (const k of ['proxyIP', 'enableTrojan', 'trojanPassword', 'alpn', 'uuid']) assert.equal(k in s, false, `${k} 不应固化进 KV`);
+  for (const k of ['proxyIP', 'alpn', 'uuid']) assert.equal(k in s, false, `${k} 不应固化进 KV`);
   assert.equal(s.tlsOnly, false, '面板里改动的其它项正常保存');
   // 环境变量之后变更，立即生效（KV 中没有旧快照）
   const later = { ...env, PROXYIP: 'new-relay.example.com:443' };
@@ -1412,7 +1406,6 @@ test('环境变量提供的值不会因为一次保存被固化进 KV；面板�
   await call(env, `/${UUID}/api/config`, { method: 'POST', cookie, body: { proxyIP: 'mine.example.com:443', alpn: 'http/1.1' } });
   assert.equal(stored(env).proxyIP, 'mine.example.com:443');
   assert.equal(stored(env).alpn, 'http/1.1');
-  assert.equal('trojanPassword' in stored(env), false);
 });
 
 test('页面安全头：面板 / 登录页带 CSP、frame-ancestors、nosniff；订阅不受影响；二维码脚本带 SRI；支持退出登录', async () => {
@@ -1605,7 +1598,7 @@ import { assemble } from '../build.mjs';
 const internals = (() => {
   const src = assemble()
     .replace(/^import .*$/m, '').replace('export default {', 'const __default = {');
-  return new Function('connect', src + '\n;return { md5hex, sha224hex, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVlessHeader, parseTrojanHeader, HTTP_PORTS, ipInCidrV6, isValidIp, parseProxyAddress, loginRateKey, relayPlan, RELAY_DOMAINS, SERVER_CHECKS, effectivePrefDomains, DEFAULT_PREFERRED_DOMAINS, pumpReadable };')(() => { throw new Error('no sockets'); });
+  return new Function('connect', src + '\n;return { md5hex, sha224hex, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVlessHeader, HTTP_PORTS, ipInCidrV6, isValidIp, parseProxyAddress, loginRateKey, relayPlan, RELAY_DOMAINS, SERVER_CHECKS, effectivePrefDomains, DEFAULT_PREFERRED_DOMAINS, pumpReadable };')(() => { throw new Error('no sockets'); });
 })();
 const hex = (u8) => Buffer.from(u8).toString('hex');
 
@@ -1695,7 +1688,6 @@ test('Poly1305 / ChaCha20-Poly1305 通过 RFC 8439 已知答案，并与 node:cr
 
 test('协议头解析：任意截断只会报「头部过短」；乱码只会抛普通 Error（不出现 RangeError / TypeError）', () => {
   const cfg = { uuid: UUID };
-  const trojanHex = createHash('sha224').update(UUID).digest('hex');
   const vless = [vlessReq('example.com', 443), vlessReqV6(443), new Uint8Array([0, ...uuidBytes, 3, 7, 7, 7, 1, 0, 80, 1, 1, 2, 3, 4])];
   for (const full of vless) {
     const header = internals.parseVlessHeader(full, cfg).headerLength;
@@ -1704,16 +1696,9 @@ test('协议头解析：任意截断只会报「头部过短」；乱码只会�
     }
     assert.equal(internals.parseVlessHeader(full.slice(0, header), cfg).headerLength, header);
   }
-  const trojanFull = new Uint8Array([...Buffer.from(trojanHex + '\r\n'), 1, 3, 11, ...Buffer.from('example.com'), 1, 187, 13, 10]);
-  for (let k = 0; k < trojanFull.length; k++) {
-    assert.throws(() => internals.parseTrojanHeader(trojanFull.slice(0, k)), (e) => e.constructor === Error && /头部过短/.test(e.message), `Trojan 截断 ${k}`);
-  }
-  assert.equal(internals.parseTrojanHeader(trojanFull).addr, 'example.com');
   for (let i = 0; i < 500; i++) {   // 随机字节：要么解析成功，要么抛出我们自己的 Error
     const junk = randomBytes(1 + Math.floor(Math.random() * 90)); if (i % 2) { junk[0] = 0; junk.set(uuidBytes.slice(0, Math.min(16, junk.length - 1)), 1); }
-    for (const parse of [(b) => internals.parseVlessHeader(b, cfg), (b) => internals.parseTrojanHeader(b)]) {
-      try { parse(junk); } catch (e) { assert.equal(e.constructor, Error, `${e.name}: ${e.message}`); }
-    }
+    try { internals.parseVlessHeader(junk, cfg); } catch (e) { assert.equal(e.constructor, Error, `${e.name}: ${e.message}`); }
   }
 });
 
@@ -1994,7 +1979,7 @@ test('Surge / Loon / Quantumult X 不输出 XHTTP 节点（它们没有 XHTTP �
     assert.ok(!/\.X\b/.test(body), `${fmt} 不含 XHTTP 节点（.X）`);
     assert.match(body, nodeRe, `${fmt} 仍包含 VLESS 节点`);
   }
-  const only = baseEnv({ CONFIG_KV: kv({ config: customCfg({ enableVless: false, enableTrojan: false, enableXhttp: true }) }) });
+  const only = baseEnv({ CONFIG_KV: kv({ config: customCfg({ enableVless: false, enableXhttp: true }) }) });
   for (const [fmt, name] of [['surge', 'Surge'], ['loon', 'Loon'], ['quanx', 'Quantumult X']]) {
     const res = await subOf(only, fmt);
     assert.equal(res.status, 500, fmt);

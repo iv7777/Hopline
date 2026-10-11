@@ -70,8 +70,6 @@ function buildConfig(env, kvCfg) {
   if (env.PROXYIP) cfg.proxyIP = String(env.PROXYIP);
   if (envVar(env, 'outbound')) cfg.outboundProxy = String(envVar(env, 'outbound'));
   if (flag(envVar(env, 'ech'))) cfg.ech = true;
-  if (flag(envVar(env, 'trojan'))) cfg.enableTrojan = true;
-  if (env.TROJAN_PASSWORD) cfg.trojanPassword = String(env.TROJAN_PASSWORD);
   if (env.ALPN) cfg.alpn = String(env.ALPN);
   // KV 图形化配置（更高优先级）：按字段表逐项合并，未登记的字段自动忽略
   if (kvCfg && typeof kvCfg === 'object') {
@@ -104,8 +102,8 @@ async function saveConfig(env, cfg) {
   const kv = kvStore(env);
   if (!kv || typeof kv.put !== 'function') return null;
   const stored = pickSchema(cfg);
-  // 环境变量提供、且面板里没有被改动的值不写入 KV：否则一次保存就会把 PROXYIP / TROJAN_PASSWORD / ALPN 等
-  // 环境变量快照进 KV（KV 优先级更高），之后再改环境变量会被静默忽略，Trojan 密码等也会明文落盘。
+  // 环境变量提供、且面板里没有被改动的值不写入 KV：否则一次保存就会把 PROXYIP / ALPN 等
+  // 环境变量快照进 KV（KV 优先级更高），之后再改环境变量会被静默忽略。
   // 面板中改成与环境变量不同的值才视为覆盖并保存
   const envBase = buildConfig(env, null), defaults = schemaDefaults();
   for (const d of CONFIG_SCHEMA) {

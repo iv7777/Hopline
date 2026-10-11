@@ -13,18 +13,17 @@ function xhttpPadding(cfg) {
   };
 }
 
-// vless/trojan 分享链接 # 后的节点名：非 ASCII（中文等）原样输出、不做 URL 编码，仅转义 URI 特殊字符（% # ? 空格）。
+// vless 分享链接 # 后的节点名：非 ASCII（中文等）原样输出、不做 URL 编码，仅转义 URI 特殊字符（% # ? 空格）。
 // 原因：v2rayNG/AsteriskNG 对 fragment 的 %XX 按系统编码（GBK）做 URL 解码，UTF-8 编码的中文（%E9%A6...）会被误读成乱码
 // （如 香港 → 棣欐腐、台湾 → 鋆版咕）；原样中文走明文 UTF-8，GBK/UTF-8 解码客户端均正常显示。
 function uriFragName(name) {
   return String(name).replace(/%/g, '%25').replace(/#/g, '%23').replace(/\?/g, '%3F').replace(/ /g, '%20');
 }
 
-// 多协议命名：同一地址同时下发多种协议时，Trojan 名称加「.T」、XHTTP 加「.X」（VLESS 保持原名），
+// 多协议命名：同一地址同时下发 VLESS 与 XHTTP 时，XHTTP 名称加「.X」（VLESS 保持原名），
 // 客户端一眼可辨协议，也避免 sing-box / Clash 因节点名重复而拒绝加载
-function protoNames(name, enV, enT, enX) {
-  const cnt = (enV ? 1 : 0) + (enT ? 1 : 0) + (enX ? 1 : 0);
-  return cnt <= 1 ? { v: name, t: name, x: name } : { v: name, t: name + '.T', x: name + '.X' };
+function protoNames(name, enV, enX) {
+  return enV && enX ? { v: name, x: name + '.X' } : { v: name, x: name };
 }
 
 // 订阅节点名全局去重：不同地址同名（如多个来源都叫「优选IP-01」）时依次追加「·2」「·3」，
@@ -79,22 +78,6 @@ function vlessNode(cfg, server, port, name, extra = {}) {
     q += '&ech=' + enc((cfg.echHost || 'cloudflare-ech.com') + '+' + (cfg.echDns || 'https://223.5.5.5/dns-query'));
   }
   return `vless://${cfg.uuid}@${addr}:${port}?${q}#${uriFragName(name)}`;
-}
-
-function trojanNode(cfg, server, port, name) {
-  const host = cfg.host;
-  const addr = server.includes(':') && !server.startsWith('[') ? `[${server}]` : server;  // IPv6 需方括号
-  const enc = encodeURIComponent;
-  const isTls = !HTTP_PORTS.has(Number(port));
-  // 明文端口（80/8080/8880/2052/2082/2086/2095）：走 security=none 明文 ws（不被 TLS 指纹检测，可用性高）；
-  // TLS 端口：security=tls + sni/fp
-  const path = enc('/' + cfg.path + (isTls ? '?ed=2048' : ''));   // TLS 下携带 ed=2048（WS 0-RTT）
-  let q = isTls
-    ? 'security=tls&sni=' + enc(host) + '&fp=chrome&host=' + enc(host) + '&type=ws&path=' + path
-    : 'security=none&host=' + enc(host) + '&type=ws&path=' + path;
-  if (cfg.alpn && isTls) q += '&alpn=' + alpnParam(cfg.alpn);
-  if (cfg.ech && isTls) q += '&ech=' + enc((cfg.echHost || 'cloudflare-ech.com') + '+' + (cfg.echDns || 'https://223.5.5.5/dns-query'));   // ECH：仅 TLS 端口有效
-  return `trojan://${cfg.trojanPassword || cfg.uuid}@${addr}:${port}?${q}#${uriFragName(name)}`;
 }
 
 // 优选域名 / 优选 API 的 DNS 解析缓存（TTL 10 分钟：域名或 URL → IP 列表）
@@ -233,10 +216,10 @@ async function resolvePreferredDomains(domainsStr, limitPerDomain = 100, maxTota
           await storeUrlCache(ck, rec);
           return rec.slice();
         }
-        // vless/trojan 订阅行提取（子订阅/转换器输出）：vless://uuid@host:port#名称
+        // vless 订阅行提取（子订阅/转换器输出）：vless://uuid@host:port#名称
         for (const line of content.split(/\r?\n/)) {
           if (rec.length >= limitPerDomain) break;
-          const vm = line.match(/(?:vless|trojan):\/\/[^@\s/]+@(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+)(?::(\d{1,5}))?/);
+          const vm = line.match(/vless:\/\/[^@\s/]+@(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+)(?::(\d{1,5}))?/);
           if (!vm) continue;
           const host = vm[1].replace(/^\[|\]$/g, '');
           const port = vm[2] ? parseInt(vm[2]) : 443;
@@ -350,9 +333,8 @@ async function buildNodes(cfg, cap = NODE_CAP) {
     if (cfg.tlsOnly && !isTls) return;   // TLS 控制：仅下发 TLS 端口节点，明文端口跳过
     // 节点端口按源端口原样下发（通常是 443），不做 TLS 端口随机（443 全域可达性最佳）
     const finalPort = Number(port);
-    const nm = protoNames(name, cfg.enableVless, cfg.enableTrojan, cfg.enableXhttp && isTls);
+    const nm = protoNames(name, cfg.enableVless, cfg.enableXhttp && isTls);
     if (cfg.enableVless) nodes.push(vlessNode(cfg, server, finalPort, nm.v));
-    if (cfg.enableTrojan) nodes.push(trojanNode(cfg, server, finalPort, nm.t));  // Trojan 明文/TLS 端口均下发
     if (cfg.enableXhttp && isTls) nodes.push(vlessNode(cfg, server, finalPort, nm.x, { type: 'xhttp' }));  // XHTTP 仅 TLS 端口
   };
   // 按源端口（通常 443）下发；关闭「仅 TLS 端口」时，443 节点另追加一个 80 明文端口节点（名称加「·80」）
@@ -442,10 +424,9 @@ function parseShareNode(n, i) {
     const start = proto >= 0 ? proto + 3 : 0;
     try { user = decodeURIComponent(n.slice(start, at)); } catch (e) { user = n.slice(start, at); }
   }
-  const isTrojan = n.startsWith('trojan://');
-  // 明文端口节点（security=none）无论 VLESS 还是 Trojan 都不启用 TLS
+  // 明文端口节点（security=none）不启用 TLS
   const tls = (getParam(n, 'security') || 'tls') === 'tls';
-  return { srv, prt, name, user, isTrojan, tls };
+  return { srv, prt, name, user, tls };
 }
 
 // 地区 / 运营商标签表：按节点名称中的关键字匹配

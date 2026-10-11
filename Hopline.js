@@ -1,8 +1,8 @@
-/*!Hopline v2.4.6*/
+/*!Hopline v2.5.0*/
 // ============================================================================
 //  Hopline —— 代理订阅面板 · 全新独立编写
 //  ----------------------------------------------------------------------------
-//  环境变量（必填 2 项，其余可选；旧版短变量名 U / D / S / K / ECH / TROJAN 仍然兼容）：
+//  环境变量（必填 2 项，其余可选；旧版短变量名 U / D / S / K / ECH 仍然兼容）：
 //    PATH            【必填】面板、订阅与节点（WebSocket / XHTTP）共用的访问路径，如 mypanel（旧名 D）
 //    ADMIN           【必填】面板管理密码：未设置时面板与管理 API 一律禁用
 //    UUID            VLESS 用户 ID（旧名 U）：留空则首次访问时随机生成并保存到 KV（未绑定 KV 时必须设置）
@@ -11,14 +11,12 @@
 //    PROXYIP         自定义反代/落地 IP（填写后作为固定出口优先使用；留空则直连失败时由地区反代兜底（面板可配置），格式 host 或 host:port）
 //    OUTBOUND_PROXY  出站代理（socks5:// / http:// / ss:// 或 host:port；旧名 OUTBOUND、S）
 //    ENABLE_ECH      设为 true/1 开启 ECH 加密（旧名 ECH）
-//    ENABLE_TROJAN   设为 true/1 开启 Trojan 协议（旧名 TROJAN）
-//    TROJAN_PASSWORD Trojan 密码（留空则使用 UUID）
 //    ALPN            自定义 ALPN 协商
 //    CONFIG_KV       KV 命名空间的绑定变量名（旧名 K）：绑定后读取 / 保存图形化配置
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '2.4.6';
+const VERSION = '2.5.0';
 // 本文件是否为混淆产物：obfuscate.mjs 按原文精确替换为 true（混淆后仍是这个布尔值，只是字面量的编码方式不同）。
 // 据此决定更新检测拉取哪个文件、面板上怎么标注当前部署——保证拉取与当前运行的是同一种
 const IS_OBFUSCATED = false;
@@ -180,7 +178,6 @@ const ENV_NAMES = {
   adminUser: ['ADMIN_USER'],
   outbound: ['OUTBOUND_PROXY', 'OUTBOUND', 'S'],
   ech: ['ENABLE_ECH', 'ECH'],
-  trojan: ['ENABLE_TROJAN', 'TROJAN'],
   kv: ['CONFIG_KV', 'K'],   // KV 命名空间的绑定变量名
 };
 // 读取环境变量（按 ENV_NAMES 顺序取第一个非空的）；未设置返回 undefined
@@ -217,8 +214,6 @@ const CONFIG_SCHEMA = [
     pattern: HOSTNAME_PATTERN, hint: '请填写域名，如 node.example.com' },
   // ---- 协议开关 ----
   { key: 'enableVless', type: 'bool', def: true, el: 'en-vless', label: 'VLESS 协议' },
-  { key: 'enableTrojan', type: 'bool', def: false, el: 'en-trojan', label: 'Trojan 协议' },
-  { key: 'trojanPassword', type: 'string', def: '', el: 'tp-pass', label: 'Trojan 密码', trim: false, maxLen: 256, noExport: true },   // noExport：面板「导出配置」不含此项（与管理密码一样不落进备份文件）
   { key: 'enableXhttp', type: 'bool', def: true, el: 'en-xhttp', label: 'XHTTP 协议' },
   // ---- 传输参数 ----
   { key: 'alpn', type: 'string', def: '', el: 'alpn', label: 'ALPN', maxLen: 64,
@@ -461,7 +456,7 @@ function sanitizeConfigPatch(body, env) {
 // 跨字段校验（作用于合并后的完整配置）
 function crossCheckConfig(cfg) {
   const errors = [];
-  if (!cfg.enableVless && !cfg.enableTrojan && !cfg.enableXhttp) {
+  if (!cfg.enableVless && !cfg.enableXhttp) {
     errors.push({ field: 'enableVless', label: '协议开关', msg: '至少启用一种协议，否则订阅中没有任何节点' });
   }
   if (cfg.relay && cfg.relay.mode === 'custom' && !String(cfg.relay.custom || '').trim()) {
@@ -779,8 +774,6 @@ function buildConfig(env, kvCfg) {
   if (env.PROXYIP) cfg.proxyIP = String(env.PROXYIP);
   if (envVar(env, 'outbound')) cfg.outboundProxy = String(envVar(env, 'outbound'));
   if (flag(envVar(env, 'ech'))) cfg.ech = true;
-  if (flag(envVar(env, 'trojan'))) cfg.enableTrojan = true;
-  if (env.TROJAN_PASSWORD) cfg.trojanPassword = String(env.TROJAN_PASSWORD);
   if (env.ALPN) cfg.alpn = String(env.ALPN);
   // KV 图形化配置（更高优先级）：按字段表逐项合并，未登记的字段自动忽略
   if (kvCfg && typeof kvCfg === 'object') {
@@ -813,8 +806,8 @@ async function saveConfig(env, cfg) {
   const kv = kvStore(env);
   if (!kv || typeof kv.put !== 'function') return null;
   const stored = pickSchema(cfg);
-  // 环境变量提供、且面板里没有被改动的值不写入 KV：否则一次保存就会把 PROXYIP / TROJAN_PASSWORD / ALPN 等
-  // 环境变量快照进 KV（KV 优先级更高），之后再改环境变量会被静默忽略，Trojan 密码等也会明文落盘。
+  // 环境变量提供、且面板里没有被改动的值不写入 KV：否则一次保存就会把 PROXYIP / ALPN 等
+  // 环境变量快照进 KV（KV 优先级更高），之后再改环境变量会被静默忽略。
   // 面板中改成与环境变量不同的值才视为覆盖并保存
   const envBase = buildConfig(env, null), defaults = schemaDefaults();
   for (const d of CONFIG_SCHEMA) {
@@ -836,7 +829,7 @@ async function saveConfig(env, cfg) {
 
 
 // ---------------------------------------------------------------------------
-// VLESS / Trojan 请求头解析
+// VLESS 请求头解析
 // ---------------------------------------------------------------------------
 function readAddress(data, view, offset, atyp) {
   // 数据不足一律抛「头部过短」：WS / XHTTP 据此继续等待后续分片，而不是因越界异常直接断开连接
@@ -900,40 +893,7 @@ function parseVlessHeader(data, cfg) {
   };
 }
 
-// Trojan 请求头：Password+CRLF(56) | Cmd(1) | Port(2) | Atyp(1) | Addr | CRLF(2)
-function parseTrojanHeader(data) {
-  if (!data || data.byteLength < 58 + 8) throw new Error('Trojan 头部过短');
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  let offset = 58;                             // 56 字节 SHA224 hex + CRLF
-  const command = view.getUint8(offset); offset += 1;   // CMD
-  const atyp = view.getUint8(offset); offset += 1;      // ATYP（Trojan 用 SOCKS5 编码：1=IPv4, 3=域名, 4=IPv6）
-  let addr, len;
-  const need = (n) => { if (offset + n > data.byteLength) throw new Error('Trojan 头部过短'); };
-  if (atyp === 1) {
-    need(4);
-    addr = `${view.getUint8(offset)}.${view.getUint8(offset + 1)}.${view.getUint8(offset + 2)}.${view.getUint8(offset + 3)}`;
-    len = 4;
-  } else if (atyp === 3) {
-    need(1);
-    const l = view.getUint8(offset);
-    need(1 + l);
-    addr = TD.decode(data.subarray(offset + 1, offset + 1 + l));
-    len = 1 + l;
-  } else if (atyp === 4) {
-    need(16);
-    addr = formatIPv6(data.subarray(offset, offset + 16));
-    len = 16;
-  } else {
-    throw new Error('无法识别的地址类型');
-  }
-  offset += len;
-  need(4);                                              // DST.PORT(2) + 尾部 CRLF(2)
-  const port = view.getUint16(offset); offset += 2;     // DST.PORT
-  offset += 2;                                    // 尾部 CRLF
-  return { command, port, addr, password: TD.decode(data.subarray(0, 56)), headerLength: offset };
-}
-
-// Trojan 协议密码使用 SHA-224（56 字节 hex）——Cloudflare WebCrypto 不支持 SHA-224，手写实现（SHA-256 结构 + SHA-224 初始值）
+// SHA-224（用于由 UUID 派生 Clash 配置的密钥）——Cloudflare WebCrypto 不支持 SHA-224，手写实现（SHA-256 结构 + SHA-224 初始值）
 const SHA256_K = [
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -986,19 +946,6 @@ function sha224hex(str) {
     hex += (v & 255).toString(16).padStart(2, '0');
   }
   return hex;
-}
-// Trojan 密码 SHA-224 摘要缓存：同一密码只计算一次，避免 WebSocket 每帧连接重复跑完整 SHA-224
-let _trojanPassC = '', _trojanHashC = '';
-function trojanPasswordHash(pass) {
-  if (pass !== _trojanPassC) { _trojanPassC = pass; _trojanHashC = sha224hex(pass); }
-  return _trojanHashC;
-}
-// Trojan 头判定：56 字节 SHA224 hex + CRLF；密码匹配或纯 hex 特征均可识别
-function detectTrojan(pending, cfg) {
-  if (!cfg.enableTrojan || !pending || pending.byteLength < 58) return false;
-  const head = pending.subarray(0, 56);
-  // 仅密码哈希匹配才视为 Trojan（不能放行任意 56 位十六进制）
-  return TD.decode(head).toLowerCase() === trojanPasswordHash(cfg.trojanPassword || cfg.uuid);
 }
 
 // DoH 端点池（UDP/DNS → DoH 转换用，使 V2rayNG 关闭「本地 DNS」时远端 DNS 仍可用）
@@ -1749,7 +1696,7 @@ function relayPlan(cfg, colo) {
 }
 
 // 打开到目标的出站连接（自定义反代 / 出站代理 / 直连 / 地区反代）
-// 反代均为透明代理：发送去掉 VLESS/Trojan 头部的原始 TLS 数据，对端按 SNI 路由到目标。
+// 反代均为透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标。
 // 出站模式语义：only = 仅走出站代理（失败用地区反代兜底，地区反代设为 off 时不兜底）；'' 默认 = 出站代理优先，失败后直连 ∥ 反代；
 // no = 直连 ∥ 反代优先，都不通时最后用出站代理
 async function openOutbound(parsed, cfg, colo, payloadKind) {
@@ -1888,11 +1835,11 @@ async function pumpBatched(reader, send) {
   } catch (e) { /* 忽略 */ }
 }
 // ---------------------------------------------------------------------------
-// WebSocket 代理（VLESS / Trojan）
+// WebSocket 代理（VLESS）
 // ---------------------------------------------------------------------------
 // WS 0-RTT 早数据（节点 path 的 ?ed=2048 / sing-box max_early_data）：客户端把首个数据包 base64url 编码后
 // 放进握手请求的 Sec-WebSocket-Protocol 头，服务端在握手阶段即可解析并抢先建立出站，省去约 1 个 RTT。
-// 只接受能通过协议校验的数据（VLESS：版本 0 + 本机 UUID；Trojan：密码哈希 + CRLF），其它取值
+// 只接受能通过协议校验的数据（版本 0 + 本机 UUID），其它取值
 // （如客户端声明的普通子协议名）一律返回 null，走原有流程，无副作用
 function decodeEarlyData(header, cfg) {
   const raw = String(header || '').trim();
@@ -1905,13 +1852,11 @@ function decodeEarlyData(header, cfg) {
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   } catch (e) { return null; }
   if (!bytes.byteLength || bytes.byteLength > 6144) return null;
-  if (bytes.byteLength >= 17 && bytes[0] === 0) {
-    let want;
-    try { want = uuidToBytes(cfg.uuid); } catch (e) { return null; }
-    for (let i = 0; i < 16; i++) if (bytes[i + 1] !== want[i]) return null;
-    return bytes;
-  }
-  return detectTrojan(bytes, cfg) ? bytes : null;
+  if (bytes.byteLength < 17 || bytes[0] !== 0) return null;
+  let want;
+  try { want = uuidToBytes(cfg.uuid); } catch (e) { return null; }
+  for (let i = 0; i < 16; i++) if (bytes[i + 1] !== want[i]) return null;
+  return bytes;
 }
 
 // WebSocket 关闭原因上限 123 字节（UTF-8）：按字节截断且不拆开多字节字符，
@@ -1930,7 +1875,7 @@ async function handleWebSocketProxy(request, cfg) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
   try { server.accept({ allowHalfOpen: true }); } catch (e) { server.accept(); }
-  // 关键：必须声明二进制类型，否则 CF 将二进制帧按 UTF-8 解码成 string，VLESS/Trojan 头（含 16 字节原始 UUID）会被损坏导致隧道失败
+  // 关键：必须声明二进制类型，否则 CF 将二进制帧按 UTF-8 解码成 string，VLESS 头（含 16 字节原始 UUID）会被损坏导致隧道失败
   server.binaryType = 'arraybuffer';
   let socket = null, writer = null, headerSent = false, pending = null, protoWait = null, respSent = false;
   let closed = false, pumped = false, wsClosed = false;   // closed：WS 已关闭（之后建好的出站连接要立即释放）；pumped：已开始把目标数据转给客户端（由它负责在结束时关闭 WS）
@@ -1948,29 +1893,23 @@ async function handleWebSocketProxy(request, cfg) {
     if (!pending || headerSent) return;
     // 握手头正常仅数十字节；持续收到不完整分片（异常 / 恶意）时限制缓冲，防内存膨胀
     if (pending.byteLength > 65536) throw new Error('握手头超过 64KB');
-    let parsed, isVless;
+    let parsed;
     try {
-      // Trojan 判定：客户端发送 SHA224(密码) 的 56 字节 hex + CRLF；密码与节点生成同源（留空用 UUID）
-      const isTrojan = detectTrojan(pending, cfg);
-      // 分帧等待：部分客户端（mihomo 等）将 Trojan 头分帧发送（首帧可能仅 56 字节 SHA224 hex）。
-      // 此时 pending[0] 为 hex 字符（非 0）且不足 58 字节，不能按 VLESS 解析（会报版本错误而关闭连接），应等待后续分片
-      if (!isTrojan && pending[0] !== 0 && pending.byteLength < 58) return;
-      isVless = !isTrojan;
       // 面板关闭 VLESS 后服务端也不再接受 VLESS 连接（XHTTP 走独立入口，由 enableXhttp 控制）
-      if (isVless && cfg.enableVless === false) throw new Error('VLESS 协议未启用');
-      parsed = isTrojan ? parseTrojanHeader(pending) : parseVlessHeader(pending, cfg);
+      if (cfg.enableVless === false) throw new Error('VLESS 协议未启用');
+      parsed = parseVlessHeader(pending, cfg);
     } catch (err) {
       if (/头部过短/.test(err.message || '')) return;   // 等下一个分片
       throw err;
     }
-    // 仅支持 TCP（VLESS 0x01 / Trojan 0x01）与 VLESS UDP-DNS（0x02）；Trojan UDP ASSOCIATE、VLESS MUX 等
+    // 仅支持 TCP（0x01）与 UDP-DNS（0x02）；VLESS MUX 等其它命令
     // 此前会被当成 TCP 连接目标地址，现在明确拒绝，客户端据此回退
-    if (isVless ? (parsed.command !== 1 && parsed.command !== 2) : parsed.command !== 1) {
+    if (parsed.command !== 1 && parsed.command !== 2) {
       throw new Error('不支持的命令 ' + parsed.command);
     }
     // 头部解析成功立即回 VLESS 响应头（version=0 + addonsLen=0），早于首包判定与出站建连：
     // 部分客户端（mihomo 等）收到这 2 字节才发送首个数据包，晚发会与服务端互相等待
-    if (!respSent && isVless && parsed.command !== 2) { respSent = true; send(new Uint8Array([0, 0])); }
+    if (!respSent && parsed.command !== 2) { respSent = true; send(new Uint8Array([0, 0])); }
     // 首包判定出站方式（非 TLS 不走 SNI 型反代，见 sniffPayloadKind）；头部完整但暂无数据时短暂等待首包，
     // 超时（SNIFF_WAIT_MS）仍无数据按 unknown 放行，不让连接悬挂
     const payload = pending.byteLength > parsed.headerLength ? pending.subarray(parsed.headerLength) : null;
@@ -1983,7 +1922,7 @@ async function handleWebSocketProxy(request, cfg) {
     headerSent = true;
     // UDP 请求（command=0x02）：CF Workers 无 UDP socket 无法原生转发数据报，
     // DNS(53) 查询 → DoH(HTTPS) 转换后回标准 DNS 响应（使 V2rayNG 关闭「本地 DNS」时远端 DNS 仍可用）；
-    // 其余 UDP 快速失败关闭连接（客户端自动回退），TCP（VLESS/Trojan WS/XHTTP）路径零影响
+    // 其余 UDP 快速失败关闭连接（客户端自动回退），TCP（VLESS WS/XHTTP）路径零影响
     if (parsed.command === 2) {
       try {
         if (parsed.port === 53 && payload && payload.byteLength >= 12) {
@@ -1999,7 +1938,7 @@ async function handleWebSocketProxy(request, cfg) {
     if (closed) { try { conn.close(); } catch (e) { /* 忽略 */ } return; }
     socket = conn;
     writer = conn.writable.getWriter();
-    // 透明代理：去掉 VLESS/Trojan 头部，发送原始 TLS 数据，由对端按 SNI 路由
+    // 透明代理：去掉 VLESS 头部，发送原始 TLS 数据，由对端按 SNI 路由
     // 补发 SOCKS5/HTTP 代理握手残留字节（目标端早期数据），避免 TLS 握手中途被截断
     if (conn._preamble && conn._preamble.byteLength > 0) send(conn._preamble);
     if (pending && pending.byteLength > parsed.headerLength) await writer.write(pending.subarray(parsed.headerLength));
@@ -2355,18 +2294,17 @@ function xhttpPadding(cfg) {
   };
 }
 
-// vless/trojan 分享链接 # 后的节点名：非 ASCII（中文等）原样输出、不做 URL 编码，仅转义 URI 特殊字符（% # ? 空格）。
+// vless 分享链接 # 后的节点名：非 ASCII（中文等）原样输出、不做 URL 编码，仅转义 URI 特殊字符（% # ? 空格）。
 // 原因：v2rayNG/AsteriskNG 对 fragment 的 %XX 按系统编码（GBK）做 URL 解码，UTF-8 编码的中文（%E9%A6...）会被误读成乱码
 // （如 香港 → 棣欐腐、台湾 → 鋆版咕）；原样中文走明文 UTF-8，GBK/UTF-8 解码客户端均正常显示。
 function uriFragName(name) {
   return String(name).replace(/%/g, '%25').replace(/#/g, '%23').replace(/\?/g, '%3F').replace(/ /g, '%20');
 }
 
-// 多协议命名：同一地址同时下发多种协议时，Trojan 名称加「.T」、XHTTP 加「.X」（VLESS 保持原名），
+// 多协议命名：同一地址同时下发 VLESS 与 XHTTP 时，XHTTP 名称加「.X」（VLESS 保持原名），
 // 客户端一眼可辨协议，也避免 sing-box / Clash 因节点名重复而拒绝加载
-function protoNames(name, enV, enT, enX) {
-  const cnt = (enV ? 1 : 0) + (enT ? 1 : 0) + (enX ? 1 : 0);
-  return cnt <= 1 ? { v: name, t: name, x: name } : { v: name, t: name + '.T', x: name + '.X' };
+function protoNames(name, enV, enX) {
+  return enV && enX ? { v: name, x: name + '.X' } : { v: name, x: name };
 }
 
 // 订阅节点名全局去重：不同地址同名（如多个来源都叫「优选IP-01」）时依次追加「·2」「·3」，
@@ -2421,22 +2359,6 @@ function vlessNode(cfg, server, port, name, extra = {}) {
     q += '&ech=' + enc((cfg.echHost || 'cloudflare-ech.com') + '+' + (cfg.echDns || 'https://223.5.5.5/dns-query'));
   }
   return `vless://${cfg.uuid}@${addr}:${port}?${q}#${uriFragName(name)}`;
-}
-
-function trojanNode(cfg, server, port, name) {
-  const host = cfg.host;
-  const addr = server.includes(':') && !server.startsWith('[') ? `[${server}]` : server;  // IPv6 需方括号
-  const enc = encodeURIComponent;
-  const isTls = !HTTP_PORTS.has(Number(port));
-  // 明文端口（80/8080/8880/2052/2082/2086/2095）：走 security=none 明文 ws（不被 TLS 指纹检测，可用性高）；
-  // TLS 端口：security=tls + sni/fp
-  const path = enc('/' + cfg.path + (isTls ? '?ed=2048' : ''));   // TLS 下携带 ed=2048（WS 0-RTT）
-  let q = isTls
-    ? 'security=tls&sni=' + enc(host) + '&fp=chrome&host=' + enc(host) + '&type=ws&path=' + path
-    : 'security=none&host=' + enc(host) + '&type=ws&path=' + path;
-  if (cfg.alpn && isTls) q += '&alpn=' + alpnParam(cfg.alpn);
-  if (cfg.ech && isTls) q += '&ech=' + enc((cfg.echHost || 'cloudflare-ech.com') + '+' + (cfg.echDns || 'https://223.5.5.5/dns-query'));   // ECH：仅 TLS 端口有效
-  return `trojan://${cfg.trojanPassword || cfg.uuid}@${addr}:${port}?${q}#${uriFragName(name)}`;
 }
 
 // 优选域名 / 优选 API 的 DNS 解析缓存（TTL 10 分钟：域名或 URL → IP 列表）
@@ -2575,10 +2497,10 @@ async function resolvePreferredDomains(domainsStr, limitPerDomain = 100, maxTota
           await storeUrlCache(ck, rec);
           return rec.slice();
         }
-        // vless/trojan 订阅行提取（子订阅/转换器输出）：vless://uuid@host:port#名称
+        // vless 订阅行提取（子订阅/转换器输出）：vless://uuid@host:port#名称
         for (const line of content.split(/\r?\n/)) {
           if (rec.length >= limitPerDomain) break;
-          const vm = line.match(/(?:vless|trojan):\/\/[^@\s/]+@(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+)(?::(\d{1,5}))?/);
+          const vm = line.match(/vless:\/\/[^@\s/]+@(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+)(?::(\d{1,5}))?/);
           if (!vm) continue;
           const host = vm[1].replace(/^\[|\]$/g, '');
           const port = vm[2] ? parseInt(vm[2]) : 443;
@@ -2692,9 +2614,8 @@ async function buildNodes(cfg, cap = NODE_CAP) {
     if (cfg.tlsOnly && !isTls) return;   // TLS 控制：仅下发 TLS 端口节点，明文端口跳过
     // 节点端口按源端口原样下发（通常是 443），不做 TLS 端口随机（443 全域可达性最佳）
     const finalPort = Number(port);
-    const nm = protoNames(name, cfg.enableVless, cfg.enableTrojan, cfg.enableXhttp && isTls);
+    const nm = protoNames(name, cfg.enableVless, cfg.enableXhttp && isTls);
     if (cfg.enableVless) nodes.push(vlessNode(cfg, server, finalPort, nm.v));
-    if (cfg.enableTrojan) nodes.push(trojanNode(cfg, server, finalPort, nm.t));  // Trojan 明文/TLS 端口均下发
     if (cfg.enableXhttp && isTls) nodes.push(vlessNode(cfg, server, finalPort, nm.x, { type: 'xhttp' }));  // XHTTP 仅 TLS 端口
   };
   // 按源端口（通常 443）下发；关闭「仅 TLS 端口」时，443 节点另追加一个 80 明文端口节点（名称加「·80」）
@@ -2784,10 +2705,9 @@ function parseShareNode(n, i) {
     const start = proto >= 0 ? proto + 3 : 0;
     try { user = decodeURIComponent(n.slice(start, at)); } catch (e) { user = n.slice(start, at); }
   }
-  const isTrojan = n.startsWith('trojan://');
-  // 明文端口节点（security=none）无论 VLESS 还是 Trojan 都不启用 TLS
+  // 明文端口节点（security=none）不启用 TLS
   const tls = (getParam(n, 'security') || 'tls') === 'tls';
-  return { srv, prt, name, user, isTrojan, tls };
+  return { srv, prt, name, user, tls };
 }
 
 // 地区 / 运营商标签表：按节点名称中的关键字匹配
@@ -2871,18 +2791,16 @@ function clashProxyYaml(p) {
   L.push('    type: ' + p.type);
   L.push('    server: ' + yamlVal(p.server));
   L.push('    port: ' + p.port);
-  if (p.type === 'vless') L.push('    uuid: ' + yamlVal(p.uuid));
-  else L.push('    password: ' + yamlVal(p.password));
+  L.push('    uuid: ' + yamlVal(p.uuid));
   L.push('    network: ' + p.network);
   L.push('    udp: true');
   if (p.tls) {
     L.push('    tls: true');
     L.push('    skip-cert-verify: false');   // 校验证书（按 servername 校验，与 server 是否为 IP 无关）
-    // ALPN：ws/trojan 强制 HTTP/1.1（CF Worker 的 WebSocket 仅支持 HTTP/1.1 升级，mihomo utls(chrome) 默认 ALPN 含 h2 → WS 升级失败）；
+    // ALPN：ws 强制 HTTP/1.1（CF Worker 的 WebSocket 仅支持 HTTP/1.1 升级，mihomo utls(chrome) 默认 ALPN 含 h2 → WS 升级失败）；
     // xhttp 必须 h2（stream-one 依赖 HTTP/2 双向流，h1.1 请求体未发完 CF 边缘无法回传响应 → Clash Verge 节点全部超时）
     L.push('    alpn: [' + (p.alpn && p.alpn.length ? p.alpn : (p.network === 'xhttp' ? ['h2'] : ['http/1.1'])).join(', ') + ']');
     L.push('    servername: ' + yamlVal(p.servername));
-    if (p.type === 'trojan') L.push('    sni: ' + yamlVal(p.servername));   // mihomo trojan 只认 sni 字段（servername 被忽略）：CF 优选 IP 下缺 sni 时 TLS SNI 回落为 server(IP)，Go/utls 对 IP 型 ServerName 不发送 SNI 扩展 → CF 边缘无法路由 → 403 → Clash Verge 全 Error
     L.push('    client-fingerprint: chrome');
     if (p['ech-opts']) {
       L.push('    ech-opts:');
@@ -2917,15 +2835,15 @@ function generateClash(cfg, nodes, clashTemplate) {
   const wsPath = path + '?ed=2048';
   const alpnArr = alpnList(cfg.alpn);   // 面板 ALPN 设置；未设置时 ws 用 http/1.1、xhttp 用 h2
   const seen = new Set();
-  // XHTTP 节点按 mihomo xhttp-opts 规范输出（含 x-padding 混淆参数），与 WS/Trojan 一并下发
+  // XHTTP 节点按 mihomo xhttp-opts 规范输出（含 x-padding 混淆参数），与 WS 一并下发
   const proxies = nodes.map((n) => {
-    const { user, srv, prt, name: baseName, isTrojan, tls } = parseShareNode(n, 0);
+    const { user, srv, prt, name: baseName, tls } = parseShareNode(n, 0);
     let name = baseName;
     const xType = getParam(n, 'type') || 'ws';
     // 同名去重：同一名称（同一 IP 多协议节点或不同 IP 同名优选池）追加协议后缀并保证全局唯一——
-    // 若后缀仍被占用（多个同名 IP 的 Trojan/XHTTP 节点），继续递增序号，避免 mihomo「duplicate name」校验失败
+    // 若后缀仍被占用（多个同名 IP 的 XHTTP 节点），继续递增序号，避免 mihomo「duplicate name」校验失败
     if (seen.has(name)) {
-      const suff = isTrojan ? 'T' : (xType === 'xhttp' ? 'X' : 'W');
+      const suff = xType === 'xhttp' ? 'X' : 'W';
       let cand = name + '·' + suff;
       let k = 2;
       while (seen.has(cand)) { cand = name + '·' + suff + k; k++; }
@@ -2937,9 +2855,6 @@ function generateClash(cfg, nodes, clashTemplate) {
       ...(tls ? { tls: true, 'skip-cert-verify': false, servername: host, 'client-fingerprint': 'chrome', alpn: alpnArr || ['http/1.1'] } : {}),
       ...(cfg.ech && tls ? { 'ech-opts': { enable: true, 'query-server-name': cfg.echHost || 'cloudflare-ech.com' } } : {})   // mihomo ECH 格式为顶层 ech-opts（enable + query-server-name）
     };
-    if (isTrojan) {
-      return { ...base, type: 'trojan', password: user, network: 'ws', 'ws-opts': { path: tls ? wsPath : path, headers: { Host: host } } };
-    }
     if (xType === 'xhttp') {
       // 从节点链接的 extra 参数恢复 x-padding 混淆配置（由 UUID 派生，与服务端一致）
       let xo = {};
@@ -2979,38 +2894,6 @@ ${template}
   return yaml;
 }
 
-// Surfboard（Surge 兼容格式，不支持 VLESS/XHTTP，Trojan 必须 TLS）：
-// 只下发 Trojan TLS 节点（密码与服务端一致，见 trojanNode）。不把 VLESS 节点改写成「密码=UUID」的 Trojan：
-// 服务端仅在启用 Trojan 时才接受 Trojan 连接，且密码可能与 UUID 不同，改写出的节点连不上。
-// 未启用 Trojan 时无节点可用，直接报错提示，而不是输出一份全部失效的配置。
-function generateSurfboard(cfg, nodes) {
-  const host = cfg.host, path = '/' + cfg.path;
-  if (!cfg.enableTrojan) throw new Error('Surfboard 只支持 Trojan 节点：请先在「节点配置」中启用 Trojan 协议');
-  const sb = nodes.filter(n => n.startsWith('trojan://') && n.indexOf('security=none') < 0);
-  if (!sb.length) throw new Error('没有可用于 Surfboard 的 Trojan TLS 节点（明文端口节点已被过滤）');
-  const lines = sb.map((n, i) => {
-    const { user, srv, prt, name } = parseShareNode(n, i);
-    return `${name} = trojan, ${srv}, ${prt}, password=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}, tls=true, skip-cert-verify=false, sni=${host}`;
-  });
-  return `#!MANAGED-CONFIG
-[General]
-loglevel = notify
-dns-server = 223.5.5.5, 119.29.29.29
-
-[Proxy]
-${lines.join('\n')}
-
-[Proxy Group]
-🚀 节点选择 = select, ${lines.map(l => l.split(' = ')[0]).join(', ')}
-🌐 全球直连 = select, DIRECT
-🐟 漏网之鱼 = select, 🚀 节点选择
-
-[Rule]
-GEOIP,CN,DIRECT
-FINAL,🐟 漏网之鱼
-`;
-}
-
 // ---------- Sing-box JSON ----------
 // sing-box 配置（1.12+ 格式）：规则集用 remote 二进制 .srs，不使用已移除的 geoip 规则 / dns 出站 / inet4_address / 入站 sniff 字段，节点 tag 保持唯一
 const SINGBOX_RULE_SETS = [
@@ -3029,7 +2912,7 @@ function generateSingbox(cfg, nodes) {
   const seen = new Set();
   // 官方 sing-box 内核没有 xhttp 传输（仅部分第三方分支支持），含 xhttp 出站的配置整体无法加载，因此不下发 XHTTP 节点
   const outbounds = nodes.filter(n => getParam(n, 'type') !== 'xhttp').map((n, i) => {
-    const { user, srv, prt, name: baseName, isTrojan, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name: baseName, tls } = parseShareNode(n, i);
     // tag 必须唯一（重复时 sing-box 拒绝启动）：名称已由 uniqueNodeNames 去重，这里再兜底一次
     let name = baseName, k = 2;
     while (seen.has(name)) name = baseName + '·' + k++;
@@ -3044,13 +2927,10 @@ function generateSingbox(cfg, nodes) {
     const transport = tls
       ? { type: 'ws', path, headers: { Host: host }, max_early_data: 2048, early_data_header_name: 'Sec-WebSocket-Protocol' }
       : { type: 'ws', path, headers: { Host: host } };
-    if (isTrojan) {
-      return { type: 'trojan', tag: name, server: srv, server_port: prt, password: user, tls: tlsObj, transport };
-    }
     return { type: 'vless', tag: name, server: srv, server_port: prt, uuid: user, tls: tlsObj, transport };
   });
   const tags = outbounds.map(o => o.tag);
-  if (!tags.length) throw new Error('sing-box 官方内核不支持 XHTTP，没有可用节点：请同时启用 VLESS 或 Trojan 协议');
+  if (!tags.length) throw new Error('sing-box 官方内核不支持 XHTTP，没有可用节点：请同时启用 VLESS 协议');
   const config = {
     log: { level: 'info' },
     // DNS：国内域名走直连 DNS（真实 IP），其余 A/AAAA 走 fakeip，兜底远程 DoH
@@ -3109,10 +2989,10 @@ function generateSingbox(cfg, nodes) {
 }
 
 // Surge / Loon / Quantumult X 没有 XHTTP 传输：XHTTP 节点若照常输出会被写成普通 WebSocket 节点而无法连接，因此一律剔除
-// （与 Sing-box、Surfboard 一致）；剔除后没有节点时明确报错，而不是输出空配置
+// （与 Sing-box 一致）；剔除后没有节点时明确报错，而不是输出空配置
 function dropXhttp(nodes, client) {
   const out = nodes.filter(n => getParam(n, 'type') !== 'xhttp');
-  if (!out.length) throw new Error(client + ' 不支持 XHTTP，没有可用节点：请同时启用 VLESS 或 Trojan 协议');
+  if (!out.length) throw new Error(client + ' 不支持 XHTTP，没有可用节点：请同时启用 VLESS 协议');
   return out;
 }
 
@@ -3121,11 +3001,9 @@ function generateSurge(cfg, nodes) {
   nodes = dropXhttp(nodes, 'Surge');
   const host = cfg.host, path = '/' + cfg.path;
   const proxies = nodes.map((n, i) => {
-    const { user, srv, prt, name, isTrojan, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name, tls } = parseShareNode(n, i);
     const tlsPart = tls ? ', tls=true, skip-cert-verify=false, sni=' + host : ', tls=false';
-    return isTrojan
-      ? `${name} = trojan, ${srv}, ${prt}, password=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`
-      : `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
+    return `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
   });
   return `#!MANAGED-CONFIG
 [General]
@@ -3151,11 +3029,9 @@ function generateLoon(cfg, nodes) {
   nodes = dropXhttp(nodes, 'Loon');
   const host = cfg.host, path = '/' + cfg.path;
   const proxies = nodes.map((n, i) => {
-    const { user, srv, prt, name, isTrojan, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name, tls } = parseShareNode(n, i);
     const tlsPart = tls ? ', tls=true, skip-cert-verify=false, sni=' + host : ', tls=false';
-    return isTrojan
-      ? `${name} = trojan, ${srv}, ${prt}, password=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`
-      : `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
+    return `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
   });
   const names = proxies.map(p => p.split(' = ')[0]).join(', ');
   return `[General]
@@ -3183,11 +3059,6 @@ function generateQuanX(cfg, nodes) {
   const qxHost = (srv) => srv.indexOf(':') >= 0 ? '[' + srv + ']' : srv;
   const servers = nodes.map((n, i) => {
     const { user, srv, prt, name, tls } = parseShareNode(n, i);
-    if (n.startsWith('trojan://')) {
-      return tls
-        ? `trojan=${qxHost(srv)}:${prt}, password=${user}, over-tls=true, tls-host=${host}, obfs=wss, obfs-host=${host}, obfs-uri=${path}, tls-verification=true, tag=${name}`
-        : `trojan=${qxHost(srv)}:${prt}, password=${user}, over-tls=false, obfs=ws, obfs-host=${host}, obfs-uri=${path}, tag=${name}`;
-    }
     return `vless=${qxHost(srv)}:${prt}, method=none, password=${user}, obfs=${tls ? 'wss' : 'ws'}, obfs-host=${host}, obfs-uri=${path}${tls ? ', tls-verification=true, tls13=true' : ''}, tag=${name}`;
   });
   const names = nodes.map((n, i) => {
@@ -3301,7 +3172,6 @@ async function generateSubscription(env, cfg, requestUrl, format, ua) {
   if (forced === 'clash' || forced === 'stash') { type = 'text/yaml'; body = generateClash(rc, nodes, await requireClashTemplate(env)); }   // Stash 使用 Clash 格式（与按 UA 识别一致）
   else if (forced === 'singbox' || forced === 'sing-box') { type = 'application/json'; body = generateSingbox(rc, nodes); }
   else if (forced === 'surge') { type = 'text/plain'; body = generateSurge(rc, nodes); }
-  else if (forced === 'surfboard') { type = 'text/plain'; body = generateSurfboard(rc, nodes); }
   else if (forced === 'loon') { type = 'text/plain'; body = generateLoon(rc, nodes); }
   else if (forced === 'quanx' || forced === 'quantumultx') { type = 'text/plain'; body = generateQuanX(rc, nodes); }
   else if (forced === 'plain' || forced === 'raw') { type = 'text/plain'; body = nodes.join('\n'); }
@@ -3314,7 +3184,6 @@ async function generateSubscription(env, cfg, requestUrl, format, ua) {
   else if (ua.includes('clash') || ua.includes('stash')) { type = 'text/yaml'; body = generateClash(rc, nodes, await requireClashTemplate(env)); }
   else if (ua.includes('sing-box')) { type = 'application/json'; body = generateSingbox(rc, nodes); }
   else if (ua.includes('surge')) { type = 'text/plain'; body = generateSurge(rc, nodes); }
-  else if (ua.includes('surfboard')) { type = 'text/plain'; body = generateSurfboard(rc, nodes); }
   else if (ua.includes('loon')) { type = 'text/plain'; body = generateLoon(rc, nodes); }
   else if (ua.includes('quantumult')) { type = 'text/plain'; body = generateQuanX(rc, nodes); }
   // 默认（v2rayN / Shadowrocket / 未知客户端）：返回 base64 编码订阅（V2rayN 标准格式）
@@ -3418,7 +3287,7 @@ const ASSET_CACHE_TTL = 30 * 86400;
 function pinnedAsset(name, path, sha256) {
   return { name, path, sha256, text: null, loading: null, failedAt: 0 };   // text：已校验的内容（每个 isolate 只加载一次）；loading：进行中的加载（并发请求共用）
 }
-const PANEL_ASSET = pinnedAsset('panel', '/dist/panel.html', 'd36a408795ac5cf3916af938dc6eec0b83ab4c3f08e7d48a7fa6c710d88e505f');
+const PANEL_ASSET = pinnedAsset('panel', '/dist/panel.html', 'b87f6c47b92a0a3998511c088d463b4e8fdd2fd6c98ddcaec6bb2f7ec662d7da');
 const CLASH_ASSET = pinnedAsset('clash', '/dist/clash-template.yaml', 'd838e14ef6be7bb3644e314fa5e085539d1ff307e40b08f44271bbd7cc7634fa');
 
 function assetSources(a) {

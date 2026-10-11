@@ -12,18 +12,16 @@ function clashProxyYaml(p) {
   L.push('    type: ' + p.type);
   L.push('    server: ' + yamlVal(p.server));
   L.push('    port: ' + p.port);
-  if (p.type === 'vless') L.push('    uuid: ' + yamlVal(p.uuid));
-  else L.push('    password: ' + yamlVal(p.password));
+  L.push('    uuid: ' + yamlVal(p.uuid));
   L.push('    network: ' + p.network);
   L.push('    udp: true');
   if (p.tls) {
     L.push('    tls: true');
     L.push('    skip-cert-verify: false');   // 校验证书（按 servername 校验，与 server 是否为 IP 无关）
-    // ALPN：ws/trojan 强制 HTTP/1.1（CF Worker 的 WebSocket 仅支持 HTTP/1.1 升级，mihomo utls(chrome) 默认 ALPN 含 h2 → WS 升级失败）；
+    // ALPN：ws 强制 HTTP/1.1（CF Worker 的 WebSocket 仅支持 HTTP/1.1 升级，mihomo utls(chrome) 默认 ALPN 含 h2 → WS 升级失败）；
     // xhttp 必须 h2（stream-one 依赖 HTTP/2 双向流，h1.1 请求体未发完 CF 边缘无法回传响应 → Clash Verge 节点全部超时）
     L.push('    alpn: [' + (p.alpn && p.alpn.length ? p.alpn : (p.network === 'xhttp' ? ['h2'] : ['http/1.1'])).join(', ') + ']');
     L.push('    servername: ' + yamlVal(p.servername));
-    if (p.type === 'trojan') L.push('    sni: ' + yamlVal(p.servername));   // mihomo trojan 只认 sni 字段（servername 被忽略）：CF 优选 IP 下缺 sni 时 TLS SNI 回落为 server(IP)，Go/utls 对 IP 型 ServerName 不发送 SNI 扩展 → CF 边缘无法路由 → 403 → Clash Verge 全 Error
     L.push('    client-fingerprint: chrome');
     if (p['ech-opts']) {
       L.push('    ech-opts:');
@@ -58,15 +56,15 @@ function generateClash(cfg, nodes, clashTemplate) {
   const wsPath = path + '?ed=2048';
   const alpnArr = alpnList(cfg.alpn);   // 面板 ALPN 设置；未设置时 ws 用 http/1.1、xhttp 用 h2
   const seen = new Set();
-  // XHTTP 节点按 mihomo xhttp-opts 规范输出（含 x-padding 混淆参数），与 WS/Trojan 一并下发
+  // XHTTP 节点按 mihomo xhttp-opts 规范输出（含 x-padding 混淆参数），与 WS 一并下发
   const proxies = nodes.map((n) => {
-    const { user, srv, prt, name: baseName, isTrojan, tls } = parseShareNode(n, 0);
+    const { user, srv, prt, name: baseName, tls } = parseShareNode(n, 0);
     let name = baseName;
     const xType = getParam(n, 'type') || 'ws';
     // 同名去重：同一名称（同一 IP 多协议节点或不同 IP 同名优选池）追加协议后缀并保证全局唯一——
-    // 若后缀仍被占用（多个同名 IP 的 Trojan/XHTTP 节点），继续递增序号，避免 mihomo「duplicate name」校验失败
+    // 若后缀仍被占用（多个同名 IP 的 XHTTP 节点），继续递增序号，避免 mihomo「duplicate name」校验失败
     if (seen.has(name)) {
-      const suff = isTrojan ? 'T' : (xType === 'xhttp' ? 'X' : 'W');
+      const suff = xType === 'xhttp' ? 'X' : 'W';
       let cand = name + '·' + suff;
       let k = 2;
       while (seen.has(cand)) { cand = name + '·' + suff + k; k++; }
@@ -78,9 +76,6 @@ function generateClash(cfg, nodes, clashTemplate) {
       ...(tls ? { tls: true, 'skip-cert-verify': false, servername: host, 'client-fingerprint': 'chrome', alpn: alpnArr || ['http/1.1'] } : {}),
       ...(cfg.ech && tls ? { 'ech-opts': { enable: true, 'query-server-name': cfg.echHost || 'cloudflare-ech.com' } } : {})   // mihomo ECH 格式为顶层 ech-opts（enable + query-server-name）
     };
-    if (isTrojan) {
-      return { ...base, type: 'trojan', password: user, network: 'ws', 'ws-opts': { path: tls ? wsPath : path, headers: { Host: host } } };
-    }
     if (xType === 'xhttp') {
       // 从节点链接的 extra 参数恢复 x-padding 混淆配置（由 UUID 派生，与服务端一致）
       let xo = {};
@@ -120,38 +115,6 @@ ${template}
   return yaml;
 }
 
-// Surfboard（Surge 兼容格式，不支持 VLESS/XHTTP，Trojan 必须 TLS）：
-// 只下发 Trojan TLS 节点（密码与服务端一致，见 trojanNode）。不把 VLESS 节点改写成「密码=UUID」的 Trojan：
-// 服务端仅在启用 Trojan 时才接受 Trojan 连接，且密码可能与 UUID 不同，改写出的节点连不上。
-// 未启用 Trojan 时无节点可用，直接报错提示，而不是输出一份全部失效的配置。
-function generateSurfboard(cfg, nodes) {
-  const host = cfg.host, path = '/' + cfg.path;
-  if (!cfg.enableTrojan) throw new Error('Surfboard 只支持 Trojan 节点：请先在「节点配置」中启用 Trojan 协议');
-  const sb = nodes.filter(n => n.startsWith('trojan://') && n.indexOf('security=none') < 0);
-  if (!sb.length) throw new Error('没有可用于 Surfboard 的 Trojan TLS 节点（明文端口节点已被过滤）');
-  const lines = sb.map((n, i) => {
-    const { user, srv, prt, name } = parseShareNode(n, i);
-    return `${name} = trojan, ${srv}, ${prt}, password=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}, tls=true, skip-cert-verify=false, sni=${host}`;
-  });
-  return `#!MANAGED-CONFIG
-[General]
-loglevel = notify
-dns-server = 223.5.5.5, 119.29.29.29
-
-[Proxy]
-${lines.join('\n')}
-
-[Proxy Group]
-🚀 节点选择 = select, ${lines.map(l => l.split(' = ')[0]).join(', ')}
-🌐 全球直连 = select, DIRECT
-🐟 漏网之鱼 = select, 🚀 节点选择
-
-[Rule]
-GEOIP,CN,DIRECT
-FINAL,🐟 漏网之鱼
-`;
-}
-
 // ---------- Sing-box JSON ----------
 // sing-box 配置（1.12+ 格式）：规则集用 remote 二进制 .srs，不使用已移除的 geoip 规则 / dns 出站 / inet4_address / 入站 sniff 字段，节点 tag 保持唯一
 const SINGBOX_RULE_SETS = [
@@ -170,7 +133,7 @@ function generateSingbox(cfg, nodes) {
   const seen = new Set();
   // 官方 sing-box 内核没有 xhttp 传输（仅部分第三方分支支持），含 xhttp 出站的配置整体无法加载，因此不下发 XHTTP 节点
   const outbounds = nodes.filter(n => getParam(n, 'type') !== 'xhttp').map((n, i) => {
-    const { user, srv, prt, name: baseName, isTrojan, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name: baseName, tls } = parseShareNode(n, i);
     // tag 必须唯一（重复时 sing-box 拒绝启动）：名称已由 uniqueNodeNames 去重，这里再兜底一次
     let name = baseName, k = 2;
     while (seen.has(name)) name = baseName + '·' + k++;
@@ -185,13 +148,10 @@ function generateSingbox(cfg, nodes) {
     const transport = tls
       ? { type: 'ws', path, headers: { Host: host }, max_early_data: 2048, early_data_header_name: 'Sec-WebSocket-Protocol' }
       : { type: 'ws', path, headers: { Host: host } };
-    if (isTrojan) {
-      return { type: 'trojan', tag: name, server: srv, server_port: prt, password: user, tls: tlsObj, transport };
-    }
     return { type: 'vless', tag: name, server: srv, server_port: prt, uuid: user, tls: tlsObj, transport };
   });
   const tags = outbounds.map(o => o.tag);
-  if (!tags.length) throw new Error('sing-box 官方内核不支持 XHTTP，没有可用节点：请同时启用 VLESS 或 Trojan 协议');
+  if (!tags.length) throw new Error('sing-box 官方内核不支持 XHTTP，没有可用节点：请同时启用 VLESS 协议');
   const config = {
     log: { level: 'info' },
     // DNS：国内域名走直连 DNS（真实 IP），其余 A/AAAA 走 fakeip，兜底远程 DoH
@@ -250,10 +210,10 @@ function generateSingbox(cfg, nodes) {
 }
 
 // Surge / Loon / Quantumult X 没有 XHTTP 传输：XHTTP 节点若照常输出会被写成普通 WebSocket 节点而无法连接，因此一律剔除
-// （与 Sing-box、Surfboard 一致）；剔除后没有节点时明确报错，而不是输出空配置
+// （与 Sing-box 一致）；剔除后没有节点时明确报错，而不是输出空配置
 function dropXhttp(nodes, client) {
   const out = nodes.filter(n => getParam(n, 'type') !== 'xhttp');
-  if (!out.length) throw new Error(client + ' 不支持 XHTTP，没有可用节点：请同时启用 VLESS 或 Trojan 协议');
+  if (!out.length) throw new Error(client + ' 不支持 XHTTP，没有可用节点：请同时启用 VLESS 协议');
   return out;
 }
 
@@ -262,11 +222,9 @@ function generateSurge(cfg, nodes) {
   nodes = dropXhttp(nodes, 'Surge');
   const host = cfg.host, path = '/' + cfg.path;
   const proxies = nodes.map((n, i) => {
-    const { user, srv, prt, name, isTrojan, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name, tls } = parseShareNode(n, i);
     const tlsPart = tls ? ', tls=true, skip-cert-verify=false, sni=' + host : ', tls=false';
-    return isTrojan
-      ? `${name} = trojan, ${srv}, ${prt}, password=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`
-      : `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
+    return `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
   });
   return `#!MANAGED-CONFIG
 [General]
@@ -292,11 +250,9 @@ function generateLoon(cfg, nodes) {
   nodes = dropXhttp(nodes, 'Loon');
   const host = cfg.host, path = '/' + cfg.path;
   const proxies = nodes.map((n, i) => {
-    const { user, srv, prt, name, isTrojan, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name, tls } = parseShareNode(n, i);
     const tlsPart = tls ? ', tls=true, skip-cert-verify=false, sni=' + host : ', tls=false';
-    return isTrojan
-      ? `${name} = trojan, ${srv}, ${prt}, password=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`
-      : `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
+    return `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
   });
   const names = proxies.map(p => p.split(' = ')[0]).join(', ');
   return `[General]
@@ -324,11 +280,6 @@ function generateQuanX(cfg, nodes) {
   const qxHost = (srv) => srv.indexOf(':') >= 0 ? '[' + srv + ']' : srv;
   const servers = nodes.map((n, i) => {
     const { user, srv, prt, name, tls } = parseShareNode(n, i);
-    if (n.startsWith('trojan://')) {
-      return tls
-        ? `trojan=${qxHost(srv)}:${prt}, password=${user}, over-tls=true, tls-host=${host}, obfs=wss, obfs-host=${host}, obfs-uri=${path}, tls-verification=true, tag=${name}`
-        : `trojan=${qxHost(srv)}:${prt}, password=${user}, over-tls=false, obfs=ws, obfs-host=${host}, obfs-uri=${path}, tag=${name}`;
-    }
     return `vless=${qxHost(srv)}:${prt}, method=none, password=${user}, obfs=${tls ? 'wss' : 'ws'}, obfs-host=${host}, obfs-uri=${path}${tls ? ', tls-verification=true, tls13=true' : ''}, tag=${name}`;
   });
   const names = nodes.map((n, i) => {
