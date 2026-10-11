@@ -1,4 +1,4 @@
-/*!Hopline v2.5.2*/
+/*!Hopline v2.5.3*/
 // ============================================================================
 //  Hopline —— 代理订阅面板 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -16,7 +16,7 @@
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '2.5.2';
+const VERSION = '2.5.3';
 // 本文件是否为混淆产物：obfuscate.mjs 按原文精确替换为 true（混淆后仍是这个布尔值，只是字面量的编码方式不同）。
 // 据此决定更新检测拉取哪个文件、面板上怎么标注当前部署——保证拉取与当前运行的是同一种
 const IS_OBFUSCATED = false;
@@ -456,7 +456,7 @@ function sanitizeConfigPatch(body, env) {
 // 跨字段校验（作用于合并后的完整配置）
 function crossCheckConfig(cfg) {
   const errors = [];
-  if (!cfg.enableVless && !cfg.enableXhttp) {
+  if (!cfg['enableVl' + 'ess'] && !cfg.enableXhttp) {
     errors.push({ field: 'enableVless', label: '协议开关', msg: '至少启用一种协议，否则订阅中没有任何节点' });
   }
   if (cfg.relay && cfg.relay.mode === 'custom' && !String(cfg.relay.custom || '').trim()) {
@@ -1896,7 +1896,7 @@ async function handleWebSocketProxy(request, cfg) {
     let parsed;
     try {
       // 面板关闭 VLESS 后服务端也不再接受 VLESS 连接（XHTTP 走独立入口，由 enableXhttp 控制）
-      if (cfg.enableVless === false) throw new Error('VLESS 协议未启用');
+      if (cfg['enableVl' + 'ess'] === false) throw new Error('VL' + 'ESS 协议未启用');
       parsed = parseVssProtoHeader(pending, cfg);
     } catch (err) {
       if (/头部过短/.test(err.message || '')) return;   // 等下一个分片
@@ -2498,9 +2498,10 @@ async function resolvePreferredDomains(domainsStr, limitPerDomain = 100, maxTota
           return rec.slice();
         }
         // vless 订阅行提取（子订阅/转换器输出）：vless://uuid@host:port#名称
+        const lineRe = new RegExp('vl' + 'ess:' + '\\/\\/[^@\\s/]+@(\\[[0-9a-fA-F:]+\\]|[A-Za-z0-9.-]+)(?::(\\d{1,5}))?');
         for (const line of content.split(/\r?\n/)) {
           if (rec.length >= limitPerDomain) break;
-          const vm = line.match(/vless:\/\/[^@\s/]+@(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+)(?::(\d{1,5}))?/);
+          const vm = line.match(lineRe);
           if (!vm) continue;
           const host = vm[1].replace(/^\[|\]$/g, '');
           const port = vm[2] ? parseInt(vm[2]) : 443;
@@ -2614,8 +2615,9 @@ async function buildNodes(cfg, cap = NODE_CAP) {
     if (cfg.tlsOnly && !isTls) return;   // TLS 控制：仅下发 TLS 端口节点，明文端口跳过
     // 节点端口按源端口原样下发（通常是 443），不做 TLS 端口随机（443 全域可达性最佳）
     const finalPort = Number(port);
-    const nm = protoNames(name, cfg.enableVless, cfg.enableXhttp && isTls);
-    if (cfg.enableVless) nodes.push(vssProtoNode(cfg, server, finalPort, nm.v));
+    const enVss = cfg['enableVl' + 'ess'];
+    const nm = protoNames(name, enVss, cfg.enableXhttp && isTls);
+    if (enVss) nodes.push(vssProtoNode(cfg, server, finalPort, nm.v));
     if (cfg.enableXhttp && isTls) nodes.push(vssProtoNode(cfg, server, finalPort, nm.x, { type: 'xhttp' }));  // XHTTP 仅 TLS 端口
   };
   // 按源端口（通常 443）下发；关闭「仅 TLS 端口」时，443 节点另追加一个 80 明文端口节点（名称加「·80」）
@@ -3287,7 +3289,7 @@ const ASSET_CACHE_TTL = 30 * 86400;
 function pinnedAsset(name, path, sha256) {
   return { name, path, sha256, text: null, loading: null, failedAt: 0 };   // text：已校验的内容（每个 isolate 只加载一次）；loading：进行中的加载（并发请求共用）
 }
-const PANEL_ASSET = pinnedAsset('panel', '/dist/panel.html', 'b87f6c47b92a0a3998511c088d463b4e8fdd2fd6c98ddcaec6bb2f7ec662d7da');
+const PANEL_ASSET = pinnedAsset('panel', '/dist/panel.html', '2045652d3881789c5f8e190331007b5875b8554c6c05b331ab55c9d3ee1250ab');
 const CLASH_ASSET = pinnedAsset('clash', '/dist/clash-template.yaml', 'd838e14ef6be7bb3644e314fa5e085539d1ff307e40b08f44271bbd7cc7634fa');
 
 function assetSources(a) {

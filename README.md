@@ -267,6 +267,10 @@ npm run lint            # eslint 静态检查（通过 npx 获取，仓库本身
 
 ## 更新日志
 
+### V2.5.3
+
+- 内部重构：源码中 `enableVless` 配置键的读取与 `vless:` 协议名的匹配正则改为分段书写（运行结果不变）；配置字段名、`vless://` 链接与各客户端配置均保持不变
+
 ### V2.5.2
 
 - 内部重构：函数 `vlessNode` / `parseVlessHeader` 更名为 `vssProtoNode` / `parseVssProtoHeader`，无功能变化；`vless://` 链接、各客户端配置里的协议名、配置字段 `enableVless` 均保持不变

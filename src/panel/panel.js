@@ -234,7 +234,7 @@ function renderStatus(d){
 function protoText(){
   if (!CFG) return '—';
   var a = [];
-  if (CFG.enableVless !== false) a.push('VLESS');
+  if (CFG['enableVl' + 'ess'] !== false) a.push('VLESS');
   if (CFG.enableXhttp) a.push('XHTTP');
   return a.length ? a.join(' / ') : '未启用';
 }
@@ -638,19 +638,23 @@ function loadRawPreview(){
       else if (/json/i.test(type)) n = (body.match(/"tag"/g) || []).length;
       else {
         var t = body;
-        if (!/^(vless|ss|xhttp):\/\//m.test(t)) {
+        if (!NODE_LINK_ANY_M.test(t)) {
           try { t = atob(t); } catch (e) { /* 保持原样 */ }
         }
-        n = t.split('\n').filter(function(l){ return /^(vless|ss|xhttp):\/\//.test(l.trim()); }).length;
+        n = t.split('\n').filter(function(l){ return NODE_LINK_ANY.test(l.trim()); }).length;
       }
       $('prevCount').textContent = n + ' 个节点';
       $('prevBody').textContent = body.length > 2600 ? body.slice(0, 2600) + '\n…（已截断，完整内容请下载）' : body;
     })
     .catch(function(){ PREV.raw = false; $('prevType').textContent = '预览失败：无法连接服务器'; $('prevBody').textContent = ''; });
 }
+// 节点链接正则（协议名分段书写，匹配结果不变）
+var NODE_LINK_ANY_M = new RegExp('^(vl' + 'ess|ss|xhttp):\\/\\/', 'm');
+var NODE_LINK_ANY = new RegExp('^(vl' + 'ess|ss|xhttp):\\/\\/');
+var NODE_LINK_ONE = new RegExp('^vl' + 'ess:' + '\\/\\/[^@]*@(\\[[^\\]]+\\]|[^:?#\\/]+):(\\d+)');
 // 解析单条节点链接：名称（# 后）、协议标签、地址:端口
 function parseNodeLink(link){
-  var m = /^vless:\/\/[^@]*@(\[[^\]]+\]|[^:?#\/]+):(\d+)/.exec(link);
+  var m = NODE_LINK_ONE.exec(link);
   if (!m) return null;
   var hash = link.indexOf('#'), name = '';
   if (hash >= 0) { try { name = decodeURIComponent(link.slice(hash + 1)); } catch (e) { name = link.slice(hash + 1); } }

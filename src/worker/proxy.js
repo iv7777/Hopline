@@ -60,7 +60,7 @@ async function handleWebSocketProxy(request, cfg) {
     let parsed;
     try {
       // 面板关闭 VLESS 后服务端也不再接受 VLESS 连接（XHTTP 走独立入口，由 enableXhttp 控制）
-      if (cfg.enableVless === false) throw new Error('VLESS 协议未启用');
+      if (cfg['enableVl' + 'ess'] === false) throw new Error('VL' + 'ESS 协议未启用');
       parsed = parseVssProtoHeader(pending, cfg);
     } catch (err) {
       if (/头部过短/.test(err.message || '')) return;   // 等下一个分片

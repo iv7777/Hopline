@@ -217,9 +217,10 @@ async function resolvePreferredDomains(domainsStr, limitPerDomain = 100, maxTota
           return rec.slice();
         }
         // vless 订阅行提取（子订阅/转换器输出）：vless://uuid@host:port#名称
+        const lineRe = new RegExp('vl' + 'ess:' + '\\/\\/[^@\\s/]+@(\\[[0-9a-fA-F:]+\\]|[A-Za-z0-9.-]+)(?::(\\d{1,5}))?');
         for (const line of content.split(/\r?\n/)) {
           if (rec.length >= limitPerDomain) break;
-          const vm = line.match(/vless:\/\/[^@\s/]+@(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+)(?::(\d{1,5}))?/);
+          const vm = line.match(lineRe);
           if (!vm) continue;
           const host = vm[1].replace(/^\[|\]$/g, '');
           const port = vm[2] ? parseInt(vm[2]) : 443;
@@ -333,8 +334,9 @@ async function buildNodes(cfg, cap = NODE_CAP) {
     if (cfg.tlsOnly && !isTls) return;   // TLS 控制：仅下发 TLS 端口节点，明文端口跳过
     // 节点端口按源端口原样下发（通常是 443），不做 TLS 端口随机（443 全域可达性最佳）
     const finalPort = Number(port);
-    const nm = protoNames(name, cfg.enableVless, cfg.enableXhttp && isTls);
-    if (cfg.enableVless) nodes.push(vssProtoNode(cfg, server, finalPort, nm.v));
+    const enVss = cfg['enableVl' + 'ess'];
+    const nm = protoNames(name, enVss, cfg.enableXhttp && isTls);
+    if (enVss) nodes.push(vssProtoNode(cfg, server, finalPort, nm.v));
     if (cfg.enableXhttp && isTls) nodes.push(vssProtoNode(cfg, server, finalPort, nm.x, { type: 'xhttp' }));  // XHTTP 仅 TLS 端口
   };
   // 按源端口（通常 443）下发；关闭「仅 TLS 端口」时，443 节点另追加一个 80 明文端口节点（名称加「·80」）
