@@ -1,16 +1,17 @@
 // ---------------------------------------------------------------------------
-// 代理设置的在线修改（可选）：面板通过服务绑定（入口 NodeControl）读写代理的运行设置
+// 代理的在线状态：身份（UUID）、启用开关与运行设置，由面板通过控制接口（proxy-control.js）读写
 // ---------------------------------------------------------------------------
-// 代理自己的 KV（绑定变量名 NODE_KV，建议单独建一个命名空间，只有代理绑定它）里保存一份 settings，
-// 优先级：KV 里的设置 > 环境变量 > 默认值（与原先面板里的规则一致）。只有这 7 项运行设置可以在线修改，
-// UUID 与 PATH（节点身份与路径）永远只来自环境变量，面板改不了。
-// 没有绑定 NODE_KV 时代理完全按环境变量工作，面板里的这些设置只读。
-//
-// 与环境变量相同的值不会写进 KV（只保存与环境变量不同的覆盖项），之后改环境变量立即生效。
-// 读取走 isolate 内存缓存（SETTINGS_MEM_TTL）+ KV 边缘缓存，每个 isolate 约每 20 秒读一次 KV；只有节点路径上的连接才会触发读取。
-// KV 读取失败时沿用上一次读到的设置（没有就用环境变量），绝不因此阻断代理。
-const SETTINGS_KEY = 'settings';
-const SETTINGS_MEM_TTL = 20 * 1000;
+// 保存在代理自己的 KV 里（绑定变量名 NODE_KV，单独的命名空间，只有代理绑定它），一个键 state：
+//   { uuid, prev, prevUntil, enabled, set }
+//   uuid / prev / prevUntil  当前 UUID；轮换后旧 UUID 在 prevUntil 之前仍被接受（10 分钟宽限，在途连接与尚未更新订阅的客户端不会立刻断开）
+//   enabled                  false = 停用：节点路径与其它路径一样只返回伪装页（控制接口仍可用，用来重新启用）
+//   set                      7 项运行设置的覆盖项，优先级：这里 > 环境变量 > 默认值；与环境变量相同的值不落盘
+// 没有 NODE_KV 时无处保存 UUID，代理无法被面板配置好，节点路径上只会返回伪装页。
+// 读取走 isolate 内存缓存（STATE_MEM_TTL）+ KV 边缘缓存，每个 isolate 约每 20 秒读一次 KV；只有节点路径上的连接才会触发。
+// KV 读取失败时沿用上一次读到的状态（从没读到过就视为未配置），绝不因此影响已有连接。
+const STATE_KEY = 'state';
+const STATE_MEM_TTL = 20 * 1000;
+const UUID_GRACE_MS = 10 * 60 * 1000;
 const SETTINGS_FIELDS = ['edgeIP', 'hopAddr', 'hopMode', 'alt.mode', 'alt.region', 'alt.region2', 'alt.custom'];
 const AEAD_METHODS = ['aes-128-gcm', 'aes-256-gcm', 'chacha20-ietf-poly1305'];
 const HOSTNAME_RE = /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
@@ -112,80 +113,165 @@ function crossCheckSettings(flat) {
   return errors;
 }
 
-// 读 KV 里保存的覆盖项：返回 { stored, error }（error：'' / 'unavailable' / 'corrupt'）；带 isolate 内存缓存
-const SETTINGS_MEM = new WeakMap();
-async function readStoredSettings(kv, fresh) {
-  const now = Date.now(), hit = SETTINGS_MEM.get(kv);
-  if (!fresh && hit && now - hit.t < SETTINGS_MEM_TTL) return hit;
+// 状态的规范化：只认合法的字段，其它一律丢弃（无效项不影响其它项）
+function emptyState() { return { uuid: '', prev: '', prevUntil: 0, enabled: true, set: {} }; }
+function sanitizeState(obj) {
+  const st = emptyState();
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return st;
+  if (typeof obj.uuid === 'string' && isUUID(obj.uuid)) st.uuid = obj.uuid.toLowerCase();
+  if (typeof obj.prev === 'string' && isUUID(obj.prev) && Number(obj.prevUntil) > 0) { st.prev = obj.prev.toLowerCase(); st.prevUntil = Number(obj.prevUntil); }
+  if (obj.enabled === false) st.enabled = false;
+  st.set = sanitizeSettings(obj.set).values;
+  return st;
+}
+
+// 读 KV 里保存的状态：返回 { state, error }（error：'' / 'unavailable' / 'corrupt'）；带 isolate 内存缓存
+const STATE_MEM = new WeakMap();
+async function readNodeState(kv, fresh) {
+  const now = Date.now(), hit = STATE_MEM.get(kv);
+  if (!fresh && hit && now - hit.t < STATE_MEM_TTL) return hit;
   let entry;
   try {
-    const raw = await kv.get(SETTINGS_KEY, fresh ? undefined : { cacheTtl: 30 });
-    let stored = {}, error = '';
+    const raw = await kv.get(STATE_KEY, fresh ? undefined : { cacheTtl: 30 });
+    let state = emptyState(), error = '';
     if (raw) {
       try {
         const obj = JSON.parse(raw);
         if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new SyntaxError('not an object');
-        stored = sanitizeSettings(obj).values;   // 无效项直接丢弃，不影响其它项
-      } catch (e) { stored = {}; error = 'corrupt'; }
+        state = sanitizeState(obj);
+      } catch (e) { state = emptyState(); error = 'corrupt'; }
     }
-    entry = { t: now, stored, error };
+    entry = { t: now, state, error };
   } catch (e) {
-    // 读取失败：沿用上一次读到的设置，5 秒后重试；从没读到过就用环境变量
-    entry = { t: now - SETTINGS_MEM_TTL + 5000, stored: hit ? hit.stored : {}, error: 'unavailable' };
+    // 读取失败：沿用上一次读到的状态，5 秒后重试；从没读到过就视为未配置
+    entry = { t: now - STATE_MEM_TTL + 5000, state: hit ? hit.state : emptyState(), error: 'unavailable' };
   }
-  SETTINGS_MEM.set(kv, entry);
+  STATE_MEM.set(kv, entry);
   return entry;
 }
+async function writeNodeState(kv, state) {
+  await kv.put(STATE_KEY, JSON.stringify(state));
+  STATE_MEM.set(kv, { t: Date.now(), state, error: '' });
+}
+// 当前接受的 UUID 列表：当前的一个，加上宽限期内的旧的一个
+function acceptedUuids(st, now) {
+  const out = [];
+  if (st.uuid) out.push(st.uuid);
+  if (st.prev && st.prevUntil > now) out.push(st.prev);
+  return out;
+}
 
-// 代理运行时使用的配置：环境变量 + KV 覆盖项（没有 NODE_KV 或环境变量有问题时就是环境变量本身）
+// 代理运行时使用的配置：环境变量 + KV 里的状态（UUID 列表、启用开关、设置覆盖项）。没有 NODE_KV 或环境变量有问题时就是环境变量本身（没有 UUID）
 async function loadNodeConfig(env, base) {
   const cfg = base || nodeConfig(env);
   const kv = nodeKv(env);
   if (!kv || cfg._problems.length) return cfg;
-  const { stored } = await readStoredSettings(kv);
-  return applySettings(cfg, stored);
+  const { state } = await readNodeState(kv);
+  cfg.uuids = acceptedUuids(state, Date.now());
+  cfg.enabled = state.enabled;
+  return applySettings(cfg, state.set);
 }
 
 // getSettings 的返回值：生效值、环境变量值、每项的来源、可选地区
-function describeSettings(env, stored, error) {
+function describeSettings(env, set, error) {
   const envFlat = flatSettings(nodeConfig(env));
-  const settings = Object.assign({}, envFlat, stored);
+  const settings = Object.assign({}, envFlat, set);
   const source = {};
-  for (const k of SETTINGS_FIELDS) source[k] = k in stored ? 'kv' : (envFlat[k] !== DEFAULT_SETTINGS[k] ? 'env' : 'default');
+  for (const k of SETTINGS_FIELDS) source[k] = k in set ? 'kv' : (envFlat[k] !== DEFAULT_SETTINGS[k] ? 'env' : 'default');
   const kv = nodeKv(env);
   return { ok: true, storage: !!(kv && typeof kv.put === 'function'), settings, env: envFlat, source, regions: Object.keys(ALT_DOMAINS), error: error || '' };
 }
+const NO_KV_MSG = '代理没有绑定 KV（变量名 NODE_KV），无法保存：UUID 与在线设置都保存在这个 KV 里，请先给代理绑定一个单独的 KV 命名空间';
 async function getNodeSettings(env) {
   const kv = nodeKv(env);
   if (!kv) return describeSettings(env, {}, '');
-  const { stored, error } = await readStoredSettings(kv);
-  return describeSettings(env, stored, error);
+  const { state, error } = await readNodeState(kv);
+  return describeSettings(env, state.set, error);
 }
-// 保存：patch 里出现的项逐项校验（任何一项出错整批都不保存），与环境变量相同的值不落盘
-async function saveNodeSettings(env, patch) {
+// 读-改-写：先用 fresh 读到当前状态（KV 读取失败时拒绝，避免覆盖；内容损坏时允许写入来修复），再由 mutate 改出新状态
+async function updateNodeState(env, mutate) {
   const kv = nodeKv(env);
-  if (!kv || typeof kv.put !== 'function') return { ok: false, error: '代理没有绑定 KV（变量名 NODE_KV），无法保存设置；这些设置仍可以通过环境变量修改' };
+  if (!kv || typeof kv.put !== 'function') return { ok: false, error: NO_KV_MSG };
+  const cur = await readNodeState(kv, true);
+  if (cur.error === 'unavailable') return { ok: false, error: 'KV 暂时无法读取，为避免覆盖已有状态，已禁止保存' };
+  const next = mutate(Object.assign({}, cur.state, { set: Object.assign({}, cur.state.set) }));
+  if (next.error) return { ok: false, error: next.error, errors: next.errors || [], ignored: next.ignored || [] };
+  try { await writeNodeState(kv, next.state); }
+  catch (e) { return { ok: false, error: 'KV 写入失败：' + ((e && e.message) || e) }; }
+  return { ok: true, state: next.state, ignored: next.ignored || [] };
+}
+// 保存设置：patch 里出现的项逐项校验（任何一项出错整批都不保存），与环境变量相同的值不落盘
+async function saveNodeSettings(env, patch) {
   const { values, errors, ignored } = sanitizeSettings(patch);
   if (errors.length) return { ok: false, error: errors.map(e => e.msg).join('；'), errors, ignored };
-  const cur = await readStoredSettings(kv, true);
-  if (cur.error === 'unavailable') return { ok: false, error: 'KV 暂时无法读取，为避免覆盖已有设置，已禁止保存' };   // 内容损坏（corrupt）时允许保存来修复
   const envFlat = flatSettings(nodeConfig(env));
-  const merged = Object.assign({}, envFlat, cur.stored, values);
-  const cross = crossCheckSettings(merged);
-  if (cross.length) return { ok: false, error: cross.map(e => e.msg).join('；'), errors: cross, ignored };
-  const next = {};
-  for (const k of SETTINGS_FIELDS) if (merged[k] !== envFlat[k]) next[k] = merged[k];
-  try { await kv.put(SETTINGS_KEY, JSON.stringify(next)); }
-  catch (e) { return { ok: false, error: 'KV 写入失败：' + ((e && e.message) || e) }; }
-  SETTINGS_MEM.set(kv, { t: Date.now(), stored: next, error: '' });
-  return Object.assign(describeSettings(env, next, ''), { ignored });
+  const r = await updateNodeState(env, (st) => {
+    const merged = Object.assign({}, envFlat, st.set, values);
+    const cross = crossCheckSettings(merged);
+    if (cross.length) return { error: cross.map(e => e.msg).join('；'), errors: cross, ignored };
+    const set = {};
+    for (const k of SETTINGS_FIELDS) if (merged[k] !== envFlat[k]) set[k] = merged[k];
+    st.set = set;
+    return { state: st, ignored };
+  });
+  return r.ok ? Object.assign(describeSettings(env, r.state.set, ''), { ignored: r.ignored }) : r;
 }
-// 重置：删除 KV 里的覆盖项，回到环境变量 + 默认值
+// 重置设置：只清除设置覆盖项，回到环境变量 + 默认值；UUID 与启用开关不动
 async function resetNodeSettings(env) {
+  const r = await updateNodeState(env, (st) => { st.set = {}; return { state: st }; });
+  return r.ok ? describeSettings(env, {}, '') : r;
+}
+// 下发 UUID：rotate 为真且已有不同的 UUID 时，旧的保留 UUID_GRACE_MS 的宽限期
+async function setNodeIdentity(env, args) {
+  const uuid = args && typeof args.uuid === 'string' ? args.uuid.trim().toLowerCase() : '';
+  if (!isUUID(uuid)) return { ok: false, error: 'UUID 格式不正确' };
+  const r = await updateNodeState(env, (st) => {
+    if (st.uuid && st.uuid !== uuid && args.rotate === true) { st.prev = st.uuid; st.prevUntil = Date.now() + UUID_GRACE_MS; }
+    else if (st.uuid !== uuid) { st.prev = ''; st.prevUntil = 0; }
+    st.uuid = uuid;
+    return { state: st };
+  });
+  return r.ok ? { ok: true, uuidTag: await uuidTag(uuid), graceMs: r.state.prev ? UUID_GRACE_MS : 0 } : r;
+}
+// 读出当前 UUID（只有持有密钥的面板能调到）：面板丢了自己保存的 UUID（比如重新添加这个代理）时用来接管，而不是生成新的把客户端搞断
+async function getNodeIdentity(env) {
   const kv = nodeKv(env);
-  if (!kv || typeof kv.delete !== 'function') return { ok: false, error: '代理没有绑定 KV（变量名 NODE_KV），没有需要重置的设置' };
-  try { await kv.delete(SETTINGS_KEY); }
-  catch (e) { return { ok: false, error: 'KV 删除失败：' + ((e && e.message) || e) }; }
-  SETTINGS_MEM.set(kv, { t: Date.now(), stored: {}, error: '' });
-  return describeSettings(env, {}, '');
+  if (!kv) return { ok: false, error: NO_KV_MSG };
+  const { state, error } = await readNodeState(kv, true);
+  if (error === 'unavailable') return { ok: false, error: 'KV 暂时无法读取' };
+  return state.uuid ? { ok: true, uuid: state.uuid } : { ok: false, error: '代理还没有下发 UUID' };
+}
+// 启用 / 停用：停用后节点路径只返回伪装页（控制接口不受影响）
+async function setNodeEnabled(env, args) {
+  if (!args || typeof args.enabled !== 'boolean') return { ok: false, error: '缺少 enabled（true / false）' };
+  const r = await updateNodeState(env, (st) => { st.enabled = args.enabled; return { state: st }; });
+  return r.ok ? { ok: true, enabled: r.state.enabled } : r;
+}
+// 状态：是否在线 / 版本 / 配置问题 / 是否已下发 UUID / 是否启用 / 设置摘要（不含 UUID、路径、密钥、反代地址与出站代理的主机和密码）
+async function nodeStatus(env) {
+  const base = nodeConfig(env);
+  const kv = nodeKv(env);
+  let state = emptyState(), kvError = '';
+  if (kv && !base._problems.length) { const r = await readNodeState(kv); state = r.state; kvError = r.error; }
+  const cfg = applySettings(nodeConfig(env), state.set);
+  const out = cfg.hopAddr ? parseHopAddress(cfg.hopAddr) : null;
+  return {
+    ok: base._problems.length === 0,
+    version: VERSION,
+    problems: base._problems,
+    storage: !!kv,
+    kvError,
+    provisioned: !!state.uuid,
+    enabled: state.enabled,
+    uuidTag: state.uuid ? await uuidTag(state.uuid) : '',
+    settings: {
+      edgeIP: !!cfg.edgeIP,
+      hopAddr: out ? out.type : '',
+      hopMode: cfg.hopMode,
+      altMode: cfg.alt.mode,
+      altRegion: cfg.alt.region,
+      altRegion2: cfg.alt.region2,
+      altCustom: cfg.alt.custom ? cfg.alt.custom.split('\n').length : 0,
+    },
+  };
 }

@@ -1,25 +1,22 @@
-/*!Hopline-panel v3.0.5*/
+/*!Hopline-panel v3.1.0*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
 //  只负责「怎么连」：管理面板、登录、订阅生成（vless 链接 / Clash / Sing-box 等）。
-//  代理本身是另一个脚本（Hopline-proxy.js），面板只需要它的 域名、UUID 与节点路径，两者之间没有任何运行时联系。
+//  代理本身是另一个脚本（Hopline-proxy.js）：面板里保存代理列表（域名、节点路径、密钥、UUID、启停），
+//  用密钥对请求签名，通过 HTTPS 联系代理的控制接口（不需要服务绑定，面板与代理可以在不同的 Cloudflare 账号）。
+//  UUID 由面板生成并下发给代理；停用某个代理时，订阅里不再下发它，并通知代理对外只显示 Hello World。
 //  环境变量（必填 2 项，其余可选）：
 //    PATH            【必填】面板与订阅的访问路径，如 mypanel（与代理的节点路径互相独立）
 //    ADMIN           【必填】面板管理密码：未设置时面板与管理 API 一律禁用
 //    ADMIN_USER      面板管理用户名（默认 admin；登录时与密码一起校验）
-//    CONFIG_KV       KV 命名空间的绑定变量名：绑定后读取 / 保存图形化配置（保存面板设置必须绑定）
-//    HOST            代理域名的默认值（节点 SNI / Host）；面板里填写后以面板为准
-//    UUID            代理 UUID 的默认值（须与代理脚本的 UUID 相同）；面板里填写后以面板为准
-//    NODE_PATH       代理节点路径的默认值（须与代理脚本的 PATH 相同）；面板里填写后以面板为准
+//    CONFIG_KV       KV 命名空间的绑定变量名：绑定后读取 / 保存图形化配置与代理列表（保存必须绑定）
 //    ENABLE_ECH      设为 true/1 开启 ECH 加密
 //    ALPN            自定义 ALPN 协商
-//  服务绑定（可选）：
-//    PROXY           指向代理 Worker 的服务绑定：入口 NodeStatus = 只读（「运行状态」显示代理是否在线与版本）；
-//                    入口 NodeControl = 另可在面板「代理设置」里在线修改代理的出站 / 地区反代设置（代理还需绑定 NODE_KV）
+//  代理的域名、节点路径、密钥在面板「面板设置 → 代理」里填写（保存在 CONFIG_KV）。
 // ============================================================================
 // 面板脚本（Hopline-panel.js）的版本号：用于检测更新与面板里显示。与代理脚本各自编号、各自升版本
-const VERSION = '3.0.5';
+const VERSION = '3.1.0';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
 // 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
@@ -166,12 +163,9 @@ const CLOUDFLARE_RANGES = CLOUDFLARE_CIDRS.map(cidrToRange);
 //   custom    面板中由专用代码回填 / 收集（通用逻辑跳过）
 // ---------------------------------------------------------------------------
 // 环境变量名（旧版短变量名 U / D / S / K / ECH 等已不再识别）。
-// PATH 与 ADMIN 为必填；其余均可选。uuid / nodePath / host 描述的是代理脚本（Hopline-proxy.js）的 UUID、节点路径与域名，
-// 环境变量只提供默认值，面板里填写后以面板为准
+// PATH 与 ADMIN 为必填；其余均可选。代理（域名、节点路径、密钥、UUID）不是面板配置项，保存在面板 KV 的 proxies 里（见 proxies.js）
 const ENV_NAMES = {
-  uuid: ['UUID'],
   path: ['PATH'],
-  nodePath: ['NODE_PATH'],
   admin: ['ADMIN'],
   adminUser: ['ADMIN_USER'],
   ech: ['ENABLE_ECH'],
@@ -187,19 +181,11 @@ function kvStore(env) {
   for (const n of ENV_NAMES.kv) if (env && env[n] && typeof env[n] === 'object') return env[n];
   return null;
 }
-const UUID_PATTERN = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
 const PATH_SEG_PATTERN = '^[A-Za-z0-9._~-]+$';
 const HOSTNAME_PATTERN = '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$';
 const RESERVED_PATHS = ['login', 'version'];
 
 const CONFIG_SCHEMA = [
-  // ---- 代理端点：订阅里的节点指向哪里（填写代理脚本的 域名、UUID 与节点路径；三项都填了才能生成订阅） ----
-  { key: 'host', type: 'string', def: '', el: 'a-host', label: '代理域名', maxLen: 253, strip: ['^https?://', '[/?#].*$'],
-    pattern: HOSTNAME_PATTERN, hint: '请填写代理的域名，如 node.example.com' },
-  { key: 'uuid', type: 'string', def: '', el: 'a-uuid', label: '代理 UUID', lower: true,
-    pattern: UUID_PATTERN, hint: 'UUID 格式不正确（应为 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx，可点「生成」）' },
-  { key: 'nodePath', type: 'string', def: '', el: 'a-nodepath', label: '代理节点路径', maxLen: 128, strip: ['^/+', '/+$'],
-    pattern: PATH_SEG_PATTERN, hint: '只能包含字母、数字及 . _ ~ -（不含 /），须与代理脚本的 PATH 相同' },
   // ---- 面板设置 ----
   // 面板与订阅的访问路径：由必填的环境变量 PATH 提供（面板中只读）；与代理的节点路径互相独立
   { key: 'path', type: 'string', def: '', el: 'a-path', label: '面板路径', maxLen: 128, strip: ['^/+', '/+$'],
@@ -627,6 +613,38 @@ function sha224hex(str) {
   return hex;
 }
 // ---------------------------------------------------------------------------
+// HMAC-SHA256 与常量时间比较（面板与代理共用：面板签名控制请求，代理验证并签名回应）
+// ---------------------------------------------------------------------------
+function b64uOfBytes(u8) {
+  let bin = '';
+  for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode(...u8.subarray(i, i + 0x8000));
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+const HMAC_KEYS = new Map();   // 原始密钥字符串 → CryptoKey（至多缓存 4 个）
+async function hmacB64u(keyStr, msg) {
+  let k = HMAC_KEYS.get(keyStr);
+  if (!k) {
+    k = await crypto.subtle.importKey('raw', TE.encode(keyStr), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    if (HMAC_KEYS.size >= 4) HMAC_KEYS.clear();
+    HMAC_KEYS.set(keyStr, k);
+  }
+  return b64uOfBytes(new Uint8Array(await crypto.subtle.sign('HMAC', k, TE.encode(msg))));
+}
+function timingSafeEqual(a, b) {
+  a = String(a); b = String(b);
+  let r = a.length ^ b.length;
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) r |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return r === 0;
+}
+// 控制请求的路径标记：由密钥派生，不知道密钥就找不到控制入口
+async function routeTag(keyStr) { return (await hmacB64u(keyStr, 'route')).slice(0, 16); }
+// UUID 的短标记（SHA-256 前 8 位十六进制）：面板据此判断代理上的 UUID 是否与自己保存的一致，而不必回传 UUID 本身
+async function uuidTag(uuid) {
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', TE.encode(String(uuid).toLowerCase())));
+  return Array.from(d.subarray(0, 4)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+// ---------------------------------------------------------------------------
 // DoH 查询（面板与代理共用）
 // ---------------------------------------------------------------------------
 // 依次尝试 DoH 端点：前一个失败（网络错误 / 非 200 / SERVFAIL 等）立即换下一个；
@@ -682,13 +700,8 @@ async function loadConfig(env) {
   }
   const cfg = buildConfig(env, kvCfg);
   if (kvError) cfg._kvError = kvError;
+  await attachProxies(env, cfg);
   return cfg;
-}
-
-// 环境变量 UUID（有效时返回小写形式，否则空串）
-function envUuid(env) {
-  const v = String(envVar(env, 'uuid') || '').toLowerCase();
-  return isUUID(v) ? v : '';
 }
 
 // 面板路径（环境变量 PATH）：去掉首尾 /，只允许 字母 数字 . _ ~ -，且不能是保留路径。返回 { value, error }
@@ -701,17 +714,11 @@ function normalizePanelPath(raw) {
 }
 
 // 由「默认值 < 环境变量 < KV 配置 < 锁定的环境变量」组装完整配置（纯函数：保存接口用刚写入的数据直接组装，
-// 不经 KV 边缘缓存，避免保存后回读到旧配置）。cfg.uuid / cfg.host / cfg.nodePath 为空表示代理端点尚未填写，cfg.path 为空表示 PATH 未设置 / 非法
+// 不经 KV 边缘缓存，避免保存后回读到旧配置）。cfg.path 为空表示 PATH 未设置 / 非法；代理列表由 loadConfig 另行读入（cfg.proxies / cfg.proxy）
 function buildConfig(env, kvCfg) {
   const cfg = schemaDefaults();
   const flag = (v) => v === true || v === 'true' || v === '1' || v === 1;
   // 环境变量
-  const envBase = { host: '', nodePath: '' };
-  if (envVar(env, 'uuid')) cfg.uuid = String(envVar(env, 'uuid')).toLowerCase();
-  if (env.HOST) envBase.host = String(env.HOST).replace(/^https?:\/\//, '').split('/')[0];
-  if (envVar(env, 'nodePath')) envBase.nodePath = String(envVar(env, 'nodePath')).trim().replace(/^\/+/, '').replace(/\/+$/, '');
-  cfg.host = envBase.host;
-  cfg.nodePath = envBase.nodePath;
   if (flag(envVar(env, 'ech'))) cfg.ech = true;
   if (env.ALPN) cfg.alpn = String(env.ALPN);
   // KV 图形化配置（更高优先级）：按字段表逐项合并，未登记的字段自动忽略
@@ -729,11 +736,6 @@ function buildConfig(env, kvCfg) {
     if (d.lower) v = v.toLowerCase();
     setPath(cfg, key, v);
   }
-  // 代理端点三项：面板里留空（或 UUID 非法）时回退环境变量；仍没有则留空，订阅会提示尚未填写
-  cfg.uuid = String(cfg.uuid || '').toLowerCase();
-  if (!isUUID(cfg.uuid)) cfg.uuid = envUuid(env);
-  if (!cfg.host) cfg.host = envBase.host;
-  if (!cfg.nodePath) cfg.nodePath = envBase.nodePath;
   // 面板路径只认环境变量 PATH（不再回退 UUID）；非法值按未设置处理并记下原因
   const np = normalizePanelPath(locked.path ? env[locked.path] : '');
   cfg.path = np.value;
@@ -769,6 +771,293 @@ async function saveConfig(env, cfg) {
 }
 
 
+// ---------------------------------------------------------------------------
+// 面板调用代理的控制接口（签名的 HTTPS 请求；协议见 proxy-control.js）
+// ---------------------------------------------------------------------------
+// 面板与代理没有任何绑定关系：只需要代理的域名、节点路径与密钥，所以可以在不同的 Cloudflare 账号里。
+// 代理必须使用自定义域名（Worker 对同一 zone 内 workers.dev / 路由上的另一个 Worker 发 fetch 会被 Cloudflare 拒绝，见错误 1042 / 1024）。
+const CALL_TIMEOUT = 6000;
+const CALL_BODY_MAX = 64 * 1024;
+const PROXY_HOST_RE = /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$/;
+
+// 面板只会连到管理员填写的域名：必须是域名（不是 IP）、不带端口 / 路径
+function proxyHostOk(host) {
+  host = String(host || '');
+  return host.length <= 253 && PROXY_HOST_RE.test(host) && !isValidIp(host);
+}
+function randomNonce() { return b64uOfBytes(crypto.getRandomValues(new Uint8Array(16))); }
+
+// 把 Cloudflare 的错误页 / 伪装页翻译成管理员能看懂的原因
+function explainControlFailure(status, text) {
+  const code = (String(text).match(/error code:\s*(\d{4})/i) || [])[1];
+  if (code === '1042') return 'Cloudflare 拒绝了这次请求（错误 1042）：面板与代理在同一个 zone 里，代理必须用自定义域名（Custom Domain），不能是 workers.dev 或路由';
+  if (code === '1024') return 'Cloudflare 拒绝了这次请求（错误 1024）：不能向 Cloudflare 的 IP 发请求，请填写代理的域名而不是 IP';
+  if (code) return 'Cloudflare 返回了错误 ' + code;
+  if (status === 503 && text) return '代理返回：' + String(text).trim().slice(0, 200);
+  if (/Hello World/i.test(text)) return '代理没有响应控制请求：节点路径或密钥不对、代理还没设置 NODE_KEY，或代理脚本版本过旧';
+  return '代理返回了无法识别的响应（HTTP ' + status + '）';
+}
+// 发一次签名请求并验证回应；失败抛 Error（message 可直接显示）。proxy：{ host, nodePath, key }
+async function callProxy(proxy, op, args) {
+  if (!proxy || !proxy.key) throw new Error('这个代理还没有填写密钥');
+  if (!proxyHostOk(proxy.host)) throw new Error('代理域名不正确（只能是域名，不能是 IP，也不带端口或路径）');
+  const ts = Date.now(), n = randomNonce(), a = JSON.stringify(args || {});
+  const body = JSON.stringify({ ts, n, op, a, s: await hmacB64u(proxy.key, ts + '.' + n + '.' + op + '.' + a) });
+  const url = 'https://' + proxy.host + '/' + proxy.nodePath + '/' + await routeTag(proxy.key);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CALL_TIMEOUT);
+  let res, text;
+  try {
+    res = await fetch(url, { method: 'POST', body, redirect: 'manual', signal: ctrl.signal, headers: { 'Content-Type': 'application/json' } });
+    text = (await res.text()).slice(0, CALL_BODY_MAX);
+  } catch (e) {
+    throw new Error(ctrl.signal.aborted ? '调用超时（代理 ' + CALL_TIMEOUT / 1000 + ' 秒内没有响应）' : '无法连接代理：' + ((e && e.message) || e));
+  } finally { clearTimeout(timer); }
+  let j = null;
+  try { j = JSON.parse(text); } catch (e) { /* 不是 JSON：下面按失败说明 */ }
+  if (!j || typeof j.d !== 'string' || typeof j.s !== 'string' || typeof j.ts !== 'number') throw new Error(explainControlFailure(res.status, text));
+  if (!timingSafeEqual(await hmacB64u(proxy.key, j.ts + '.' + n + '.' + j.d), j.s)) throw new Error('代理的回应签名不对（密钥不一致？）');
+  if (Math.abs(Date.now() - j.ts) > 60000) throw new Error('代理的回应时间偏差过大');
+  const d = JSON.parse(j.d);
+  if (!d || typeof d !== 'object') throw new Error('代理返回的内容不正确');
+  return d;
+}
+// 把「操作失败」的结果（ok:false）转成 Error，方便调用方统一处理
+async function callProxyOk(proxy, op, args) {
+  const d = await callProxy(proxy, op, args);
+  if (d.ok === false) throw Object.assign(new Error(String(d.error || '代理拒绝了这次操作')), { errors: Array.isArray(d.errors) ? d.errors : [] });
+  return d;
+}
+
+// 同步：让代理与面板保存的一致。面板没有 UUID 时：代理上已经有就接管它（不会把已经在用的客户端搞断），没有才生成新的；
+// 代理还没下发 UUID 或 UUID 对不上就下发面板的；启用状态不一致就同步。返回 { status, actions, uuid }（uuid 可能是新得到的，由调用方存回面板）
+async function syncProxy(proxy) {
+  const actions = [];
+  let st = await callProxyOk(proxy, 'status', {});
+  if (!st.ok) return { status: st, actions, uuid: proxy.uuid };   // 代理自己的环境变量有问题：先让管理员处理
+  let uuid = proxy.uuid;
+  if (!uuid) {
+    if (st.provisioned) { uuid = (await callProxyOk(proxy, 'getIdentity', {})).uuid; actions.push('已接管代理上现有的 UUID'); }
+    else { uuid = crypto.randomUUID(); actions.push('已生成 UUID'); }
+  }
+  if (!st.provisioned || st.uuidTag !== await uuidTag(uuid)) {
+    await callProxyOk(proxy, 'setIdentity', { uuid });
+    actions.push(st.provisioned ? '已把面板的 UUID 重新下发给代理' : '已把 UUID 下发给代理');
+  }
+  if (st.enabled !== proxy.enabled) {
+    await callProxyOk(proxy, 'setEnabled', { enabled: proxy.enabled });
+    actions.push(proxy.enabled ? '已启用代理' : '已停用代理');
+  }
+  if (actions.length) st = await callProxyOk(proxy, 'status', {});
+  return { status: st, actions, uuid };
+}
+// ---------------------------------------------------------------------------
+// 代理列表：面板 KV 里的 proxies（一个 JSON 数组），每项 { id, name, host, nodePath, uuid, key, enabled }
+// ---------------------------------------------------------------------------
+// 面板是 UUID 的权威：由面板生成并下发给代理（见 proxy-client.js 的 syncProxy）。密钥只写不读：接口不回传，备份不导出。
+// 目前订阅只使用第一个启用的代理；数据结构、接口与代理设置页已经按「多个代理」设计，之后加多代理订阅不需要迁移。
+const PROXIES_KEY = 'proxies';
+const PROXIES_MAX = 8;
+
+function publicProxy(p) {
+  return { id: p.id, name: p.name, host: p.host, nodePath: p.nodePath, uuid: p.uuid, keySet: !!p.key, enabled: p.enabled };
+}
+function cleanProxyRecord(r) {
+  if (!r || typeof r !== 'object') return null;
+  const id = String(r.id || '');
+  if (!/^[A-Za-z0-9_-]{4,32}$/.test(id)) return null;
+  return {
+    id, name: String(r.name || '').slice(0, 40) || id,
+    host: String(r.host || '').toLowerCase(), nodePath: String(r.nodePath || ''),
+    uuid: isUUID(r.uuid) ? String(r.uuid).toLowerCase() : '', key: typeof r.key === 'string' ? r.key : '', enabled: r.enabled !== false,
+  };
+}
+// 读入面板配置时附带代理列表：cfg.proxies 全部，cfg.proxy 第一个启用的（订阅用）；读取失败记在 cfg._proxiesError（此时拒绝保存）
+async function attachProxies(env, cfg) {
+  cfg.proxies = []; cfg.proxy = null;
+  const kv = kvStore(env);
+  if (!kv || typeof kv.get !== 'function') return;
+  try {
+    const raw = await kv.get(PROXIES_KEY, { cacheTtl: 30 });
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) throw new SyntaxError('not an array');
+      cfg.proxies = arr.map(cleanProxyRecord).filter(Boolean).slice(0, PROXIES_MAX);
+    }
+  } catch (e) { cfg._proxiesError = (e instanceof SyntaxError) ? 'corrupt' : 'unavailable'; }
+  cfg.proxy = cfg.proxies.find(p => p.enabled) || null;
+}
+async function saveProxies(env, list) {
+  const kv = kvStore(env);
+  if (!kv || typeof kv.put !== 'function') throw new Error('未绑定 KV 命名空间（变量名 CONFIG_KV），无法保存代理');
+  await kv.put(PROXIES_KEY, JSON.stringify(list));
+}
+
+// 校验并规范化管理员提交的字段（partial：更新时只处理出现的项；密钥留空 = 保持不变）。返回 { value, errors }
+function sanitizeProxyInput(input, { partial } = {}) {
+  const value = {}, errors = [];
+  const err = (field, msg) => errors.push({ field, msg });
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return { value, errors: [{ field: '', msg: '请求体必须为 JSON 对象' }] };
+  const has = (k) => input[k] !== undefined;
+  const str = (k) => (input[k] == null ? '' : String(input[k]).trim());
+  if (has('name')) { const v = str('name'); if (v.length > 40) err('name', '名称最长 40 个字符'); else value.name = v; }
+  if (has('host') || !partial) {
+    const v = str('host').replace(/^https?:\/\//i, '').replace(/[/?#].*$/, '').toLowerCase();
+    if (!v) err('host', '请填写代理的域名，如 node.example.com');
+    else if (!proxyHostOk(v)) err('host', '代理域名不正确：只能是域名（不是 IP），不带端口或路径');
+    else value.host = v;
+  }
+  if (has('nodePath') || !partial) {
+    const v = str('nodePath').replace(/^\/+/, '').replace(/\/+$/, '');
+    if (!v) err('nodePath', '请填写代理的节点路径（与代理的环境变量 PATH 相同）');
+    else if (!new RegExp(PATH_SEG_PATTERN).test(v) || v.length > 128) err('nodePath', '只能包含字母、数字及 . _ ~ -（不含 /），最长 128 位');
+    else value.nodePath = v;
+  }
+  if (has('uuid')) {
+    const v = str('uuid').toLowerCase();
+    if (v && !isUUID(v)) err('uuid', 'UUID 格式不正确（应为 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx；留空则连接时自动生成）');
+    else value.uuid = v;
+  }
+  if (has('key') && str('key') !== '') {
+    const v = String(input.key).trim();
+    if (v.length < 24 || v.length > 256 || !/^[\x21-\x7e]+$/.test(v)) err('key', '密钥至少 24 位，只能是可见的 ASCII 字符（可以点「生成密钥」）');
+    else value.key = v;
+  } else if (!partial) err('key', '请填写密钥（与代理的环境变量 NODE_KEY 相同；可以点「生成密钥」）');
+  if (has('enabled')) { if (typeof input.enabled !== 'boolean') err('enabled', '必须为开或关'); else value.enabled = input.enabled; }
+  return { value, errors };
+}
+function newProxyId() { return b64uOfBytes(crypto.getRandomValues(new Uint8Array(6))); }
+
+// 订阅需要的代理端点是否齐全：返回尚未就绪的说明（空数组 = 可以生成订阅）
+function endpointMissing(cfg) {
+  if (cfg._proxiesError) return ['代理列表（' + (cfg._proxiesError === 'corrupt' ? 'KV 里的内容已损坏' : 'KV 暂时无法读取') + '）'];
+  const px = cfg.proxy;
+  if (!px) return [cfg.proxies && cfg.proxies.length ? '启用中的代理（现有的都已停用）' : '代理（请先在「面板设置 → 代理」添加）'];
+  return [['host', '代理域名'], ['nodePath', '节点路径'], ['uuid', 'UUID（点「连接并同步」会自动生成并下发）']].filter(([k]) => !px[k]).map(([, label]) => label);
+}
+// ---------------------------------------------------------------------------
+// 面板的代理管理接口（需登录）：/api/proxies（增删改、同步、启停、换 UUID）、/api/proxy-status、/api/proxy-settings、/api/proxy-reset
+// ---------------------------------------------------------------------------
+const pickProxy = (cfg, id) => (id ? cfg.proxies.find(p => p.id === id) : (cfg.proxy || cfg.proxies[0])) || null;
+
+// 代理状态（给仪表盘）：调用失败不抛错，返回 { configured, up, error }
+async function proxyStatusOf(p) {
+  if (!p) return { configured: false };
+  const base = { configured: true, id: p.id, name: p.name, enabledHere: p.enabled };
+  if (!p.key) return Object.assign(base, { up: false, error: '没有填写密钥' });
+  try {
+    const st = await callProxyOk(p, 'status', {});
+    return Object.assign(base, {
+      up: true, ok: st.ok === true, version: String(st.version || ''), problems: Array.isArray(st.problems) ? st.problems.map(String) : [],
+      storage: st.storage === true, kvError: String(st.kvError || ''), provisioned: st.provisioned === true, enabled: st.enabled !== false,
+      uuidMatch: !!(st.provisioned && p.uuid && st.uuidTag === await uuidTag(p.uuid)),
+      settings: st.settings && typeof st.settings === 'object' ? st.settings : {},
+    });
+  } catch (e) { return Object.assign(base, { up: false, error: String((e && e.message) || e) }); }
+}
+const proxyFail = (e) => json({ ok: false, msg: String((e && e.message) || e), errors: (e && e.errors) || [] }, (e && e.errors && e.errors.length) ? 400 : 502);
+const noProxy = () => json({ ok: false, msg: '还没有代理：请先在「面板设置 → 代理」添加一个（填写域名、节点路径和密钥）' }, 400);
+
+async function handleProxiesApi(apiName, request, env, cfg, segs, url) {
+  const method = request.method;
+  const guardWrite = () => {
+    if (cfg._proxiesError) return json({ ok: false, msg: '代理列表读取失败（' + (cfg._proxiesError === 'corrupt' ? 'KV 里的内容已损坏' : 'KV 暂时无法读取') + '），为避免覆盖已有数据，已禁止保存' }, 503);
+    const kv = kvStore(env);
+    if (!kv || typeof kv.put !== 'function') return json({ ok: false, msg: '未绑定 KV 命名空间（变量名 CONFIG_KV），无法保存代理；请在面板 Worker 设置中绑定 KV 后重试' }, 400);
+    return null;
+  };
+  const readBody = async () => { try { return await request.json(); } catch (e) { return undefined; } };
+  const save = async (list) => { await saveProxies(env, list); cfg.proxies = list; cfg.proxy = list.find(p => p.enabled) || null; };
+
+  if (apiName === 'proxy-status') {
+    if (method !== 'GET') return json({ ok: false, msg: '仅支持 GET' }, 405);
+    return json({ ok: true, data: await proxyStatusOf(pickProxy(cfg, url.searchParams.get('id'))) });
+  }
+  if (apiName === 'proxy-settings' || apiName === 'proxy-reset') {
+    const p = pickProxy(cfg, url.searchParams.get('id'));
+    if (!p) return noProxy();
+    try {
+      if (apiName === 'proxy-reset') {
+        if (method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);
+        return json({ ok: true, data: await callProxyOk(p, 'resetSettings', {}) });
+      }
+      if (method === 'GET') return json({ ok: true, data: await callProxyOk(p, 'getSettings', {}) });
+      if (method === 'POST') {
+        const body = await readBody();
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ ok: false, msg: '请求体必须为 JSON 对象' }, 400);
+        return json({ ok: true, data: await callProxyOk(p, 'setSettings', body) });
+      }
+      return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
+    } catch (e) { return proxyFail(e); }
+  }
+
+  // /api/proxies[/<id>[/<action>]]
+  const id = segs[3] || '', action = segs[4] || '';
+  if (!id) {
+    if (method === 'GET') return json({ ok: true, data: { proxies: cfg.proxies.map(publicProxy), error: cfg._proxiesError || '' } });
+    if (method !== 'POST') return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
+    const blocked = guardWrite(); if (blocked) return blocked;
+    if (cfg.proxies.length >= PROXIES_MAX) return json({ ok: false, msg: '最多 ' + PROXIES_MAX + ' 个代理' }, 400);
+    const body = await readBody();
+    const { value, errors } = sanitizeProxyInput(body);
+    if (errors.length) return json({ ok: false, msg: errors.map(e => e.msg).join('；'), errors }, 400);
+    const rec = cleanProxyRecord(Object.assign({ id: newProxyId(), name: '代理 ' + (cfg.proxies.length + 1), uuid: '', enabled: true }, value));
+    await save([...cfg.proxies, rec]);
+    const sync = body.sync === false ? null : await syncAndStore(env, cfg, rec.id, save);
+    return json({ ok: true, data: { proxy: publicProxy(cfg.proxies.find(x => x.id === rec.id)), sync } });
+  }
+  const p = cfg.proxies.find(x => x.id === id);
+  if (!p) return (method !== 'GET' && guardWrite()) || json({ ok: false, msg: '没有这个代理' }, 404);
+  if (!action) {
+    const blocked = method === 'GET' ? null : guardWrite(); if (blocked) return blocked;
+    if (method === 'GET') return json({ ok: true, data: { proxy: publicProxy(p) } });
+    if (method === 'DELETE') {
+      await save(cfg.proxies.filter(x => x.id !== id));
+      return json({ ok: true, msg: '已从面板删除；代理本身没有被改动（要让它停止服务，请先「停用」再删除，或到代理上清除）' });
+    }
+    if (method !== 'POST') return json({ ok: false, msg: '仅支持 GET / POST / DELETE' }, 405);
+    const body = await readBody();
+    const { value, errors } = sanitizeProxyInput(body, { partial: true });
+    if (errors.length) return json({ ok: false, msg: errors.map(e => e.msg).join('；'), errors }, 400);
+    const next = cleanProxyRecord(Object.assign({}, p, value));
+    await save(cfg.proxies.map(x => (x.id === id ? next : x)));
+    const sync = body.sync === false ? null : await syncAndStore(env, cfg, id, save);
+    return json({ ok: true, data: { proxy: publicProxy(cfg.proxies.find(x => x.id === id)), sync } });
+  }
+  if (method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);
+  const blocked = guardWrite(); if (blocked) return blocked;
+  if (action === 'sync') {
+    const sync = await syncAndStore(env, cfg, id, save);
+    return json({ ok: true, data: { proxy: publicProxy(cfg.proxies.find(x => x.id === id)), sync } });
+  }
+  if (action === 'enabled') {
+    const body = await readBody();
+    if (!body || typeof body.enabled !== 'boolean') return json({ ok: false, msg: '缺少 enabled（true / false）' }, 400);
+    const next = Object.assign({}, p, { enabled: body.enabled });
+    await save(cfg.proxies.map(x => (x.id === id ? next : x)));
+    // 面板这边立刻生效（停用的代理不进订阅）；同时通知代理本身启用 / 停用，代理没响应时只给出提醒，之后可以「连接并同步」补上
+    let synced = false, warning = '';
+    try { await callProxyOk(next, 'setEnabled', { enabled: body.enabled }); synced = true; } catch (e) { warning = '面板已' + (body.enabled ? '启用' : '停用') + '，但没能通知代理：' + e.message + '。代理上的状态以后可以点「连接并同步」补上'; }
+    return json({ ok: true, data: { proxy: publicProxy(next), synced, warning } });
+  }
+  if (action === 'rotate') {
+    const uuid = crypto.randomUUID();
+    try { var r = await callProxyOk(p, 'setIdentity', { uuid, rotate: true }); } catch (e) { return proxyFail(e); }
+    const next = Object.assign({}, p, { uuid });
+    await save(cfg.proxies.map(x => (x.id === id ? next : x)));
+    return json({ ok: true, data: { proxy: publicProxy(next), graceMs: r.graceMs || 0 } });
+  }
+  return json({ ok: false, msg: '未知操作：' + action }, 404);
+}
+// 同步一个代理并把可能新生成的 UUID 存回面板；失败不抛错，返回 { ok:false, error }
+async function syncAndStore(env, cfg, id, save) {
+  const p = cfg.proxies.find(x => x.id === id);
+  try {
+    const r = await syncProxy(p);
+    if (r.uuid !== p.uuid) await save(cfg.proxies.map(x => (x.id === id ? Object.assign({}, x, { uuid: r.uuid }) : x)));
+    return { ok: r.status.ok === true, actions: r.actions, status: await proxyStatusOf(cfg.proxies.find(x => x.id === id)), error: r.status.ok ? '' : r.status.problems.join(' ') };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e), actions: [] }; }
+}
 // ---------------------------------------------------------------------------
 // 优选器：候选提取（txt / HTML 多源）+ TCP 延迟测试
 // ---------------------------------------------------------------------------
@@ -1833,10 +2122,10 @@ const NODE_CAP = 500;
 async function generateSubscription(cfg, format, ua) {
   // 明文端口节点只由「仅 TLS 端口」控制（默认开启）；ECH 只对 TLS 生效，开启时同样只下发 TLS 端口节点。
   // 自定义域名的明文端口需在 Cloudflare 关闭「始终使用 HTTPS」，否则被 301 重定向、WebSocket 握手失败
-  // 代理端点（域名 / UUID / 节点路径）来自面板设置；没填全就没有可指向的代理，直接报错
+  // 订阅指向第一个启用的代理（域名 / UUID / 节点路径来自面板保存的代理列表）；没有可用的代理就直接报错
   const missing = endpointMissing(cfg);
-  if (missing.length) throw Object.assign(new Error('请先在面板「代理端点」里填写：' + missing.join('、') + '（与代理脚本的域名、UUID、PATH 一致）'), { status: 400 });
-  const rc = Object.assign({}, cfg);
+  if (missing.length) throw Object.assign(new Error('订阅还不能生成：缺少 ' + missing.join('、') + '。请到「面板设置 → 代理」处理'), { status: 400 });
+  const rc = Object.assign({}, cfg, { host: cfg.proxy.host, uuid: cfg.proxy.uuid, nodePath: cfg.proxy.nodePath });
   const prefList = effectivePrefDomains(cfg);   // 面板填写的优选域名（整体替换内置列表）或内置列表
   if (rc.ech) rc.tlsOnly = true;
   // 筛选含 IPv6 时查询 AAAA 记录并生成 IPv6 节点（默认双选 IPv4+IPv6 同样生效）；
@@ -2598,7 +2887,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
     <button class="icon-btn" id="themeBtn" title="切换主题：跟随系统 / 日间 / 夜间"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path id="themeIcon" d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
   </div>
   <div class="wdwarn" id="wdwarn">当前运行在 *.workers.dev 域名上：面板与订阅功能正常；若客户端更新订阅失败或访问受限，建议在 Cloudflare 面板给面板 Worker 绑定自定义域名后使用。</div>
-  <div class="wdwarn" id="epwarn">尚未填写代理端点：<b id="epMissing"></b>。订阅需要知道代理脚本的域名、UUID 与节点路径，请到 <a href="#" onclick="switchView('account');return false">面板设置 → 代理端点</a> 填写。</div>
+  <div class="wdwarn" id="epwarn">还不能生成订阅，缺少：<b id="epMissing"></b>。请到 <a href="#" onclick="switchView('account');return false">面板设置 → 代理</a> 添加并连接代理。</div>
 
   <div class="content">
     
@@ -2606,7 +2895,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
       <div class="card">
         <h3><span class="tick"></span>快速开始</h3>
         <ol class="steps">
-          <li><b>填写代理端点</b>：在「面板设置 → 代理端点」填入代理脚本（Hopline-proxy.js）的域名、UUID 与节点路径，客户端订阅即可获得一批 Cloudflare 优选节点（优选域名与在线优选 IP 来源）；Clash / Mihomo 与 Sing-box 订阅已内置大陆直连分流规则（大陆应用、微软、苹果直连，国外服务走代理）。</li>
+          <li><b>连接代理</b>：在「面板设置 → 代理」填入代理脚本（Hopline-proxy.js）的域名、节点路径（环境变量 PATH）和密钥（环境变量 NODE_KEY），点「连接并同步」，面板会自动生成 UUID 并下发给代理，客户端订阅即可获得一批 Cloudflare 优选节点（优选域名与在线优选 IP 来源）；Clash / Mihomo 与 Sing-box 订阅已内置大陆直连分流规则（大陆应用、微软、苹果直连，国外服务走代理）。</li>
           <li><b>调优节点</b>：用本地工具（如 CloudflareSpeedTest）在自己的网络下测速，把最优 IP 列表托管成一个地址（纯 IP 行 / CSV），填入「优选配置 → 优选 IP 来源」的自定义优选 API；也可以在「优选配置 → 优选域名」换成自己的优选域名。</li>
           <li><b>检查来源</b>：在「优选配置 → 优选 IP 来源」开关各在线来源，点「测试」可立即查看该来源实时拉取到的 IP；单次订阅最多下发 500 个节点，保证在免费计划 10ms CPU 限制内稳定生成。</li>
         </ol>
@@ -2772,7 +3061,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
     </section>
 
     
-    <section class="view" data-view="proxy" data-title="代理设置" data-sub="在线修改代理脚本的落地、出站与地区反代设置（通过服务绑定 PROXY，不经过订阅）">
+    <section class="view" data-view="proxy" data-title="代理设置" data-sub="在线修改代理脚本的落地、出站与地区反代设置（面板用密钥签名后通过 HTTPS 发给代理，不经过订阅）">
       <div class="card">
         <h3><span class="tick"></span>状态</h3>
         <div class="note-box" id="px-note" style="margin:0">读取中…</div>
@@ -2781,7 +3070,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
           <button class="btn primary" id="px-save" onclick="saveProxySettings()">保存到代理</button>
           <button class="btn danger" id="px-reset" onclick="resetProxySettings()">恢复为环境变量</button>
         </div>
-        <p class="hint" style="margin-top:10px">这里的设置只保存在代理自己的 KV（变量名 NODE_KV）里，面板不保存；保存后代理约 1 分钟内生效（KV 同步与缓存）。优先级：这里的设置 &gt; 代理的环境变量 &gt; 默认值；与环境变量相同的值不会存入 KV。UUID 与节点路径（PATH）只能在代理的环境变量里改，这里改不了。「恢复为环境变量」会清除这里保存的全部覆盖项。</p>
+        <p class="hint" style="margin-top:10px">这里的设置只保存在代理自己的 KV（变量名 NODE_KV）里，面板不保存；保存后代理约 1 分钟内生效（KV 同步与缓存）。优先级：这里的设置 &gt; 代理的环境变量 &gt; 默认值；与环境变量相同的值不会存入 KV。节点路径（PATH）与密钥（NODE_KEY）只能在代理的环境变量里改，改完后到「面板设置 → 代理」同步更新；UUID 由面板管理。「恢复为环境变量」会清除这里保存的全部覆盖项。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>落地与出站</h3>
@@ -2825,31 +3114,48 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
     </section>
 
     
-    <section class="view" data-view="account" data-title="面板设置" data-sub="代理端点（域名、UUID、节点路径）、面板路径（PATH）、管理用户名与密码">
+    <section class="view" data-view="account" data-title="面板设置" data-sub="代理（域名、节点路径、密钥、UUID、启停）、面板路径（PATH）、管理用户名与密码">
       <div class="card">
-        <h3><span class="tick"></span>代理端点</h3>
-        <p class="hint" style="margin-top:0;margin-bottom:12px">订阅里的节点指向哪里：填写代理脚本（Hopline-proxy.js）所在的域名，以及它的环境变量 UUID 与 PATH。面板与代理之间没有任何联系，这三项只用来生成节点链接，三项都填了才能生成订阅。</p>
-        <div class="field"><label>代理域名（节点 SNI / Host，如 node.example.com）</label><input type="text" id="a-host" placeholder="node.example.com" autocomplete="off"></div>
-        <div class="field"><label>代理 UUID（须与代理脚本的环境变量 UUID 相同）</label>
+        <h3><span class="tick"></span>代理</h3>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">订阅里的节点指向哪里：填写代理脚本（Hopline-proxy.js）所在的域名、它的环境变量 PATH（节点路径）和 NODE_KEY（密钥）。面板用密钥签名后通过 HTTPS 联系代理：<b>UUID 由面板生成并下发给代理</b>（存在代理的 NODE_KV 里），不需要手工填写。密钥只写入、不回显；留空保持不变。</p>
+        <div class="note-box" id="px-conn" style="margin:0 0 12px">读取中…</div>
+        <div class="field"><label>名称（可选）</label><input type="text" id="a-pname" placeholder="代理 1" autocomplete="off"></div>
+        <div class="field"><label>代理域名（节点 SNI / Host，如 node.example.com；须是代理 Worker 的自定义域名）</label><input type="text" id="a-host" placeholder="node.example.com" autocomplete="off"></div>
+        <div class="field"><label>节点路径（须与代理脚本的环境变量 PATH 相同）</label><input type="text" id="a-nodepath" placeholder="mynode" autocomplete="off"></div>
+        <div class="field"><label>密钥（须与代理脚本的环境变量 NODE_KEY 相同，24–256 位可见字符）</label>
           <div class="inrow">
-            <input type="text" id="a-uuid" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
+            <input type="password" id="a-key" placeholder="" autocomplete="new-password">
+            <button class="btn sm" onclick="genKey()">生成密钥</button>
+            <button class="btn sm" onclick="copyKey()">复制</button>
+          </div>
+          <div class="hint" id="a-keyhint"></div>
+        </div>
+        <div class="field"><label>UUID（可留空，连接时自动生成；已有则显示在这里）</label>
+          <div class="inrow">
+            <input type="text" id="a-uuid" placeholder="连接并同步后自动生成" autocomplete="off">
             <button class="btn sm" onclick="genUuid()">生成</button>
           </div>
         </div>
-        <div class="field" style="margin-bottom:0"><label>代理节点路径（须与代理脚本的环境变量 PATH 相同）</label><input type="text" id="a-nodepath" placeholder="mynode" autocomplete="off"></div>
-        <p class="hint" style="margin-top:10px">XHTTP 协议要求代理使用自定义域名（在 Cloudflare 面板 → Workers 与 Pages → 代理 Worker → Domains &amp; Routes 添加）。「生成」只是在这里生成一个 UUID，需要自己把它填进代理脚本的环境变量 UUID。</p>
+        <div class="field" style="margin-bottom:0"><label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="a-penabled" checked> 启用（取消勾选 = 订阅里不再下发该代理的节点，并通知代理对外只显示 Hello World）</label></div>
+        <div class="inrow" style="margin-top:12px">
+          <button class="btn primary" id="px-connect" onclick="saveProxyEntry()">保存并连接</button>
+          <button class="btn" id="px-sync" onclick="syncProxyEntry()">连接并同步</button>
+          <button class="btn" id="px-rotate" onclick="rotateProxyUuid()">更换 UUID</button>
+          <button class="btn danger" id="px-del" onclick="deleteProxyEntry()">删除</button>
+        </div>
+        <p class="hint" style="margin-top:10px">XHTTP 与面板联系代理都要求代理使用自定义域名（Cloudflare 面板 → Workers 与 Pages → 代理 Worker → Domains &amp; Routes 添加）；面板与代理在同一个 Cloudflare 区域（zone）时请把代理设为 Custom Domain。代理需要绑定一个 KV（变量名 NODE_KV）来保存 UUID。「更换 UUID」后旧 UUID 在代理上还会保留 10 分钟，已有客户端更新订阅即可。当前界面一次管理一个代理，数据结构已支持多个。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>基础配置</h3>
         <div class="field"><label>面板路径（环境变量 PATH 设置，面板中只读）</label><input type="text" id="a-path" autocomplete="off"><div class="hint">面板与订阅共用此路径（与代理的节点路径互相独立）；修改请到面板 Worker 的环境变量 PATH，修改后订阅地址随之改变，客户端需重新添加订阅。</div></div>
-        <div class="field"><label>自定义订阅路径（只填一段，如 mysub → /mysub/sub；留空为 /代理 UUID/sub）</label><input type="text" id="a-suburl" placeholder="mysub" autocomplete="off"></div>
+        <div class="field"><label>自定义订阅路径（只填一段，如 mysub → /mysub/sub；留空则使用 面板路径/sub）</label><input type="text" id="a-suburl" placeholder="mysub" autocomplete="off"></div>
         <div class="field"><label>管理用户名（登录时需要；留空为 admin，区分大小写）</label><input type="text" id="a-adminuser" placeholder="admin" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <div class="field" style="margin-bottom:0"><label>管理密码（留空保持不变；未设置时面板禁用）</label><input type="password" id="a-admin" placeholder="设置后访问面板需登录" autocomplete="new-password"></div>
         <p class="hint" style="margin-top:10px">未绑定 KV（绑定变量名 CONFIG_KV）时无法保存面板配置，只有环境变量生效。自定义域名访问面板需先在 Cloudflare 面板 → Workers 与 Pages → 面板 Worker → Domains &amp; Routes 添加。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>备份与恢复</h3>
-        <p class="hint" style="margin-top:0;margin-bottom:12px">以 JSON 格式导出全部面板设置（含协议、优选、筛选），可保存到本地或迁移到其他部署；导入后请点右下角「保存全部」生效。<b>备份文件包含代理 UUID（节点身份，知道它即可使用你的节点），请妥善保管、不要分享；管理密码不会导出。</b></p>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">以 JSON 格式导出全部面板设置（含协议、优选、筛选），可保存到本地或迁移到其他部署；导入后请点右下角「保存全部」生效。<b>备份文件不含代理的密钥与 UUID（它们保存在面板的代理列表里，不在备份范围）；管理密码也不会导出。</b></p>
         <div class="inrow">
           <button class="btn" onclick="exportConfig()">导出配置</button>
           <button class="btn" onclick="$('importFile').click()">导入配置</button>
@@ -2868,7 +3174,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
       </div>
       <div class="danger-zone">
         <h3 style="margin-bottom:8px;color:var(--err)">危险操作</h3>
-        <p style="font-size:13px;color:var(--dim);margin-bottom:12px">重置将清空 KV 中保存的全部面板配置，面板还原为初始部署状态（环境变量不受影响），不可恢复。</p>
+        <p style="font-size:13px;color:var(--dim);margin-bottom:12px">重置将清空 KV 中保存的全部面板配置，面板还原为初始部署状态（环境变量与「代理」列表不受影响），不可恢复。</p>
         <button class="btn danger" onclick="resetAll()">重置全部数据</button>
       </div>
     </section>
@@ -3106,6 +3412,7 @@ function loadAll(){
   }).catch(function(){});
   checkProxy();
   loadProxySettings();
+  loadProxyEntry();
   api('config').then(function(r){
     if (r && r.ok){
       CFG = r.data;
@@ -3203,7 +3510,8 @@ function loadProxySettings(){
     }
     fillProxy(r.data);
     if (!r.data.storage){
-      proxyNote('代理没有绑定 KV（变量名 NODE_KV），这些设置目前只读：显示的是代理环境变量里的值。给代理 Worker 绑定一个单独的 KV 命名空间后即可在这里修改。', 'err');
+      proxyNote('代理没有绑定 KV（变量名 NODE_KV）：无法保存 UUID 与这些设置，代理也无法对外提供服务。给代理 Worker 绑定一个单独的 KV 命名空间后点「面板设置 → 代理 → 连接并同步」。', 'err');
+      setProxyFormEnabled(false);
       return;
     }
     proxyNote(r.data.error === 'unavailable' ? '代理的 KV 暂时无法读取：下面显示的可能不是最新的设置，保存会被拒绝，稍后重新读取。' : (r.data.error === 'corrupt' ? '代理 KV 里保存的设置已损坏，已忽略；保存一次即可修复。' : '已连接代理，可以在线修改。'), r.data.error ? 'err' : '');
@@ -3252,19 +3560,24 @@ function checkProxy(){
   api('proxy-status').then(function(r){
     var d = r && r.ok && r.data;
     if (!d){ v.textContent = '检测失败'; v.className = 'v bad'; return; }
-    if (!d.bound){
-      v.textContent = '未绑定（可选）';
-      h.textContent = '给面板 Worker 添加服务绑定：变量名 PROXY → 代理 Worker，入口 NodeStatus（只读）或 NodeControl（可在线修改代理设置），就能在这里看到代理是否在线与版本';
+    if (!d.configured){
+      v.textContent = '未添加';
+      h.textContent = '到「面板设置 → 代理」添加代理（域名、节点路径、密钥），面板会自动生成 UUID 并下发';
       return;
     }
     if (!d.up){
       v.textContent = '无法连接'; v.className = 'v bad';
-      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 NodeStatus 或 NodeControl，且代理已更新到 3.0.3 或更高版本';
+      h.textContent = d.error || '';
       return;
     }
-    v.textContent = '在线 · 代理 v' + (d.version || '?');
-    v.className = 'v ' + (d.ok ? 'ok' : 'bad');
-    h.textContent = d.ok ? proxySummary(d.settings) + (d.control ? ' · 可在线修改（入口 NodeControl' + (d.storage ? '，已绑定 KV' : '，代理未绑定 NODE_KV') + '）' : ' · 只读入口（要在线修改请把入口改为 NodeControl）') : '代理配置有问题：' + (d.problems || []).join(' ');
+    var tags = [];
+    if (!d.provisioned) tags.push('尚未下发 UUID');
+    else if (!d.uuidMatch) tags.push('UUID 与面板不一致');
+    if (!d.enabled) tags.push('代理已停用');
+    if (!d.storage) tags.push('代理未绑定 NODE_KV');
+    v.textContent = '在线 · 代理 v' + (d.version || '?') + (tags.length ? '（' + tags.join('，') + '）' : '');
+    v.className = 'v ' + (d.ok && !tags.length ? 'ok' : 'bad');
+    h.textContent = d.ok ? proxySummary(d.settings) : '代理配置有问题：' + (d.problems || []).join(' ');
   }).catch(function(){ v.textContent = '检测失败'; v.className = 'v bad'; });
 }
 function renderStatus(d){
@@ -3510,20 +3823,136 @@ function resetAll(){
     .catch(function(){ toast('重置失败：无法连接服务器', 'err'); })
     .then(function(){ btn.disabled = false; });
 }
+function randUuid(){
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c){
+    var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 3 | 8);
+    return v.toString(16);
+  });
+}
 function genUuid(){
-  var u = '';
-  if (window.crypto && crypto.randomUUID){ u = crypto.randomUUID(); }
-  else {
-    var tpl = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
-    u = tpl.replace(/[xy]/g, function(c){
-      var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 3 | 8);
-      return v.toString(16);
-    });
-  }
-  $('a-uuid').value = u;
-  clearFieldError($('a-uuid'));
-  markDirty();
-  toast('已生成新 UUID：请同时填入代理脚本的环境变量 UUID', 'ok');
+  $('a-uuid').value = randUuid();
+  toast('已生成 UUID：点「保存并连接」后会下发给代理', 'ok');
+}
+function genKey(){
+  var b = new Uint8Array(24), t = '';
+  (window.crypto || window.msCrypto).getRandomValues(b);
+  for (var i = 0; i < b.length; i++) t += (b[i] + 256).toString(16).slice(1);
+  var k = $('a-key');
+  k.type = 'text';
+  k.value = t;
+  toast('已生成密钥：请同时填入代理脚本的环境变量 NODE_KEY（点「复制」）', 'ok');
+}
+function copyKey(){
+  var v = $('a-key').value;
+  if (!v){ toast('密钥为空（已保存的密钥不回显，需要时请重新生成并更新代理的 NODE_KEY）', 'err'); return; }
+  copyText(v);
+}
+
+var PX = null; 
+function pxConn(text, kind){
+  var n = $('px-conn');
+  n.textContent = text;
+  n.style.borderColor = kind === 'err' ? 'var(--err)' : '';
+}
+function pxFill(p){
+  PX = p || null;
+  $('a-pname').value = p ? p.name : '';
+  $('a-host').value = p ? p.host : '';
+  $('a-nodepath').value = p ? p.nodePath : '';
+  $('a-key').value = '';
+  $('a-key').type = 'password';
+  $('a-keyhint').textContent = p ? (p.keySet ? '已保存密钥（不回显）；留空保持不变，填新值则更新。' : '尚未保存密钥。') : '';
+  $('a-uuid').value = p ? p.uuid : '';
+  $('a-penabled').checked = p ? p.enabled : true;
+  $('px-sync').disabled = !p;
+  $('px-rotate').disabled = !p;
+  $('px-del').disabled = !p;
+  ['a-host', 'a-nodepath', 'a-key', 'a-uuid'].forEach(function(id){ clearFieldError($(id)); });
+}
+var PX_FIELD = { host: 'a-host', nodePath: 'a-nodepath', key: 'a-key', uuid: 'a-uuid', name: 'a-pname' };
+function pxErrors(errors){
+  var unplaced = [], first = null;
+  (errors || []).forEach(function(e){
+    var el = PX_FIELD[e.field] ? $(PX_FIELD[e.field]) : null;
+    if (!el){ unplaced.push(e.msg); return; }
+    clearFieldError(el);
+    el.classList.add('invalid');
+    el._errTip = attachMsg(el, 'field-err', e.msg);
+    if (!first) first = el;
+  });
+  if (first){ try { first.scrollIntoView({ block: 'center', behavior: 'smooth' }); first.focus({ preventScroll: true }); } catch (e) {} }
+  return unplaced;
+}
+function pxRefreshAll(){
+  
+  api('config').then(function(r){ if (r && r.ok && r.data){ if (CFG) CFG.endpointMissing = r.data.endpointMissing; renderEndpoint(); } }).catch(function(){});
+  checkProxy();
+  loadProxySettings();
+}
+function pxSyncText(sync){
+  if (!sync) return '';
+  if (sync.ok) return sync.actions && sync.actions.length ? '已连接，并完成：' + sync.actions.join('、') : '已连接，代理状态已是最新';
+  return '没能同步到代理：' + (sync.error || '未知错误');
+}
+function loadProxyEntry(){
+  pxConn('读取中…');
+  return api('proxies').then(function(r){
+    if (!r || !r.ok || !r.data){ pxConn((r && r.msg) || '读取失败', 'err'); return; }
+    var list = r.data.proxies || [];
+    pxFill(list[0] || null);
+    if (r.data.error){ pxConn('代理列表读取失败（' + r.data.error + '）：为避免覆盖已有数据，暂时不能保存。', 'err'); return; }
+    pxConn(list.length ? '已添加代理「' + list[0].name + '」。' + (list[0].enabled ? '' : '当前已停用：订阅里不会下发它的节点。') : '还没有代理：填写下面的域名、节点路径和密钥，点「保存并连接」。');
+  }).catch(function(){ pxConn('无法连接服务器', 'err'); });
+}
+function pxDone(r, okMsg){
+  var d = r.data || {};
+  if (d.proxy) pxFill(d.proxy);
+  var t = (d.sync ? pxSyncText(d.sync) : '') || okMsg;
+  pxConn(t, d.sync && !d.sync.ok ? 'err' : '');
+  toast(t, d.sync && !d.sync.ok ? 'err' : 'ok');
+  pxRefreshAll();
+}
+function pxBusy(on){
+  ['px-connect', 'px-sync', 'px-rotate', 'px-del'].forEach(function(id){ var b = $(id); if (b) b.disabled = on || (id !== 'px-connect' && !PX); });
+}
+function pxCall(path, opts, okMsg, fail){
+  pxBusy(true);
+  return api(path, opts).then(function(r){
+    if (r && r.ok){ pxDone(r, okMsg); return; }
+    var unplaced = pxErrors(r && r.errors);
+    toast((unplaced.length ? unplaced.join('；') : (r && r.msg)) || fail, 'err');
+    pxConn((r && r.msg) || fail, 'err');
+  }).catch(function(){ toast(fail + '：无法连接服务器', 'err'); })
+    .then(function(){ pxBusy(false); });
+}
+var JSON_H = { 'Content-Type': 'application/json' };
+function saveProxyEntry(){
+  var body = { name: $('a-pname').value, host: $('a-host').value, nodePath: $('a-nodepath').value, uuid: $('a-uuid').value, enabled: $('a-penabled').checked };
+  var key = $('a-key').value;
+  if (key) body.key = key;
+  else if (!PX || !PX.keySet){ pxErrors([{ field: 'key', msg: '请填写密钥（与代理脚本的环境变量 NODE_KEY 相同）' }]); return; }
+  if (!body.name) delete body.name;
+  if (!body.uuid) delete body.uuid;
+  pxCall(PX ? 'proxies/' + PX.id : 'proxies', { method: 'POST', headers: JSON_H, body: JSON.stringify(body) }, '已保存', '保存失败');
+}
+function syncProxyEntry(){
+  if (!PX) return;
+  pxCall('proxies/' + PX.id + '/sync', { method: 'POST' }, '已同步', '同步失败');
+}
+function rotateProxyUuid(){
+  if (!PX) return;
+  if (!confirm('确定更换 UUID？新 UUID 立即生效，旧 UUID 在代理上保留 10 分钟；之后客户端必须更新订阅才能继续使用。')) return;
+  pxCall('proxies/' + PX.id + '/rotate', { method: 'POST' }, '已更换 UUID：旧 UUID 还会在代理上保留 10 分钟，请尽快更新订阅', '更换失败');
+}
+function deleteProxyEntry(){
+  if (!PX) return;
+  if (!confirm('从面板删除这个代理？代理本身不会被改动（想让它停止服务，请先取消勾选「启用」并保存，再删除）。')) return;
+  pxBusy(true);
+  api('proxies/' + PX.id, { method: 'DELETE' }).then(function(r){
+    if (r && r.ok){ pxFill(null); pxConn('已删除。'); toast('已从面板删除', 'ok'); pxRefreshAll(); }
+    else toast((r && r.msg) || '删除失败', 'err');
+  }).catch(function(){ toast('删除失败：无法连接服务器', 'err'); }).then(function(){ pxBusy(false); });
 }
 
 function exportConfig(){
@@ -3606,7 +4035,7 @@ function subUrlOf(fmt){
   
   
   var custom = (window.CFG && CFG.subUrl) ? String(CFG.subUrl).trim().replace(/^\/+/, '').replace(/\/sub$/, '').replace(/\/+$/, '') : '';
-  var seg = custom || (window.CFG && CFG.uuid) || '';
+  var seg = custom;
   var base = seg ? (location.origin + '/' + seg) : (location.origin + APIPATH);
   var u = base + '/sub';
   return fmt ? (u + '/' + fmt) : u;
@@ -3926,13 +4355,6 @@ function isBrowserUA(ua) {
 //  - 未设置 ADMIN 时一律拒绝
 //  - Cookie 为带过期时间的 HMAC-SHA256 签名令牌
 //  - 常量时间比较 + 登录失败限速
-function timingSafeEqual(a, b) {
-  a = String(a); b = String(b);
-  let r = a.length ^ b.length;
-  const n = Math.max(a.length, b.length);
-  for (let i = 0; i < n; i++) r |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
-  return r === 0;
-}
 async function hmacHex(key, msg) {
   const k = await crypto.subtle.importKey('raw', TE.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const sig = await crypto.subtle.sign('HMAC', k, TE.encode(msg));
@@ -4070,40 +4492,6 @@ function formatConfigErrors(errors) {
   return errors.map(e => (e.label ? e.label + '：' : '') + e.msg).join('；');
 }
 
-// 调用代理的 RPC（服务绑定 PROXY → 代理 Worker 的 NodeStatus / NodeControl 入口）：带超时，失败时抛 Error，由调用方转成面板能显示的结果
-const PROXY_CALL_TIMEOUT = 4000;
-async function callProxy(env, method, ...args) {
-  if (!(env && env.PROXY)) throw Object.assign(new Error('没有绑定服务绑定 PROXY'), { unbound: true });
-  const r = await Promise.race([
-    env.PROXY[method](...args),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('调用超时')), PROXY_CALL_TIMEOUT)),
-  ]);
-  if (!r || typeof r !== 'object') throw new Error('返回内容不正确');
-  return r;
-}
-// 代理状态：绑定缺失、调用失败或超时都不抛错，返回 { bound, up, ... } 给面板显示
-async function proxyStatus(env) {
-  if (!(env && env.PROXY)) return { bound: false };
-  try {
-    const r = await callProxy(env, 'status');
-    return { bound: true, up: true, ok: r.ok === true, version: String(r.version || ''), problems: Array.isArray(r.problems) ? r.problems.map(String) : [], control: r.control === true, storage: r.storage === true, settings: r.settings && typeof r.settings === 'object' ? r.settings : {} };
-  } catch (e) {
-    return { bound: true, up: false, error: String((e && e.message) || e) };
-  }
-}
-// 在线修改代理设置：把面板的请求转给代理的 NodeControl 入口；绑定的是只读入口 NodeStatus 时代理会报「does not implement」
-async function proxySettingsCall(env, method, ...args) {
-  try {
-    const r = await callProxy(env, method, ...args);
-    if (r.ok === false) return json({ ok: false, msg: String(r.error || '代理拒绝了这次操作'), errors: Array.isArray(r.errors) ? r.errors : [] }, 400);
-    return json({ ok: true, data: r });
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    if (e && e.unbound) return json({ ok: false, msg: '没有绑定服务绑定 PROXY：请在面板 Worker 添加变量名 PROXY、入口 NodeControl 的服务绑定' }, 400);
-    return json({ ok: false, msg: '无法调用代理：' + msg + '。请确认服务绑定 PROXY 的入口是 NodeControl，且代理已更新到 3.0.3 或更高版本' }, 502);
-  }
-}
-
 // 生成订阅：/sub 与面板预览共用同一流程，保证预览与客户端实际拿到的一致
 async function serveSubscription(request, cfg, fmt) {
   const UA = request.headers.get('User-Agent') || '';
@@ -4116,11 +4504,6 @@ function setupProblems(env, cfg) {
   return cfg._pathError
     ? '环境变量 PATH 的值不正确：' + cfg._pathError + '。'
     : 'Hopline 面板尚未完成配置：请在 Worker 环境变量中设置 PATH（面板与订阅的访问路径，如 mypanel）和 ADMIN（管理密码），然后重新访问。';
-}
-
-// 代理端点（订阅里的节点指向哪里）：域名、UUID、节点路径三项都填了才能生成订阅。返回尚未填写的字段名
-function endpointMissing(cfg) {
-  return [['host', '代理域名'], ['uuid', '代理 UUID'], ['nodePath', '代理节点路径']].filter(([k]) => !cfg[k]).map(([, label]) => label);
 }
 
 async function handleRequest(request, env, state) {
@@ -4177,13 +4560,11 @@ async function handleRequest(request, env, state) {
     return new Response(loginHTML, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
-  // 订阅入口：自定义订阅路径（如 /mysub/sub），留空则为 /<UUID>/sub（UUID 即代理 UUID）；
-  // 面板路径下的 /sub 始终可用。
+  // 订阅入口：自定义订阅路径（如 /mysub/sub）；面板路径下的 /sub 始终可用。
   // 面板入口与管理 API 只认 panelPath，订阅入口下不开放面板与管理接口
   const subAlias = String(cfg.subUrl || '').trim().replace(/^\/+/, '').replace(/\/+$/, '');
-  const subRoot = subAlias || cfg.uuid;
   const isPanelRoot = segs[0] === panelPath;
-  const isSubRoot = isPanelRoot || segs[0] === subRoot;
+  const isSubRoot = isPanelRoot || (subAlias !== '' && segs[0] === subAlias);
 
   // 根路径不跳转到面板入口（否则会把面板路径 / UUID 告诉任何访问者），返回伪装页
   if (segs[0] === '') {
@@ -4260,23 +4641,8 @@ async function handleRequest(request, env, state) {
       return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
     }
 
-    // 代理状态：通过服务绑定 PROXY（入口 NodeStatus）读取代理的在线状态与版本；没绑定就只返回 bound:false，面板其它功能不受影响
-    if (apiName === 'proxy-status') return json({ ok: true, data: await proxyStatus(env) });
-    // 在线修改代理设置（7 项出站 / 地区反代设置）：GET 读取、POST 保存（只提交出现的项，整批校验）、proxy-reset 恢复为环境变量 + 默认值
-    if (apiName === 'proxy-settings') {
-      if (request.method === 'GET') return proxySettingsCall(env, 'getSettings');
-      if (request.method === 'POST') {
-        let body;
-        try { body = await request.json(); } catch (e) { return json({ ok: false, msg: '请求体不是合法的 JSON' }, 400); }
-        if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ ok: false, msg: '请求体必须为 JSON 对象' }, 400);
-        return proxySettingsCall(env, 'setSettings', body);
-      }
-      return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
-    }
-    if (apiName === 'proxy-reset') {
-      if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);
-      return proxySettingsCall(env, 'resetSettings');
-    }
+    // 代理管理（增删改 / 同步 / 启停 / 状态 / 在线设置）：面板通过签名的 HTTPS 请求调用代理的控制接口，见 proxies-api.js
+    if (apiName === 'proxies' || apiName === 'proxy-status' || apiName === 'proxy-settings' || apiName === 'proxy-reset') return handleProxiesApi(apiName, request, env, cfg, segs, url);
 
     if (apiName === 'logout') {
       if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);

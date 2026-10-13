@@ -191,6 +191,7 @@ function loadAll(){
   }).catch(function(){});
   checkProxy();
   loadProxySettings();
+  loadProxyEntry();
   api('config').then(function(r){
     if (r && r.ok){
       CFG = r.data;
@@ -216,7 +217,7 @@ function setConn(ok){
   p.className = 'pill ' + (ok ? '' : 'off');
   $('connText').textContent = ok ? '运行中' : '无法连接';
 }
-/* ===== 代理设置：通过服务绑定 PROXY 在线修改代理的 7 项出站 / 地区反代设置（保存在代理自己的 KV，不属于面板配置） ===== */
+/* ===== 代理设置：通过签名 HTTPS 接口在线修改代理的 7 项出站 / 地区反代设置（保存在代理自己的 KV，不属于面板配置） ===== */
 var PROXY_FIELDS = { 'edgeIP': 's-proxyIP', 'hopAddr': 's-outbound', 'hopMode': 's-outmode', 'alt.mode': 'rl-mode', 'alt.region': 'rl-region', 'alt.region2': 'rl-region2', 'alt.custom': 'rl-custom' };
 var PROXY_ENV_NAMES = { 'edgeIP': 'EDGEIP', 'hopAddr': 'HOP_ADDR', 'hopMode': 'HOP_MODE', 'alt.mode': 'ALT_MODE', 'alt.region': 'ALT_REGION', 'alt.region2': 'ALT_REGION2', 'alt.custom': 'ALT_CUSTOM' };
 var RELAY_ZH = { HK: '香港', US: '美国', SG: '新加坡', JP: '日本', KR: '韩国', DE: '德国', SE: '瑞典', NL: '荷兰', FI: '芬兰', GB: '英国' };
@@ -288,7 +289,8 @@ function loadProxySettings(){
     }
     fillProxy(r.data);
     if (!r.data.storage){
-      proxyNote('代理没有绑定 KV（变量名 NODE_KV），这些设置目前只读：显示的是代理环境变量里的值。给代理 Worker 绑定一个单独的 KV 命名空间后即可在这里修改。', 'err');
+      proxyNote('代理没有绑定 KV（变量名 NODE_KV）：无法保存 UUID 与这些设置，代理也无法对外提供服务。给代理 Worker 绑定一个单独的 KV 命名空间后点「面板设置 → 代理 → 连接并同步」。', 'err');
+      setProxyFormEnabled(false);
       return;
     }
     proxyNote(r.data.error === 'unavailable' ? '代理的 KV 暂时无法读取：下面显示的可能不是最新的设置，保存会被拒绝，稍后重新读取。' : (r.data.error === 'corrupt' ? '代理 KV 里保存的设置已损坏，已忽略；保存一次即可修复。' : '已连接代理，可以在线修改。'), r.data.error ? 'err' : '');
@@ -321,7 +323,7 @@ function resetProxySettings(){
   }).catch(function(){ toast('恢复失败：无法连接服务器', 'err'); });
 }
 
-/* ===== 代理状态：服务绑定 PROXY → 代理 Worker 的 NodeStatus.status()（只读） ===== */
+/* ===== 代理状态：面板 → 代理的签名 HTTPS 接口（status） ===== */
 function proxySummary(s){
   s = s || {};
   var a = [];
@@ -337,19 +339,24 @@ function checkProxy(){
   api('proxy-status').then(function(r){
     var d = r && r.ok && r.data;
     if (!d){ v.textContent = '检测失败'; v.className = 'v bad'; return; }
-    if (!d.bound){
-      v.textContent = '未绑定（可选）';
-      h.textContent = '给面板 Worker 添加服务绑定：变量名 PROXY → 代理 Worker，入口 NodeStatus（只读）或 NodeControl（可在线修改代理设置），就能在这里看到代理是否在线与版本';
+    if (!d.configured){
+      v.textContent = '未添加';
+      h.textContent = '到「面板设置 → 代理」添加代理（域名、节点路径、密钥），面板会自动生成 UUID 并下发';
       return;
     }
     if (!d.up){
       v.textContent = '无法连接'; v.className = 'v bad';
-      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 NodeStatus 或 NodeControl，且代理已更新到 3.0.3 或更高版本';
+      h.textContent = d.error || '';
       return;
     }
-    v.textContent = '在线 · 代理 v' + (d.version || '?');
-    v.className = 'v ' + (d.ok ? 'ok' : 'bad');
-    h.textContent = d.ok ? proxySummary(d.settings) + (d.control ? ' · 可在线修改（入口 NodeControl' + (d.storage ? '，已绑定 KV' : '，代理未绑定 NODE_KV') + '）' : ' · 只读入口（要在线修改请把入口改为 NodeControl）') : '代理配置有问题：' + (d.problems || []).join(' ');
+    var tags = [];
+    if (!d.provisioned) tags.push('尚未下发 UUID');
+    else if (!d.uuidMatch) tags.push('UUID 与面板不一致');
+    if (!d.enabled) tags.push('代理已停用');
+    if (!d.storage) tags.push('代理未绑定 NODE_KV');
+    v.textContent = '在线 · 代理 v' + (d.version || '?') + (tags.length ? '（' + tags.join('，') + '）' : '');
+    v.className = 'v ' + (d.ok && !tags.length ? 'ok' : 'bad');
+    h.textContent = d.ok ? proxySummary(d.settings) : '代理配置有问题：' + (d.problems || []).join(' ');
   }).catch(function(){ v.textContent = '检测失败'; v.className = 'v bad'; });
 }
 function renderStatus(d){
@@ -370,7 +377,7 @@ function renderStatus(d){
   topVerText = 'v' + v;
   $('aVer').textContent = v;
 }
-// 代理端点（域名 / UUID / 节点路径）没填全时在顶部提示
+// 订阅还缺代理端点（代理 / 域名 / 节点路径 / UUID）时在顶部提示
 function renderEndpoint(){
   var miss = (CFG && CFG.endpointMissing) || [];
   $('epwarn').style.display = miss.length ? 'block' : 'none';
@@ -598,20 +605,136 @@ function resetAll(){
     .catch(function(){ toast('重置失败：无法连接服务器', 'err'); })
     .then(function(){ btn.disabled = false; });
 }
+function randUuid(){
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c){
+    var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 3 | 8);
+    return v.toString(16);
+  });
+}
 function genUuid(){
-  var u = '';
-  if (window.crypto && crypto.randomUUID){ u = crypto.randomUUID(); }
-  else {
-    var tpl = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
-    u = tpl.replace(/[xy]/g, function(c){
-      var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 3 | 8);
-      return v.toString(16);
-    });
-  }
-  $('a-uuid').value = u;
-  clearFieldError($('a-uuid'));
-  markDirty();
-  toast('已生成新 UUID：请同时填入代理脚本的环境变量 UUID', 'ok');
+  $('a-uuid').value = randUuid();
+  toast('已生成 UUID：点「保存并连接」后会下发给代理', 'ok');
+}
+function genKey(){
+  var b = new Uint8Array(24), t = '';
+  (window.crypto || window.msCrypto).getRandomValues(b);
+  for (var i = 0; i < b.length; i++) t += (b[i] + 256).toString(16).slice(1);
+  var k = $('a-key');
+  k.type = 'text';
+  k.value = t;
+  toast('已生成密钥：请同时填入代理脚本的环境变量 NODE_KEY（点「复制」）', 'ok');
+}
+function copyKey(){
+  var v = $('a-key').value;
+  if (!v){ toast('密钥为空（已保存的密钥不回显，需要时请重新生成并更新代理的 NODE_KEY）', 'err'); return; }
+  copyText(v);
+}
+/* ===== 代理列表（面板设置 → 代理）：当前界面一次管理一个代理（列表第一项），接口 /api/proxies 已支持多个 ===== */
+var PX = null; // 当前编辑的代理（服务端返回的 publicProxy，不含密钥）
+function pxConn(text, kind){
+  var n = $('px-conn');
+  n.textContent = text;
+  n.style.borderColor = kind === 'err' ? 'var(--err)' : '';
+}
+function pxFill(p){
+  PX = p || null;
+  $('a-pname').value = p ? p.name : '';
+  $('a-host').value = p ? p.host : '';
+  $('a-nodepath').value = p ? p.nodePath : '';
+  $('a-key').value = '';
+  $('a-key').type = 'password';
+  $('a-keyhint').textContent = p ? (p.keySet ? '已保存密钥（不回显）；留空保持不变，填新值则更新。' : '尚未保存密钥。') : '';
+  $('a-uuid').value = p ? p.uuid : '';
+  $('a-penabled').checked = p ? p.enabled : true;
+  $('px-sync').disabled = !p;
+  $('px-rotate').disabled = !p;
+  $('px-del').disabled = !p;
+  ['a-host', 'a-nodepath', 'a-key', 'a-uuid'].forEach(function(id){ clearFieldError($(id)); });
+}
+var PX_FIELD = { host: 'a-host', nodePath: 'a-nodepath', key: 'a-key', uuid: 'a-uuid', name: 'a-pname' };
+function pxErrors(errors){
+  var unplaced = [], first = null;
+  (errors || []).forEach(function(e){
+    var el = PX_FIELD[e.field] ? $(PX_FIELD[e.field]) : null;
+    if (!el){ unplaced.push(e.msg); return; }
+    clearFieldError(el);
+    el.classList.add('invalid');
+    el._errTip = attachMsg(el, 'field-err', e.msg);
+    if (!first) first = el;
+  });
+  if (first){ try { first.scrollIntoView({ block: 'center', behavior: 'smooth' }); first.focus({ preventScroll: true }); } catch (e) {} }
+  return unplaced;
+}
+function pxRefreshAll(){
+  // 代理变更后，刷新顶部提示、仪表盘状态与「代理设置」视图
+  api('config').then(function(r){ if (r && r.ok && r.data){ if (CFG) CFG.endpointMissing = r.data.endpointMissing; renderEndpoint(); } }).catch(function(){});
+  checkProxy();
+  loadProxySettings();
+}
+function pxSyncText(sync){
+  if (!sync) return '';
+  if (sync.ok) return sync.actions && sync.actions.length ? '已连接，并完成：' + sync.actions.join('、') : '已连接，代理状态已是最新';
+  return '没能同步到代理：' + (sync.error || '未知错误');
+}
+function loadProxyEntry(){
+  pxConn('读取中…');
+  return api('proxies').then(function(r){
+    if (!r || !r.ok || !r.data){ pxConn((r && r.msg) || '读取失败', 'err'); return; }
+    var list = r.data.proxies || [];
+    pxFill(list[0] || null);
+    if (r.data.error){ pxConn('代理列表读取失败（' + r.data.error + '）：为避免覆盖已有数据，暂时不能保存。', 'err'); return; }
+    pxConn(list.length ? '已添加代理「' + list[0].name + '」。' + (list[0].enabled ? '' : '当前已停用：订阅里不会下发它的节点。') : '还没有代理：填写下面的域名、节点路径和密钥，点「保存并连接」。');
+  }).catch(function(){ pxConn('无法连接服务器', 'err'); });
+}
+function pxDone(r, okMsg){
+  var d = r.data || {};
+  if (d.proxy) pxFill(d.proxy);
+  var t = (d.sync ? pxSyncText(d.sync) : '') || okMsg;
+  pxConn(t, d.sync && !d.sync.ok ? 'err' : '');
+  toast(t, d.sync && !d.sync.ok ? 'err' : 'ok');
+  pxRefreshAll();
+}
+function pxBusy(on){
+  ['px-connect', 'px-sync', 'px-rotate', 'px-del'].forEach(function(id){ var b = $(id); if (b) b.disabled = on || (id !== 'px-connect' && !PX); });
+}
+function pxCall(path, opts, okMsg, fail){
+  pxBusy(true);
+  return api(path, opts).then(function(r){
+    if (r && r.ok){ pxDone(r, okMsg); return; }
+    var unplaced = pxErrors(r && r.errors);
+    toast((unplaced.length ? unplaced.join('；') : (r && r.msg)) || fail, 'err');
+    pxConn((r && r.msg) || fail, 'err');
+  }).catch(function(){ toast(fail + '：无法连接服务器', 'err'); })
+    .then(function(){ pxBusy(false); });
+}
+var JSON_H = { 'Content-Type': 'application/json' };
+function saveProxyEntry(){
+  var body = { name: $('a-pname').value, host: $('a-host').value, nodePath: $('a-nodepath').value, uuid: $('a-uuid').value, enabled: $('a-penabled').checked };
+  var key = $('a-key').value;
+  if (key) body.key = key;
+  else if (!PX || !PX.keySet){ pxErrors([{ field: 'key', msg: '请填写密钥（与代理脚本的环境变量 NODE_KEY 相同）' }]); return; }
+  if (!body.name) delete body.name;
+  if (!body.uuid) delete body.uuid;
+  pxCall(PX ? 'proxies/' + PX.id : 'proxies', { method: 'POST', headers: JSON_H, body: JSON.stringify(body) }, '已保存', '保存失败');
+}
+function syncProxyEntry(){
+  if (!PX) return;
+  pxCall('proxies/' + PX.id + '/sync', { method: 'POST' }, '已同步', '同步失败');
+}
+function rotateProxyUuid(){
+  if (!PX) return;
+  if (!confirm('确定更换 UUID？新 UUID 立即生效，旧 UUID 在代理上保留 10 分钟；之后客户端必须更新订阅才能继续使用。')) return;
+  pxCall('proxies/' + PX.id + '/rotate', { method: 'POST' }, '已更换 UUID：旧 UUID 还会在代理上保留 10 分钟，请尽快更新订阅', '更换失败');
+}
+function deleteProxyEntry(){
+  if (!PX) return;
+  if (!confirm('从面板删除这个代理？代理本身不会被改动（想让它停止服务，请先取消勾选「启用」并保存，再删除）。')) return;
+  pxBusy(true);
+  api('proxies/' + PX.id, { method: 'DELETE' }).then(function(r){
+    if (r && r.ok){ pxFill(null); pxConn('已删除。'); toast('已从面板删除', 'ok'); pxRefreshAll(); }
+    else toast((r && r.msg) || '删除失败', 'err');
+  }).catch(function(){ toast('删除失败：无法连接服务器', 'err'); }).then(function(){ pxBusy(false); });
 }
 // 备份：把当前面板表单值收集成 JSON 下载（与保存配置同一套字段，恢复后可直接保存；不含密码与令牌）
 function exportConfig(){
@@ -691,10 +814,10 @@ bindFormEvents();
 /* ===== 订阅 ===== */
 function subUrlOf(fmt){
   // 自定义订阅路径优先：自动保留当前域名（location.origin），只替换路径段；
-  // 用户只填 UUID/别名段（如 mysub），拼成 https://当前域名/mysub/sub；留空用 UUID（https://当前域名/<UUID>/sub）。
+  // 用户只填别名段（如 mysub），拼成 https://当前域名/mysub/sub；留空用面板路径（https://当前域名/<PATH>/sub）。
   // 填了 /sub 结尾或带前后斜杠时自动归一，格式后缀（clash/singbox 等）拼为 /sub/<格式>
   var custom = (window.CFG && CFG.subUrl) ? String(CFG.subUrl).trim().replace(/^\/+/, '').replace(/\/sub$/, '').replace(/\/+$/, '') : '';
-  var seg = custom || (window.CFG && CFG.uuid) || '';
+  var seg = custom;
   var base = seg ? (location.origin + '/' + seg) : (location.origin + APIPATH);
   var u = base + '/sub';
   return fmt ? (u + '/' + fmt) : u;

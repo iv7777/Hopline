@@ -36,7 +36,7 @@
     <button class="icon-btn" id="themeBtn" title="切换主题：跟随系统 / 日间 / 夜间"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path id="themeIcon" d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
   </div>
   <div class="wdwarn" id="wdwarn">当前运行在 *.workers.dev 域名上：面板与订阅功能正常；若客户端更新订阅失败或访问受限，建议在 Cloudflare 面板给面板 Worker 绑定自定义域名后使用。</div>
-  <div class="wdwarn" id="epwarn">尚未填写代理端点：<b id="epMissing"></b>。订阅需要知道代理脚本的域名、UUID 与节点路径，请到 <a href="#" onclick="switchView('account');return false">面板设置 → 代理端点</a> 填写。</div>
+  <div class="wdwarn" id="epwarn">还不能生成订阅，缺少：<b id="epMissing"></b>。请到 <a href="#" onclick="switchView('account');return false">面板设置 → 代理</a> 添加并连接代理。</div>
 
   <div class="content">
     <!-- ===== 视图：仪表盘 ===== -->
@@ -44,7 +44,7 @@
       <div class="card">
         <h3><span class="tick"></span>快速开始</h3>
         <ol class="steps">
-          <li><b>填写代理端点</b>：在「面板设置 → 代理端点」填入代理脚本（Hopline-proxy.js）的域名、UUID 与节点路径，客户端订阅即可获得一批 Cloudflare 优选节点（优选域名与在线优选 IP 来源）；Clash / Mihomo 与 Sing-box 订阅已内置大陆直连分流规则（大陆应用、微软、苹果直连，国外服务走代理）。</li>
+          <li><b>连接代理</b>：在「面板设置 → 代理」填入代理脚本（Hopline-proxy.js）的域名、节点路径（环境变量 PATH）和密钥（环境变量 NODE_KEY），点「连接并同步」，面板会自动生成 UUID 并下发给代理，客户端订阅即可获得一批 Cloudflare 优选节点（优选域名与在线优选 IP 来源）；Clash / Mihomo 与 Sing-box 订阅已内置大陆直连分流规则（大陆应用、微软、苹果直连，国外服务走代理）。</li>
           <li><b>调优节点</b>：用本地工具（如 CloudflareSpeedTest）在自己的网络下测速，把最优 IP 列表托管成一个地址（纯 IP 行 / CSV），填入「优选配置 → 优选 IP 来源」的自定义优选 API；也可以在「优选配置 → 优选域名」换成自己的优选域名。</li>
           <li><b>检查来源</b>：在「优选配置 → 优选 IP 来源」开关各在线来源，点「测试」可立即查看该来源实时拉取到的 IP；单次订阅最多下发 500 个节点，保证在免费计划 10ms CPU 限制内稳定生成。</li>
         </ol>
@@ -209,8 +209,8 @@
       </div>
     </section>
 
-    <!-- ===== 视图：代理设置（通过服务绑定 PROXY 在线修改代理的出站 / 地区反代设置） ===== -->
-    <section class="view" data-view="proxy" data-title="代理设置" data-sub="在线修改代理脚本的落地、出站与地区反代设置（通过服务绑定 PROXY，不经过订阅）">
+    <!-- ===== 视图：代理设置（通过签名 HTTPS 接口在线修改代理的出站 / 地区反代设置） ===== -->
+    <section class="view" data-view="proxy" data-title="代理设置" data-sub="在线修改代理脚本的落地、出站与地区反代设置（面板用密钥签名后通过 HTTPS 发给代理，不经过订阅）">
       <div class="card">
         <h3><span class="tick"></span>状态</h3>
         <div class="note-box" id="px-note" style="margin:0">读取中…</div>
@@ -219,7 +219,7 @@
           <button class="btn primary" id="px-save" onclick="saveProxySettings()">保存到代理</button>
           <button class="btn danger" id="px-reset" onclick="resetProxySettings()">恢复为环境变量</button>
         </div>
-        <p class="hint" style="margin-top:10px">这里的设置只保存在代理自己的 KV（变量名 NODE_KV）里，面板不保存；保存后代理约 1 分钟内生效（KV 同步与缓存）。优先级：这里的设置 &gt; 代理的环境变量 &gt; 默认值；与环境变量相同的值不会存入 KV。UUID 与节点路径（PATH）只能在代理的环境变量里改，这里改不了。「恢复为环境变量」会清除这里保存的全部覆盖项。</p>
+        <p class="hint" style="margin-top:10px">这里的设置只保存在代理自己的 KV（变量名 NODE_KV）里，面板不保存；保存后代理约 1 分钟内生效（KV 同步与缓存）。优先级：这里的设置 &gt; 代理的环境变量 &gt; 默认值；与环境变量相同的值不会存入 KV。节点路径（PATH）与密钥（NODE_KEY）只能在代理的环境变量里改，改完后到「面板设置 → 代理」同步更新；UUID 由面板管理。「恢复为环境变量」会清除这里保存的全部覆盖项。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>落地与出站</h3>
@@ -263,31 +263,48 @@
     </section>
 
     <!-- ===== 视图：面板设置 ===== -->
-    <section class="view" data-view="account" data-title="面板设置" data-sub="代理端点（域名、UUID、节点路径）、面板路径（PATH）、管理用户名与密码">
+    <section class="view" data-view="account" data-title="面板设置" data-sub="代理（域名、节点路径、密钥、UUID、启停）、面板路径（PATH）、管理用户名与密码">
       <div class="card">
-        <h3><span class="tick"></span>代理端点</h3>
-        <p class="hint" style="margin-top:0;margin-bottom:12px">订阅里的节点指向哪里：填写代理脚本（Hopline-proxy.js）所在的域名，以及它的环境变量 UUID 与 PATH。面板与代理之间没有任何联系，这三项只用来生成节点链接，三项都填了才能生成订阅。</p>
-        <div class="field"><label>代理域名（节点 SNI / Host，如 node.example.com）</label><input type="text" id="a-host" placeholder="node.example.com" autocomplete="off"></div>
-        <div class="field"><label>代理 UUID（须与代理脚本的环境变量 UUID 相同）</label>
+        <h3><span class="tick"></span>代理</h3>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">订阅里的节点指向哪里：填写代理脚本（Hopline-proxy.js）所在的域名、它的环境变量 PATH（节点路径）和 NODE_KEY（密钥）。面板用密钥签名后通过 HTTPS 联系代理：<b>UUID 由面板生成并下发给代理</b>（存在代理的 NODE_KV 里），不需要手工填写。密钥只写入、不回显；留空保持不变。</p>
+        <div class="note-box" id="px-conn" style="margin:0 0 12px">读取中…</div>
+        <div class="field"><label>名称（可选）</label><input type="text" id="a-pname" placeholder="代理 1" autocomplete="off"></div>
+        <div class="field"><label>代理域名（节点 SNI / Host，如 node.example.com；须是代理 Worker 的自定义域名）</label><input type="text" id="a-host" placeholder="node.example.com" autocomplete="off"></div>
+        <div class="field"><label>节点路径（须与代理脚本的环境变量 PATH 相同）</label><input type="text" id="a-nodepath" placeholder="mynode" autocomplete="off"></div>
+        <div class="field"><label>密钥（须与代理脚本的环境变量 NODE_KEY 相同，24–256 位可见字符）</label>
           <div class="inrow">
-            <input type="text" id="a-uuid" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
+            <input type="password" id="a-key" placeholder="" autocomplete="new-password">
+            <button class="btn sm" onclick="genKey()">生成密钥</button>
+            <button class="btn sm" onclick="copyKey()">复制</button>
+          </div>
+          <div class="hint" id="a-keyhint"></div>
+        </div>
+        <div class="field"><label>UUID（可留空，连接时自动生成；已有则显示在这里）</label>
+          <div class="inrow">
+            <input type="text" id="a-uuid" placeholder="连接并同步后自动生成" autocomplete="off">
             <button class="btn sm" onclick="genUuid()">生成</button>
           </div>
         </div>
-        <div class="field" style="margin-bottom:0"><label>代理节点路径（须与代理脚本的环境变量 PATH 相同）</label><input type="text" id="a-nodepath" placeholder="mynode" autocomplete="off"></div>
-        <p class="hint" style="margin-top:10px">XHTTP 协议要求代理使用自定义域名（在 Cloudflare 面板 → Workers 与 Pages → 代理 Worker → Domains &amp; Routes 添加）。「生成」只是在这里生成一个 UUID，需要自己把它填进代理脚本的环境变量 UUID。</p>
+        <div class="field" style="margin-bottom:0"><label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="a-penabled" checked> 启用（取消勾选 = 订阅里不再下发该代理的节点，并通知代理对外只显示 Hello World）</label></div>
+        <div class="inrow" style="margin-top:12px">
+          <button class="btn primary" id="px-connect" onclick="saveProxyEntry()">保存并连接</button>
+          <button class="btn" id="px-sync" onclick="syncProxyEntry()">连接并同步</button>
+          <button class="btn" id="px-rotate" onclick="rotateProxyUuid()">更换 UUID</button>
+          <button class="btn danger" id="px-del" onclick="deleteProxyEntry()">删除</button>
+        </div>
+        <p class="hint" style="margin-top:10px">XHTTP 与面板联系代理都要求代理使用自定义域名（Cloudflare 面板 → Workers 与 Pages → 代理 Worker → Domains &amp; Routes 添加）；面板与代理在同一个 Cloudflare 区域（zone）时请把代理设为 Custom Domain。代理需要绑定一个 KV（变量名 NODE_KV）来保存 UUID。「更换 UUID」后旧 UUID 在代理上还会保留 10 分钟，已有客户端更新订阅即可。当前界面一次管理一个代理，数据结构已支持多个。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>基础配置</h3>
         <div class="field"><label>面板路径（环境变量 PATH 设置，面板中只读）</label><input type="text" id="a-path" autocomplete="off"><div class="hint">面板与订阅共用此路径（与代理的节点路径互相独立）；修改请到面板 Worker 的环境变量 PATH，修改后订阅地址随之改变，客户端需重新添加订阅。</div></div>
-        <div class="field"><label>自定义订阅路径（只填一段，如 mysub → /mysub/sub；留空为 /代理 UUID/sub）</label><input type="text" id="a-suburl" placeholder="mysub" autocomplete="off"></div>
+        <div class="field"><label>自定义订阅路径（只填一段，如 mysub → /mysub/sub；留空则使用 面板路径/sub）</label><input type="text" id="a-suburl" placeholder="mysub" autocomplete="off"></div>
         <div class="field"><label>管理用户名（登录时需要；留空为 admin，区分大小写）</label><input type="text" id="a-adminuser" placeholder="admin" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <div class="field" style="margin-bottom:0"><label>管理密码（留空保持不变；未设置时面板禁用）</label><input type="password" id="a-admin" placeholder="设置后访问面板需登录" autocomplete="new-password"></div>
         <p class="hint" style="margin-top:10px">未绑定 KV（绑定变量名 CONFIG_KV）时无法保存面板配置，只有环境变量生效。自定义域名访问面板需先在 Cloudflare 面板 → Workers 与 Pages → 面板 Worker → Domains &amp; Routes 添加。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>备份与恢复</h3>
-        <p class="hint" style="margin-top:0;margin-bottom:12px">以 JSON 格式导出全部面板设置（含协议、优选、筛选），可保存到本地或迁移到其他部署；导入后请点右下角「保存全部」生效。<b>备份文件包含代理 UUID（节点身份，知道它即可使用你的节点），请妥善保管、不要分享；管理密码不会导出。</b></p>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">以 JSON 格式导出全部面板设置（含协议、优选、筛选），可保存到本地或迁移到其他部署；导入后请点右下角「保存全部」生效。<b>备份文件不含代理的密钥与 UUID（它们保存在面板的代理列表里，不在备份范围）；管理密码也不会导出。</b></p>
         <div class="inrow">
           <button class="btn" onclick="exportConfig()">导出配置</button>
           <button class="btn" onclick="$('importFile').click()">导入配置</button>
@@ -306,7 +323,7 @@
       </div>
       <div class="danger-zone">
         <h3 style="margin-bottom:8px;color:var(--err)">危险操作</h3>
-        <p style="font-size:13px;color:var(--dim);margin-bottom:12px">重置将清空 KV 中保存的全部面板配置，面板还原为初始部署状态（环境变量不受影响），不可恢复。</p>
+        <p style="font-size:13px;color:var(--dim);margin-bottom:12px">重置将清空 KV 中保存的全部面板配置，面板还原为初始部署状态（环境变量与「代理」列表不受影响），不可恢复。</p>
         <button class="btn danger" onclick="resetAll()">重置全部数据</button>
       </div>
     </section>

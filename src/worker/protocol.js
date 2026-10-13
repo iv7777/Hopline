@@ -26,17 +26,32 @@ function readAddress(data, view, offset, atyp) {
 }
 
 // VLESS 请求头：Version(1) | UUID(16) | AddonsLen(1) | Addons | Cmd(1) | Port(2) | Atyp(1) | Addr | [TCP]1字节User | [UDP]数据包
-// 必须校验 UUID，否则任意 UUID 都能使用代理
-let UUID_BYTES_CACHE = { s: null, b: null };
+// 必须校验 UUID，否则任意 UUID 都能使用代理。UUID 由面板下发并保存在代理的 KV 里：cfg.uuids 是当前接受的 UUID 列表
+// （当前的一个；轮换后 10 分钟内还包含旧的一个）
+const UUID_BYTES_CACHE = new Map();
 function uuidToBytes(u) {
   const str = String(u || '');
-  if (UUID_BYTES_CACHE.s === str) return UUID_BYTES_CACHE.b;
+  const hit = UUID_BYTES_CACHE.get(str);
+  if (hit) return hit;
   const h = str.replace(/-/g, '').toLowerCase();
   if (!/^[0-9a-f]{32}$/.test(h)) throw new Error('服务端 UUID 配置无效');
   const b = new Uint8Array(16);
   for (let i = 0; i < 16; i++) b[i] = parseInt(h.substr(i * 2, 2), 16);
-  UUID_BYTES_CACHE = { s: str, b };
+  if (UUID_BYTES_CACHE.size >= 8) UUID_BYTES_CACHE.clear();
+  UUID_BYTES_CACHE.set(str, b);
   return b;
+}
+// 16 字节（getByte(i) 取第 i 个）是否匹配 cfg.uuids 里的任一项；逐项逐字节比较，不因提前不符而短路
+function uuidAccepted(getByte, cfg) {
+  let ok = false;
+  for (const u of (cfg && cfg.uuids) || []) {
+    let want;
+    try { want = uuidToBytes(u); } catch (e) { continue; }
+    let diff = 0;
+    for (let i = 0; i < 16; i++) diff |= (getByte(i) ^ want[i]);
+    if (diff === 0) ok = true;
+  }
+  return ok;
 }
 function parseVssProtoHeader(data, cfg) {
   if (!data || data.byteLength < 1) throw new Error('VSS 头部过短');
@@ -44,10 +59,7 @@ function parseVssProtoHeader(data, cfg) {
   let offset = 0;
   if (view.getUint8(0) !== 0) throw new Error('不支持的 VSS 版本');
   if (data.byteLength < 17) throw new Error('VSS 头部过短');
-  const want = uuidToBytes(cfg && cfg.uuid);
-  let diff = 0;
-  for (let i = 0; i < 16; i++) diff |= (view.getUint8(1 + i) ^ want[i]);
-  if (diff !== 0) throw new Error('UUID 不匹配');
+  if (!uuidAccepted((i) => view.getUint8(1 + i), cfg)) throw new Error('UUID 不匹配');
   offset += 1 + 16;                       // version + uuid
   if (offset >= data.byteLength) throw new Error('VSS 头部过短');
   const addonsLen = view.getUint8(offset); offset += 1;

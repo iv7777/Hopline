@@ -10,13 +10,6 @@ function isBrowserUA(ua) {
 //  - 未设置 ADMIN 时一律拒绝
 //  - Cookie 为带过期时间的 HMAC-SHA256 签名令牌
 //  - 常量时间比较 + 登录失败限速
-function timingSafeEqual(a, b) {
-  a = String(a); b = String(b);
-  let r = a.length ^ b.length;
-  const n = Math.max(a.length, b.length);
-  for (let i = 0; i < n; i++) r |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
-  return r === 0;
-}
 async function hmacHex(key, msg) {
   const k = await crypto.subtle.importKey('raw', TE.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const sig = await crypto.subtle.sign('HMAC', k, TE.encode(msg));
@@ -154,40 +147,6 @@ function formatConfigErrors(errors) {
   return errors.map(e => (e.label ? e.label + '：' : '') + e.msg).join('；');
 }
 
-// 调用代理的 RPC（服务绑定 PROXY → 代理 Worker 的 NodeStatus / NodeControl 入口）：带超时，失败时抛 Error，由调用方转成面板能显示的结果
-const PROXY_CALL_TIMEOUT = 4000;
-async function callProxy(env, method, ...args) {
-  if (!(env && env.PROXY)) throw Object.assign(new Error('没有绑定服务绑定 PROXY'), { unbound: true });
-  const r = await Promise.race([
-    env.PROXY[method](...args),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('调用超时')), PROXY_CALL_TIMEOUT)),
-  ]);
-  if (!r || typeof r !== 'object') throw new Error('返回内容不正确');
-  return r;
-}
-// 代理状态：绑定缺失、调用失败或超时都不抛错，返回 { bound, up, ... } 给面板显示
-async function proxyStatus(env) {
-  if (!(env && env.PROXY)) return { bound: false };
-  try {
-    const r = await callProxy(env, 'status');
-    return { bound: true, up: true, ok: r.ok === true, version: String(r.version || ''), problems: Array.isArray(r.problems) ? r.problems.map(String) : [], control: r.control === true, storage: r.storage === true, settings: r.settings && typeof r.settings === 'object' ? r.settings : {} };
-  } catch (e) {
-    return { bound: true, up: false, error: String((e && e.message) || e) };
-  }
-}
-// 在线修改代理设置：把面板的请求转给代理的 NodeControl 入口；绑定的是只读入口 NodeStatus 时代理会报「does not implement」
-async function proxySettingsCall(env, method, ...args) {
-  try {
-    const r = await callProxy(env, method, ...args);
-    if (r.ok === false) return json({ ok: false, msg: String(r.error || '代理拒绝了这次操作'), errors: Array.isArray(r.errors) ? r.errors : [] }, 400);
-    return json({ ok: true, data: r });
-  } catch (e) {
-    const msg = String((e && e.message) || e);
-    if (e && e.unbound) return json({ ok: false, msg: '没有绑定服务绑定 PROXY：请在面板 Worker 添加变量名 PROXY、入口 NodeControl 的服务绑定' }, 400);
-    return json({ ok: false, msg: '无法调用代理：' + msg + '。请确认服务绑定 PROXY 的入口是 NodeControl，且代理已更新到 3.0.3 或更高版本' }, 502);
-  }
-}
-
 // 生成订阅：/sub 与面板预览共用同一流程，保证预览与客户端实际拿到的一致
 async function serveSubscription(request, cfg, fmt) {
   const UA = request.headers.get('User-Agent') || '';
@@ -200,11 +159,6 @@ function setupProblems(env, cfg) {
   return cfg._pathError
     ? '环境变量 PATH 的值不正确：' + cfg._pathError + '。'
     : 'Hopline 面板尚未完成配置：请在 Worker 环境变量中设置 PATH（面板与订阅的访问路径，如 mypanel）和 ADMIN（管理密码），然后重新访问。';
-}
-
-// 代理端点（订阅里的节点指向哪里）：域名、UUID、节点路径三项都填了才能生成订阅。返回尚未填写的字段名
-function endpointMissing(cfg) {
-  return [['host', '代理域名'], ['uuid', '代理 UUID'], ['nodePath', '代理节点路径']].filter(([k]) => !cfg[k]).map(([, label]) => label);
 }
 
 async function handleRequest(request, env, state) {
@@ -261,13 +215,11 @@ async function handleRequest(request, env, state) {
     return new Response(loginHTML, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
-  // 订阅入口：自定义订阅路径（如 /mysub/sub），留空则为 /<UUID>/sub（UUID 即代理 UUID）；
-  // 面板路径下的 /sub 始终可用。
+  // 订阅入口：自定义订阅路径（如 /mysub/sub）；面板路径下的 /sub 始终可用。
   // 面板入口与管理 API 只认 panelPath，订阅入口下不开放面板与管理接口
   const subAlias = String(cfg.subUrl || '').trim().replace(/^\/+/, '').replace(/\/+$/, '');
-  const subRoot = subAlias || cfg.uuid;
   const isPanelRoot = segs[0] === panelPath;
-  const isSubRoot = isPanelRoot || segs[0] === subRoot;
+  const isSubRoot = isPanelRoot || (subAlias !== '' && segs[0] === subAlias);
 
   // 根路径不跳转到面板入口（否则会把面板路径 / UUID 告诉任何访问者），返回伪装页
   if (segs[0] === '') {
@@ -344,23 +296,8 @@ async function handleRequest(request, env, state) {
       return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
     }
 
-    // 代理状态：通过服务绑定 PROXY（入口 NodeStatus）读取代理的在线状态与版本；没绑定就只返回 bound:false，面板其它功能不受影响
-    if (apiName === 'proxy-status') return json({ ok: true, data: await proxyStatus(env) });
-    // 在线修改代理设置（7 项出站 / 地区反代设置）：GET 读取、POST 保存（只提交出现的项，整批校验）、proxy-reset 恢复为环境变量 + 默认值
-    if (apiName === 'proxy-settings') {
-      if (request.method === 'GET') return proxySettingsCall(env, 'getSettings');
-      if (request.method === 'POST') {
-        let body;
-        try { body = await request.json(); } catch (e) { return json({ ok: false, msg: '请求体不是合法的 JSON' }, 400); }
-        if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ ok: false, msg: '请求体必须为 JSON 对象' }, 400);
-        return proxySettingsCall(env, 'setSettings', body);
-      }
-      return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
-    }
-    if (apiName === 'proxy-reset') {
-      if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);
-      return proxySettingsCall(env, 'resetSettings');
-    }
+    // 代理管理（增删改 / 同步 / 启停 / 状态 / 在线设置）：面板通过签名的 HTTPS 请求调用代理的控制接口，见 proxies-api.js
+    if (apiName === 'proxies' || apiName === 'proxy-status' || apiName === 'proxy-settings' || apiName === 'proxy-reset') return handleProxiesApi(apiName, request, env, cfg, segs, url);
 
     if (apiName === 'logout') {
       if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);

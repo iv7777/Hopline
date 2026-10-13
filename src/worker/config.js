@@ -22,13 +22,8 @@ async function loadConfig(env) {
   }
   const cfg = buildConfig(env, kvCfg);
   if (kvError) cfg._kvError = kvError;
+  await attachProxies(env, cfg);
   return cfg;
-}
-
-// 环境变量 UUID（有效时返回小写形式，否则空串）
-function envUuid(env) {
-  const v = String(envVar(env, 'uuid') || '').toLowerCase();
-  return isUUID(v) ? v : '';
 }
 
 // 面板路径（环境变量 PATH）：去掉首尾 /，只允许 字母 数字 . _ ~ -，且不能是保留路径。返回 { value, error }
@@ -41,17 +36,11 @@ function normalizePanelPath(raw) {
 }
 
 // 由「默认值 < 环境变量 < KV 配置 < 锁定的环境变量」组装完整配置（纯函数：保存接口用刚写入的数据直接组装，
-// 不经 KV 边缘缓存，避免保存后回读到旧配置）。cfg.uuid / cfg.host / cfg.nodePath 为空表示代理端点尚未填写，cfg.path 为空表示 PATH 未设置 / 非法
+// 不经 KV 边缘缓存，避免保存后回读到旧配置）。cfg.path 为空表示 PATH 未设置 / 非法；代理列表由 loadConfig 另行读入（cfg.proxies / cfg.proxy）
 function buildConfig(env, kvCfg) {
   const cfg = schemaDefaults();
   const flag = (v) => v === true || v === 'true' || v === '1' || v === 1;
   // 环境变量
-  const envBase = { host: '', nodePath: '' };
-  if (envVar(env, 'uuid')) cfg.uuid = String(envVar(env, 'uuid')).toLowerCase();
-  if (env.HOST) envBase.host = String(env.HOST).replace(/^https?:\/\//, '').split('/')[0];
-  if (envVar(env, 'nodePath')) envBase.nodePath = String(envVar(env, 'nodePath')).trim().replace(/^\/+/, '').replace(/\/+$/, '');
-  cfg.host = envBase.host;
-  cfg.nodePath = envBase.nodePath;
   if (flag(envVar(env, 'ech'))) cfg.ech = true;
   if (env.ALPN) cfg.alpn = String(env.ALPN);
   // KV 图形化配置（更高优先级）：按字段表逐项合并，未登记的字段自动忽略
@@ -69,11 +58,6 @@ function buildConfig(env, kvCfg) {
     if (d.lower) v = v.toLowerCase();
     setPath(cfg, key, v);
   }
-  // 代理端点三项：面板里留空（或 UUID 非法）时回退环境变量；仍没有则留空，订阅会提示尚未填写
-  cfg.uuid = String(cfg.uuid || '').toLowerCase();
-  if (!isUUID(cfg.uuid)) cfg.uuid = envUuid(env);
-  if (!cfg.host) cfg.host = envBase.host;
-  if (!cfg.nodePath) cfg.nodePath = envBase.nodePath;
   // 面板路径只认环境变量 PATH（不再回退 UUID）；非法值按未设置处理并记下原因
   const np = normalizePanelPath(locked.path ? env[locked.path] : '');
   cfg.path = np.value;

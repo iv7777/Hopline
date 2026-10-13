@@ -12,7 +12,7 @@
 //   - target 固定为 service-worker，selfDefending / debugProtection 固定关闭：
 //     这两个特性依赖 `Function(...)` 构造动态代码来获取全局对象引用或反调试，
 //     Cloudflare Workers 运行时默认禁止动态生成代码执行，开启会导致部署后直接报错或请求失败。
-//   - 顶层函数 / 变量名一并改名（renameGlobals 开启；整份脚本一次处理，没有分段）；保留的只有 export default 与服务绑定入口类名 NodeStatus / NodeControl。
+//   - 顶层函数 / 变量名一并改名（renameGlobals 开启；整份脚本一次处理，没有分段）；保留的只有 export default。
 //   - 通过 npx 调用（与 `npm run lint` 使用 eslint 的方式一致），版本固定以保证可复现。
 import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -29,7 +29,6 @@ const OPTIONS = {
   target: 'service-worker',
   identifierNamesGenerator: 'mangled-shuffled',
   renameGlobals: true,                      // 单文件处理：顶层函数 / 变量名一并改名
-  reservedNames: ['^NodeStatus$', '^NodeControl$'],   // 服务绑定按名字找入口，导出的类名必须保留（default 导出不受影响）
   selfDefending: false,
   debugProtection: false,
   stringArray: false,

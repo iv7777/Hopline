@@ -1,20 +1,24 @@
-// 面板与代理的端到端衔接：面板生成的节点链接，能被代理接受并转发（两个脚本之间只有这条 vless:// 链接）
+// 面板与代理的端到端衔接：面板通过签名的 HTTPS 控制接口配置代理（生成并下发 UUID、启停、改设置），
+// 面板生成的节点链接能被代理接受并转发；两个脚本之间没有服务绑定
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { register } from 'node:module';
 
 const hooks = `
 export async function resolve(spec, ctx, next) {
-  if (spec === 'cloudflare:workers') {
-    return { url: 'data:text/javascript,export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }', shortCircuit: true };
-  }
   if (spec === 'cloudflare:sockets') {
     return { url: 'data:text/javascript,export function connect(a){ return globalThis.__connect(a); }', shortCircuit: true };
   }
   return next(spec, ctx);
 }`;
 register('data:text/javascript,' + encodeURIComponent(hooks));
-globalThis.fetch = async () => { throw new Error('offline in tests'); };
+// 面板与代理之间只有 HTTPS：发往已挂载域名的 fetch 直接交给对应的代理脚本（测试里源码版与混淆版都挂载一次）
+const MOUNTED = new Map();   // 域名 → { worker, env }
+globalThis.fetch = async (url, opts = {}) => {
+  const m = MOUNTED.get(new URL(String(url)).host);
+  if (!m) throw new Error('offline in tests');
+  return m.worker.fetch(new Request(url, opts), m.env, {});
+};
 
 // Workers 运行时对象的最小替身：WebSocketPair、101 响应、假 TCP 连接
 class FakeWS {
@@ -49,40 +53,61 @@ const proxyModule = await import('../Hopline-proxy.js');
 const proxy = proxyModule.default;
 const panel = (await import('../Hopline-panel.js')).default;
 
-const PROXY_UUID = '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d';
+const NODE_KEY = 'integration-node-key-0123456789ab';
 const PROXY_HOST = 'edge.proxy-example.net';
 const PROXY_PATH = 'tunnel-7';
 const kv = () => { const m = new Map(); return { m, async get(k) { return m.has(k) ? m.get(k) : null; }, async put(k, v) { m.set(k, v); }, async delete(k) { m.delete(k); } }; };
+const state = (m) => JSON.parse(m.env.NODE_KV.m.get('state'));
 
-test('面板里填写代理端点后生成的 vless 链接，可被代理（只配了 UUID 与 PATH）接受并转发', async () => {
-  // 面板：环境变量只有 PATH / ADMIN，代理端点在面板里保存
+let loginSeq = 10;
+async function panelSession() {
   const penv = { PATH: 'my-panel', ADMIN: 'pw', CONFIG_KV: kv() };
-  const loginRes = await panel.fetch(new Request('https://panel.example.org/login', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': '203.0.113.7' },
+  const res = await panel.fetch(new Request('https://panel.example.org/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': '203.0.113.' + (++loginSeq) },
     body: 'username=admin&password=pw&next=' + encodeURIComponent('/my-panel'),
   }), penv, {});
-  assert.equal(loginRes.status, 200);
-  const cookie = loginRes.headers.get('Set-Cookie').split(';')[0];
-  const save = await panel.fetch(new Request('https://panel.example.org/my-panel/api/config', {
-    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      host: PROXY_HOST, uuid: PROXY_UUID, nodePath: PROXY_PATH,
-      src: { prefDomain: false }, ipsrc: { hostmonit: false, uouin: false }, enableXhttp: true,
-    }),
-  }), penv, {});
-  assert.equal(save.status, 200, await save.clone().text());
+  assert.equal(res.status, 200);
+  const cookie = res.headers.get('Set-Cookie').split(';')[0];
+  const api = async (path, init = {}) => {
+    const r = await panel.fetch(new Request('https://panel.example.org/my-panel/api/' + path, { ...init, headers: { Cookie: cookie, 'Content-Type': 'application/json' } }), penv, {});
+    return { status: r.status, body: await r.json() };
+  };
+  return { penv, api };
+}
+const mount = (worker, extra = {}) => {
+  const m = { worker, env: { PATH: PROXY_PATH, NODE_KEY, NODE_KV: kv(), ...extra } };
+  MOUNTED.set(PROXY_HOST, m);
+  return m;
+};
+const uuidBytes = (u) => u.replace(/-/g, '').match(/../g).map(h => parseInt(h, 16));
+const TLS = [0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5];
+const reqFor = (uuid, host) => new Uint8Array([0, ...uuidBytes(uuid), 0, 1, 1, 187, 2, host.length, ...Buffer.from(host), ...TLS]);
+const waitWritten = async () => { for (let i = 0; i < 100 && !connections.some(c => c.written.length); i++) await new Promise(r => setTimeout(r, 10)); return connections.find(c => c.written.length); };
+const linksOf = async (penv, fmt = 'plain') => {
+  const r = await panel.fetch(new Request(`https://panel.example.org/my-panel/sub/${fmt}`, { headers: { 'User-Agent': 'v2rayN/7.0' } }), penv, {});
+  return { status: r.status, text: await r.text() };
+};
+
+test('面板添加代理（域名 / 节点路径 / 密钥）→ 自动生成 UUID 并下发 → 生成的 vless 链接可被代理接受并转发；停用后代理只显示 Hello World，启用后恢复', async () => {
+  const m = mount(proxy);
+  const { penv, api } = await panelSession();
+  assert.equal((await api('config', {})).body.data.endpointMissing.length, 1, '还没有代理');
+  const add = await api('proxies', { method: 'POST', body: JSON.stringify({ host: PROXY_HOST, nodePath: PROXY_PATH, key: NODE_KEY }) });
+  assert.equal(add.status, 200, JSON.stringify(add.body));
+  assert.equal(add.body.data.sync.ok, true, JSON.stringify(add.body.data.sync));
+  const uuid = add.body.data.proxy.uuid;
+  assert.equal(state(m).uuid, uuid, 'UUID 由面板生成，保存在代理的 NODE_KV 里（代理没有 UUID 环境变量）');
+  const id = add.body.data.proxy.id;
   // 优选来源全部关闭、原生地址开启：节点 server 就是代理域名本身
-  const save2 = await panel.fetch(new Request('https://panel.example.org/my-panel/api/config', {
-    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ src: { native: true, prefDomain: false, prefIp: false } }),
-  }), penv, {});
-  assert.equal(save2.status, 200);
-  const subRes = await panel.fetch(new Request(`https://panel.example.org/${PROXY_UUID}/sub/plain`, { headers: { 'User-Agent': 'v2rayN/7.0' } }), penv, {});
-  assert.equal(subRes.status, 200);
-  const links = (await subRes.text()).split('\n').filter(l => l.startsWith('vless://'));
+  const cfgSave = await api('config', { method: 'POST', body: JSON.stringify({ src: { native: true, prefDomain: false, prefIp: false }, enableXhttp: true }) });
+  assert.equal(cfgSave.status, 200);
+  const sub = await linksOf(penv);
+  assert.equal(sub.status, 200);
+  const links = sub.text.split('\n').filter(l => l.startsWith('vless://'));
   assert.ok(links.length >= 2, '原生地址下发 VLESS 与 XHTTP 两种节点');
   const urls = links.map(l => new URL(l.replace('vless://', 'http://')));
   for (const u of urls) {
-    assert.equal(decodeURIComponent(u.username), PROXY_UUID);
+    assert.equal(decodeURIComponent(u.username), uuid);
     assert.equal(u.searchParams.get('sni'), PROXY_HOST);
     assert.equal(u.searchParams.get('host'), PROXY_HOST);
     assert.equal(u.searchParams.get('path').split('?')[0], '/' + PROXY_PATH);
@@ -90,136 +115,117 @@ test('面板里填写代理端点后生成的 vless 链接，可被代理（只�
   const ws = urls.find(u => u.searchParams.get('type') === 'ws');
   const xh = urls.find(u => u.searchParams.get('type') === 'xhttp');
   assert.ok(ws && xh);
-
-  // 代理：只有 UUID 与 PATH 两个环境变量，没有任何面板信息
-  const xenv = { UUID: PROXY_UUID, PATH: PROXY_PATH };
-  const upgrade = await proxy.fetch(new Request(`https://${PROXY_HOST}${ws.searchParams.get('path')}`, { headers: { Upgrade: 'websocket' } }), xenv, {});
+  const connect = (path) => proxy.fetch(new Request(`https://${PROXY_HOST}${path}`, { headers: { Upgrade: 'websocket' } }), m.env, {});
+  const upgrade = await connect(ws.searchParams.get('path'));
   assert.equal(upgrade.status, 101, 'WebSocket 节点链接里的路径被代理接受（含 ?ed=2048）');
-  const uuidBytes = PROXY_UUID.replace(/-/g, '').match(/../g).map(h => parseInt(h, 16));
-  const tls = [0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5];
-  const host = 'target.example';
-  const req = new Uint8Array([0, ...uuidBytes, 0, 1, 1, 187, 2, host.length, ...Buffer.from(host), ...tls]);
-  await lastServer.emit('message', { data: req.buffer });
-  for (let i = 0; i < 100 && !connections.some(c => c.written.length); i++) await new Promise(r => setTimeout(r, 10));
-  const c = connections.find(x => x.written.length);
-  assert.equal(c && c.hostname, host, '用链接里的 UUID 发起的请求被转发到目标');
-  assert.deepEqual([...c.written[0]], tls);
-  // XHTTP 节点链接的路径同样被代理接受
-  const xhRes = await proxy.fetch(new Request(`https://${PROXY_HOST}${xh.searchParams.get('path')}`, { method: 'POST', body: new Uint8Array(req), duplex: 'half' }), xenv, {});
+  connections.length = 0;
+  await lastServer.emit('message', { data: reqFor(uuid, 'target.example').buffer });
+  const c = await waitWritten();
+  assert.equal(c && c.hostname, 'target.example', '用链接里的 UUID 发起的请求被转发到目标');
+  assert.deepEqual([...c.written[0]], TLS);
+  const xhRes = await proxy.fetch(new Request(`https://${PROXY_HOST}${xh.searchParams.get('path')}`, { method: 'POST', body: reqFor(uuid, 'target.example'), duplex: 'half' }), m.env, {});
   assert.equal(xhRes.status, 200);
   assert.equal(xhRes.headers.get('content-type'), 'application/octet-stream');
-  // 代理不接受面板路径，也不认识别的 UUID
-  const wrongPath = await proxy.fetch(new Request(`https://${PROXY_HOST}/my-panel`, { headers: { Upgrade: 'websocket' } }), xenv, {});
-  assert.notEqual(wrongPath.status, 101);
+  // 不认识别的 UUID，也不接受面板路径
+  connections.length = 0;
+  await connect('/' + PROXY_PATH); await lastServer.emit('message', { data: reqFor('0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d', 'other.example').buffer });
+  await new Promise(r => setTimeout(r, 40));
+  assert.equal(connections.some(x => x.hostname === 'other.example'), false, '陌生 UUID 不被转发');
+  assert.notEqual((await connect('/my-panel')).status, 101);
+  // 停用：面板不再下发，代理对外只显示 Hello World
+  const off = await api(`proxies/${id}/enabled`, { method: 'POST', body: JSON.stringify({ enabled: false }) });
+  assert.equal(off.body.data.synced, true);
+  assert.equal((await linksOf(penv)).status, 400);
+  const quiet = await connect(ws.searchParams.get('path'));
+  assert.equal(quiet.status, 200); assert.match(await quiet.text(), /Hello World/);
+  assert.match(await (await proxy.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}`, { method: 'POST', body: reqFor(uuid, 'target.example'), duplex: 'half' }), m.env, {})).text(), /Hello World/);
+  const st = (await api('proxy-status')).body.data;
+  assert.equal(st.up, true); assert.equal(st.enabled, false, '停用后控制接口仍可用，面板能看到状态');
+  // 启用：恢复
+  await api(`proxies/${id}/enabled`, { method: 'POST', body: JSON.stringify({ enabled: true }) });
+  assert.equal((await connect(ws.searchParams.get('path'))).status, 101);
+  assert.equal((await linksOf(penv)).status, 200);
+  // 更换 UUID：新 UUID 立即可用，旧 UUID 在宽限期内仍可用
+  const rot = await api(`proxies/${id}/rotate`, { method: 'POST' });
+  assert.equal(rot.status, 200);
+  const fresh = rot.body.data.proxy.uuid;
+  assert.notEqual(fresh, uuid);
+  for (const [u, host] of [[fresh, 'new-uuid.example'], [uuid, 'old-uuid.example']]) {
+    connections.length = 0;
+    await connect('/' + PROXY_PATH); await lastServer.emit('message', { data: reqFor(u, host).buffer });
+    assert.equal((await waitWritten()).hostname, host, host);
+  }
 });
 
-test('服务绑定：面板通过 PROXY 绑定读到真实代理的在线状态与版本；代理未配置好时面板显示配置问题', async () => {
-  const login = async (penv) => {
-    const res = await panel.fetch(new Request('https://panel.example.org/login', {
-      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': '203.0.113.8' },
-      body: 'username=admin&password=pw&next=' + encodeURIComponent('/my-panel'),
-    }), penv, {});
-    return res.headers.get('Set-Cookie').split(';')[0];
-  };
-  const status = async (proxyEnv) => {
-    const penv = { PATH: 'my-panel', ADMIN: 'pw', CONFIG_KV: kv(), PROXY: new proxyModule.NodeStatus({}, proxyEnv) };
-    const res = await panel.fetch(new Request('https://panel.example.org/my-panel/api/proxy-status', { headers: { Cookie: await login(penv) } }), penv, {});
-    return (await res.json()).data;
-  };
-  const good = await status({ UUID: PROXY_UUID, PATH: PROXY_PATH, HOP_ADDR: 'http://user:pw@1.2.3.4:8080' });
-  assert.equal(good.up, true); assert.equal(good.ok, true);
-  assert.match(good.version, /^\d+\.\d+\.\d+$/, '代理自己的版本号');
-  assert.ok(!('panelVersion' in good), '面板与代理各自编号，状态里不再带面板版本');
-  assert.equal(good.settings.hopAddr, 'http');
-  assert.ok(!JSON.stringify(good).includes('user:pw') && !JSON.stringify(good).includes(PROXY_UUID));
-  const bad = await status({ PATH: PROXY_PATH });
-  assert.equal(bad.up, true); assert.equal(bad.ok, false);
-  assert.match(bad.problems.join(' '), /UUID/);
-});
-
-test('面板在线修改代理设置：面板 → NodeControl → 代理自己的 KV → 代理按新设置出站；改不了 UUID / PATH；只读入口 NodeStatus 不能写', async () => {
-  const nodeKv = kv();
-  const xenv = { UUID: PROXY_UUID, PATH: PROXY_PATH, EDGEIP: 'env-alt.example', NODE_KV: nodeKv };
-  const penv = { PATH: 'my-panel', ADMIN: 'pw', CONFIG_KV: kv(), PROXY: new proxyModule.NodeControl({}, xenv) };
-  const loginRes = await panel.fetch(new Request('https://panel.example.org/login', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': '203.0.113.9' },
-    body: 'username=admin&password=pw&next=' + encodeURIComponent('/my-panel'),
-  }), penv, {});
-  const cookie = loginRes.headers.get('Set-Cookie').split(';')[0];
-  const api = async (path, init = {}) => {
-    const res = await panel.fetch(new Request('https://panel.example.org/my-panel/api/' + path, { ...init, headers: { Cookie: cookie, 'Content-Type': 'application/json' } }), penv, {});
-    return { status: res.status, body: await res.json() };
-  };
+test('面板在线修改代理设置：面板 → 签名 HTTPS → 代理自己的 KV → 代理按新设置出站；改不了 UUID / PATH / 密钥；密钥不对时面板连不上', async () => {
+  const m = mount(proxy, { EDGEIP: 'env-alt.example' });
+  const { api } = await panelSession();
+  const add = await api('proxies', { method: 'POST', body: JSON.stringify({ host: PROXY_HOST, nodePath: PROXY_PATH, key: NODE_KEY }) });
+  const uuid = add.body.data.proxy.uuid;
   const got = await api('proxy-settings');
   assert.equal(got.body.data.storage, true);
   assert.equal(got.body.data.settings.edgeIP, 'env-alt.example');
   assert.equal(got.body.data.source.edgeIP, 'env');
-  const saved = await api('proxy-settings', { method: 'POST', body: JSON.stringify({ edgeIP: 'panel-set.example:8443', 'alt.mode': 'off', UUID: 'hijack', PATH: 'hijack' }) });
+  const saved = await api('proxy-settings', { method: 'POST', body: JSON.stringify({ edgeIP: 'panel-set.example:8443', 'alt.mode': 'off', UUID: 'hijack', PATH: 'hijack', NODE_KEY: 'hijack' }) });
   assert.equal(saved.status, 200, JSON.stringify(saved.body));
   assert.equal(saved.body.data.settings.edgeIP, 'panel-set.example:8443');
-  assert.deepEqual(JSON.parse(nodeKv.m.get('settings')), { edgeIP: 'panel-set.example:8443', 'alt.mode': 'off' });
-  assert.ok(!nodeKv.m.get('settings').includes('hijack'));
+  assert.deepEqual(state(m).set, { edgeIP: 'panel-set.example:8443', 'alt.mode': 'off' });
+  assert.equal(state(m).uuid, uuid, '设置不影响 UUID');
+  assert.ok(!JSON.stringify(state(m)).includes('hijack'));
   const st = (await api('proxy-status')).body.data;
-  assert.equal(st.control, true); assert.equal(st.storage, true);
+  assert.equal(st.storage, true); assert.equal(st.provisioned, true); assert.equal(st.uuidMatch, true);
   assert.equal(st.settings.edgeIP, true); assert.equal(st.settings.altMode, 'off');
-  // 代理按新设置工作：relay.mode=off → 目标直连失败后不尝试任何反代
-  const upgrade = await proxy.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}`, { headers: { Upgrade: 'websocket' } }), xenv, {});
+  // 代理按新设置工作：alt.mode=off → 目标直连失败后不尝试任何反代
+  const upgrade = await proxy.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}`, { headers: { Upgrade: 'websocket' } }), m.env, {});
   assert.equal(upgrade.status, 101);
   connections.length = 0;
-  const failing = globalThis.__connect;
+  const working = globalThis.__connect;
   globalThis.__connect = ({ hostname, port }) => { connections.push({ hostname, port }); throw new Error('refused'); };
-  const uuidBytes = PROXY_UUID.replace(/-/g, '').match(/../g).map(h => parseInt(h, 16));
-  const host = 'nowhere.example';
-  const req = new Uint8Array([0, ...uuidBytes, 0, 1, 1, 187, 2, host.length, ...Buffer.from(host), 0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5]);
-  await lastServer.emit('message', { data: req.buffer });
+  await lastServer.emit('message', { data: reqFor(uuid, 'nowhere.example').buffer });
   await new Promise(r => setTimeout(r, 50));
-  globalThis.__connect = failing;
-  assert.ok(connections.length >= 1 && connections.every(c => c.hostname === host || c.hostname === 'panel-set.example'), '没有尝试任何地区反代');
-  // 恢复为环境变量
+  globalThis.__connect = working;
+  assert.ok(connections.length >= 1 && connections.every(c => c.hostname === 'nowhere.example' || c.hostname === 'panel-set.example'), '没有尝试任何地区反代');
   const reset = await api('proxy-reset', { method: 'POST' });
   assert.equal(reset.body.data.settings.edgeIP, 'env-alt.example');
-  assert.equal(nodeKv.m.has('settings'), false);
-  // 只读入口：能看状态，不能改
-  const roEnv = { ...penv, PROXY: new proxyModule.NodeStatus({}, xenv) };
-  const roRes = await panel.fetch(new Request('https://panel.example.org/my-panel/api/proxy-settings', { method: 'POST', body: '{}', headers: { Cookie: cookie, 'Content-Type': 'application/json' } }), roEnv, {});
-  assert.equal(roRes.status, 502);
-  const roStatus = await panel.fetch(new Request('https://panel.example.org/my-panel/api/proxy-status', { headers: { Cookie: cookie } }), roEnv, {});
-  assert.equal((await roStatus.json()).data.control, false);
+  assert.deepEqual(state(m).set, {});
+  // 代理上的 NODE_KEY 被改过：面板连不上，给出可读的原因
+  m.env.NODE_KEY = 'changed-key-0123456789-abcdefghij';
+  const lost = await api('proxy-status');
+  assert.equal(lost.body.data.up, false); assert.match(lost.body.data.error, /没有响应控制请求/);
 });
 
-test('混淆版代理脚本（顶层名字也已改名）功能不变：WebSocket 与 XHTTP 都能转发，出站设置与地区反代按环境变量 / KV 生效', async () => {
+test('混淆版代理脚本（顶层名字也已改名）功能不变：面板同样能连接、下发 UUID，WebSocket 与 XHTTP 都能转发，在线设置生效', async () => {
   const obf = await import('../obf_Hopline-proxy.js?e2e');
-  const xenv = { UUID: PROXY_UUID, PATH: PROXY_PATH };
-  const uuidBytes = PROXY_UUID.replace(/-/g, '').match(/../g).map(h => parseInt(h, 16));
-  const tls = [0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5];
-  const reqFor = (host) => new Uint8Array([0, ...uuidBytes, 0, 1, 1, 187, 2, host.length, ...Buffer.from(host), ...tls]);
-  const waitWritten = async () => { for (let i = 0; i < 100 && !connections.some(c => c.written.length); i++) await new Promise(r => setTimeout(r, 10)); return connections.find(c => c.written.length); };
+  assert.deepEqual(Object.keys(obf), ['default']);
+  const m = mount(obf.default);
+  const { api } = await panelSession();
+  const add = await api('proxies', { method: 'POST', body: JSON.stringify({ host: PROXY_HOST, nodePath: PROXY_PATH, key: NODE_KEY }) });
+  assert.equal(add.body.data.sync.ok, true, JSON.stringify(add.body.data.sync));
+  const uuid = add.body.data.proxy.uuid;
+  assert.equal(state(m).uuid, uuid);
   // WebSocket
   connections.length = 0;
-  const up = await obf.default.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}?ed=2048`, { headers: { Upgrade: 'websocket' } }), xenv, {});
+  const up = await obf.default.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}?ed=2048`, { headers: { Upgrade: 'websocket' } }), m.env, {});
   assert.equal(up.status, 101);
-  await lastServer.emit('message', { data: reqFor('obf-ws.example').buffer });
+  await lastServer.emit('message', { data: reqFor(uuid, 'obf-ws.example').buffer });
   const ws = await waitWritten();
   assert.equal(ws && ws.hostname, 'obf-ws.example');
-  assert.deepEqual([...ws.written[0]], tls);
+  assert.deepEqual([...ws.written[0]], TLS);
   // XHTTP
   connections.length = 0;
-  const xh = await obf.default.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}`, { method: 'POST', body: reqFor('obf-xh.example'), duplex: 'half' }), xenv, {});
+  const xh = await obf.default.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}`, { method: 'POST', body: reqFor(uuid, 'obf-xh.example'), duplex: 'half' }), m.env, {});
   assert.equal(xh.status, 200);
   assert.equal((await waitWritten()).hostname, 'obf-xh.example');
   // 伪装页与错误路径
-  for (const path of ['/', '/other', '/status']) assert.match(await (await obf.default.fetch(new Request(`https://${PROXY_HOST}${path}`), xenv, {})).text(), /Hello World/);
-  // 在线设置（NodeControl + NODE_KV）：写入后的新连接按新设置出站
-  const settingsKv = kv();
-  const env2 = { ...xenv, NODE_KV: settingsKv, EDGEIP: 'env-edge.example' };
-  const ctl = new obf.NodeControl({}, env2);
-  assert.equal((await ctl.getSettings()).settings.edgeIP, 'env-edge.example');
-  const saved = await ctl.setSettings({ edgeIP: 'saved-edge.example', 'alt.mode': 'off', hopMode: 'no' });
-  assert.equal(saved.ok, true, JSON.stringify(saved));
-  assert.deepEqual(JSON.parse(settingsKv.m.get('settings')), { edgeIP: 'saved-edge.example', hopMode: 'no', 'alt.mode': 'off' });
-  const status = await ctl.status();
-  assert.equal(status.control, true); assert.equal(status.settings.altMode, 'off');
-  assert.equal((await ctl.resetSettings()).settings.edgeIP, 'env-edge.example');
+  for (const path of ['/', '/other', '/status']) assert.match(await (await obf.default.fetch(new Request(`https://${PROXY_HOST}${path}`), m.env, {})).text(), /Hello World/);
+  // 在线设置与停用
+  assert.equal((await api('proxy-settings')).body.data.settings.edgeIP, '');
+  const saved = await api('proxy-settings', { method: 'POST', body: JSON.stringify({ edgeIP: 'saved-edge.example', 'alt.mode': 'off', hopMode: 'no' }) });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+  assert.deepEqual(state(m).set, { edgeIP: 'saved-edge.example', hopMode: 'no', 'alt.mode': 'off' });
+  const off = await api(`proxies/${add.body.data.proxy.id}/enabled`, { method: 'POST', body: JSON.stringify({ enabled: false }) });
+  assert.equal(off.body.data.synced, true);
+  assert.match(await (await obf.default.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}`, { headers: { Upgrade: 'websocket' } }), m.env, {})).text(), /Hello World/);
 });
 
 test('源码与混淆版都没有协议 / 代理角色的名字：去掉注释后，标识符与字符串里不再出现 vless、xhttp、proxy、relay、outbound、shadowsocks、tunnel 等词（协议规定必须原样出现的字面量除外）', async () => {

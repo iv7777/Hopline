@@ -7,13 +7,10 @@ import assert from 'node:assert/strict';
 
 import { register } from 'node:module';
 
-// cloudflare:sockets / cloudflare:workers 仅存在于 Workers 运行时：测试中替换为桩
+// cloudflare:sockets 仅存在于 Workers 运行时：测试中替换为桩
 const hooks = `
 
 export async function resolve(spec, ctx, next) {
-  if (spec === 'cloudflare:workers') {
-    return { url: 'data:text/javascript,export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }', shortCircuit: true };
-  }
   if (spec === 'cloudflare:sockets') {
     // 默认不可用；出站测试通过 globalThis.__connect 注入可控的假连接
     return { url: 'data:text/javascript,export function connect(a){ if (globalThis.__connect) return globalThis.__connect(a); throw new Error("sockets unavailable in tests"); }', shortCircuit: true };
@@ -29,7 +26,9 @@ const proxyModule = await import('../Hopline-proxy.js');
 const worker = proxyModule.default;
 
 const UUID = '11111111-2222-4333-8444-555555555555';
-const baseEnv = (extra = {}) => ({ UUID, PATH: UUID, ...extra });   // 代理只需要 UUID 与 PATH 两个环境变量；路径取 UUID 的值，使 /<UUID> 即节点入口
+const KEY = 'test-node-key-0123456789-abcdef';
+// 代理的环境变量只有 PATH 与 NODE_KEY；UUID 由面板下发、保存在 NODE_KV 的 state 里（这里直接预置）；路径取 UUID 的值，使 /<UUID> 即节点入口
+const baseEnv = (extra = {}) => ({ PATH: UUID, NODE_KEY: KEY, NODE_KV: memKv({ state: { uuid: UUID } }), ...extra });
 
 // ---------------- 优选 IP 来源开关：HostMonit / uouin / 自定义 API ----------------
 import { createHash } from 'node:crypto';
@@ -500,7 +499,7 @@ import { assemble } from '../build.mjs';
 const internals = (() => {
   const src = assemble('proxy')
     .replace(/^import .*$/gm, '').replace('export default {', 'const __default = {').replace(/^export class /gm, 'class ');
-  return new Function('connect', 'WorkerEntrypoint', src + '\n;return { md5Bytes, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVssProtoHeader, isValidIp, parseHopAddress, altPlan, ALT_DOMAINS, nodeConfig, pumpReadable };')(() => { throw new Error('no sockets'); }, class { constructor(ctx, env) { this.ctx = ctx; this.env = env; } });
+  return new Function('connect', src + '\n;return { md5Bytes, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVssProtoHeader, isValidIp, parseHopAddress, altPlan, ALT_DOMAINS, nodeConfig, pumpReadable, routeTag, uuidTag };')(() => { throw new Error('no sockets'); });
 })();
 
 const hex = (u8) => Buffer.from(u8).toString('hex');
@@ -593,7 +592,7 @@ test('Poly1305 / ChaCha20-Poly1305 通过 RFC 8439 已知答案，并与 node:cr
 });
 
 test('协议头解析：任意截断只会报「头部过短」；乱码只会抛普通 Error（不出现 RangeError / TypeError）', () => {
-  const cfg = { uuid: UUID };
+  const cfg = { uuids: [UUID] };
   const vless = [vlessReq('example.com', 443), vlessReqV6(443), new Uint8Array([0, ...uuidBytes, 3, 7, 7, 7, 1, 0, 80, 1, 1, 2, 3, 4])];
   for (const full of vless) {
     const header = internals.parseVssProtoHeader(full, cfg).headerLength;
@@ -825,13 +824,15 @@ test('WS：同一帧内一次性到达的大量数据帧（建连完成前）按
   assert.equal(Buffer.compare(got, Buffer.concat(frames.map(f => Buffer.from(f)))), 0);
 });
 
-// ---------------- 代理配置（只来自环境变量）与路由 ----------------
+// ---------------- 代理配置（环境变量只有 PATH 与 NODE_KEY）与路由 ----------------
 import { readFileSync } from 'node:fs';
+import { PROXY_VERSION } from './helpers-version.mjs';
 
-test('环境变量：PATH 首尾斜杠自动去掉；其余设置缺省时与原先面板里的默认值一致', () => {
-  const cfg = internals.nodeConfig({ UUID: UUID.toUpperCase(), PATH: '/mynode/' });
-  assert.equal(cfg.uuid, UUID, 'UUID 转小写');
+test('环境变量：PATH 首尾斜杠自动去掉；没有 UUID 环境变量；其余设置缺省时与原先面板里的默认值一致', () => {
+  const cfg = internals.nodeConfig({ PATH: '/mynode/', NODE_KEY: KEY, UUID });
   assert.equal(cfg.path, 'mynode');
+  assert.equal(cfg.key, KEY);
+  assert.deepEqual(cfg.uuids, [], 'UUID 环境变量不再被读取，UUID 只来自面板下发的 KV 状态');
   assert.deepEqual(cfg._problems, []);
   assert.equal(cfg.edgeIP, '');
   assert.equal(cfg.hopAddr, '');
@@ -840,7 +841,7 @@ test('环境变量：PATH 首尾斜杠自动去掉；其余设置缺省时与原
 });
 
 test('环境变量：出站 / 地区反代设置按原先的取值校验，无效值回落默认；自定义反代最多 3 个、支持换行与逗号分隔', () => {
-  const c = (extra) => internals.nodeConfig({ UUID, PATH: 'p', ...extra });
+  const c = (extra) => internals.nodeConfig({ NODE_KEY: KEY, PATH: 'p', ...extra });
   assert.equal(c({ EDGEIP: ' proxy.example.com:8443 ' }).edgeIP, 'proxy.example.com:8443');
   assert.equal(c({ HOP_ADDR: 'socks5://u:p@1.2.3.4:1080' }).hopAddr, 'socks5://u:p@1.2.3.4:1080');
   assert.equal(c({ HOP_MODE: 'only' }).hopMode, 'only');
@@ -856,14 +857,15 @@ test('环境变量：出站 / 地区反代设置按原先的取值校验，无�
   assert.equal(c({ ALT_CUSTOM: 'a.example.com, b.example.com:8443\nc.example.com;d.example.com' }).alt.custom, 'a.example.com\nb.example.com:8443\nc.example.com');
 });
 
-test('必填环境变量：UUID / PATH 缺失或非法时所有请求返回 503 设置说明', async () => {
+test('必填环境变量：PATH / NODE_KEY 缺失或非法时所有请求返回 503 设置说明', async () => {
   for (const [env, re] of [
-    [{}, /UUID[\s\S]*PATH/],
-    [{ UUID }, /PATH/],
-    [{ PATH: 'p' }, /UUID/],
-    [{ UUID: 'not-a-uuid', PATH: 'p' }, /UUID 的值不正确/],
-    [{ UUID, PATH: 'a/b' }, /PATH 的值不正确/],
-    [{ UUID, PATH: 'x'.repeat(129) }, /PATH 的值不正确/],
+    [{}, /PATH[\s\S]*NODE_KEY/],
+    [{ NODE_KEY: KEY }, /PATH/],
+    [{ PATH: 'p' }, /NODE_KEY/],
+    [{ PATH: 'p', NODE_KEY: 'short' }, /NODE_KEY 的值不正确/],
+    [{ PATH: 'p', NODE_KEY: 'has space in it 0123456789abcdef' }, /NODE_KEY 的值不正确/],
+    [{ NODE_KEY: KEY, PATH: 'a/b' }, /PATH 的值不正确/],
+    [{ NODE_KEY: KEY, PATH: 'x'.repeat(129) }, /PATH 的值不正确/],
   ]) {
     for (const path of ['/', '/p', '/anything']) {
       const res = await worker.fetch(new Request('https://node.example.com' + path), env, {});
@@ -881,7 +883,7 @@ test('路由：只有节点路径上的 WebSocket / XHTTP 进入代理，其余�
     assert.equal(res.status, 200, path);
     assert.match(await res.text(), /Hello World/, path);
   };
-  for (const path of ['/', '/login', '/version', '/mynode/api/config', '/mynode/sub', `/${UUID}/sub`, `/${UUID}`, '/mynode/x', '/other']) {
+  for (const path of ['/', '/login', '/version', '/mynode/api/config', '/mynode/sub', `/${UUID}/sub`, `/${UUID}`, '/mynode/x', '/other', '/mynode/status', '/mynode/ctl']) {
     await hello(path, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     await hello(path, { headers: { 'User-Agent': 'v2rayN/7.0' } });
   }
@@ -895,64 +897,15 @@ test('路由：只有节点路径上的 WebSocket / XHTTP 进入代理，其余�
   assert.equal(post.headers.get('content-type'), 'application/octet-stream');
 });
 
-test('构建产物：代理脚本不含面板 / 登录 / 订阅 / 管理接口 / KV / 更新检测的任何代码', () => {
+test('构建产物：代理脚本不含面板 / 登录 / 订阅 / 管理接口 / 面板 KV / 更新检测的任何代码，也不导出任何 RPC 入口', () => {
   const code = readFileSync(new URL('../Hopline-proxy.js', import.meta.url), 'utf8');
-  for (const needle of ['hopline_auth', '/api/', 'CONFIG_KV', 'loginHTML', 'generateSubscription', 'raw.githubusercontent.com', 'clash-template', 'PBKDF2', 'ADMIN']) {
+  for (const needle of ['hopline_auth', '/api/', 'CONFIG_KV', 'loginHTML', 'generateSubscription', 'raw.githubusercontent.com', 'clash-template', 'PBKDF2', 'ADMIN', 'WorkerEntrypoint', 'cloudflare:workers']) {
     assert.ok(!code.includes(needle), needle);
   }
+  assert.deepEqual(Object.keys(proxyModule), ['default']);
 });
 
-// ---------------- 只读状态入口 NodeStatus（服务绑定） ----------------
-import { PROXY_VERSION } from './helpers-version.mjs';
-
-test('NodeStatus.status()：在线与否、版本、配置问题与非敏感的设置摘要；不返回 UUID / 路径 / 反代地址 / 出站代理的主机与密码', async () => {
-  assert.equal(typeof proxyModule.NodeStatus, 'function');
-  const env = baseEnv({ PATH: 'secret-node-path', EDGEIP: 'alt.private.example:8443', HOP_ADDR: 'socks5://alice:hunter2@10.9.8.7:1080', HOP_MODE: 'only', ALT_MODE: 'custom', ALT_CUSTOM: 'a.example\nb.example' });
-  const st = await new proxyModule.NodeStatus({}, env).status();
-  assert.equal(st.ok, true);
-  assert.equal(st.version, PROXY_VERSION);
-  assert.deepEqual(st.problems, []);
-  assert.deepEqual(st.settings, { edgeIP: true, hopAddr: 'socks5', hopMode: 'only', altMode: 'custom', altRegion: '', altRegion2: '', altCustom: 2 });
-  const text = JSON.stringify(st);
-  for (const secret of [UUID, 'secret-node-path', 'alt.private.example', 'alice', 'hunter2', '10.9.8.7', 'a.example']) assert.ok(!text.includes(secret), secret);
-  // 默认设置
-  const d = await new proxyModule.NodeStatus({}, baseEnv()).status();
-  assert.deepEqual(d.settings, { edgeIP: false, hopAddr: '', hopMode: '', altMode: 'builtin', altRegion: '', altRegion2: '', altCustom: 0 });
-  // 配置有问题时仍在线，但 ok 为 false 并列出原因
-  const bad = await new proxyModule.NodeStatus({}, {}).status();
-  assert.equal(bad.ok, false);
-  assert.equal(bad.version, PROXY_VERSION);
-  assert.equal(bad.problems.length, 2);
-});
-
-test('状态只能通过服务绑定读取：没有任何 HTTP 路由能拿到版本或状态，公开响应里没有版本号', async () => {
-  const env = baseEnv({ PATH: 'mynode' });
-  for (const path of ['/', '/status', '/version', '/NodeStatus', '/mynode', '/mynode/status', '/mynode/version', '/api/status']) {
-    for (const init of [{}, { method: 'POST', body: 'x' }, { headers: { 'User-Agent': 'Mozilla/5.0' } }]) {
-      if (path === '/mynode' && init.method === 'POST') continue;   // 节点路径上的 POST 是 XHTTP 入口，不是伪装页
-      const res = await worker.fetch(new Request('https://node.example.com' + path, init), env, {});
-      const body = await res.text();
-      assert.equal(res.status, 200, path);
-      assert.match(body, /Hello World/, path);
-      assert.ok(!body.includes(PROXY_VERSION), path);
-    }
-  }
-  assert.deepEqual(Object.keys(proxyModule).sort(), ['NodeControl', 'NodeStatus', 'default'], '模块只导出默认入口与两个 RPC 入口');
-});
-
-test('混淆版代理脚本保留入口名 NodeStatus / NodeControl（服务绑定按名字找入口），在线设置同样可用', async () => {
-  const obf = await import('../obf_Hopline-proxy.js?obf-test');
-  assert.deepEqual(Object.keys(obf).sort(), ['NodeControl', 'NodeStatus', 'default']);
-  const kv = memKv();
-  const st = await new obf.NodeControl({}, baseEnv({ NODE_KV: kv })).status();
-  assert.equal(st.ok, true);
-  assert.equal(st.version, PROXY_VERSION);
-  assert.equal(st.control, true);
-  assert.equal((await new obf.NodeControl({}, baseEnv({ NODE_KV: kv })).setSettings({ hopMode: 'no' })).ok, true);
-  assert.deepEqual(JSON.parse(kv.m.get('settings')), { hopMode: 'no' });
-});
-
-// ---------------- 在线修改设置：NodeControl + 代理自己的 KV（NODE_KV） ----------------
+// ---------------- 面板下发的状态（UUID / 启停）与签名控制接口 ----------------
 function memKv(init = {}) {
   const m = new Map(Object.entries(init).map(([k, v]) => [k, typeof v === 'string' ? v : JSON.stringify(v)]));
   const kv = { m, gets: 0, puts: 0, down: false,
@@ -961,49 +914,198 @@ function memKv(init = {}) {
     async delete(k) { m.delete(k); } };
   return kv;
 }
-const control = (env) => new proxyModule.NodeControl({}, env);
-const storedOf = (kv) => JSON.parse(kv.m.get('settings'));
+const hm = (key, msg) => createHmac('sha256', key).update(msg).digest('base64url');
+const TAG = hm(KEY, 'route').slice(0, 16);
+let nonceSeq = 0;
+// 发一条控制请求；o 可覆盖 key / ts / n / s / tag / path / method / body 来构造各种错误请求
+async function ctl(env, op, args = {}, o = {}) {
+  const key = o.key ?? KEY, ts = o.ts ?? Date.now(), n = o.n ?? ('nonce-' + (++nonceSeq) + '-abcdefgh');
+  const a = JSON.stringify(args);
+  const s = o.s ?? hm(key, `${ts}.${n}.${op}.${a}`);
+  const path = o.path ?? `/${env.PATH}/${o.tag ?? TAG}`;
+  const body = o.body ?? JSON.stringify({ ts, n, op, a, s });
+  const res = await worker.fetch(new Request('https://node.example.com' + path, { method: o.method || 'POST', body: (o.method === 'GET') ? undefined : body }), env, {});
+  return { res, n, ts };
+}
+// 发控制请求并检查回应签名，返回解析后的结果
+async function call(env, op, args = {}) {
+  const { res, n } = await ctl(env, op, args);
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.s, hm(KEY, `${j.ts}.${n}.${j.d}`), '回应带有绑定请求随机串的签名');
+  return JSON.parse(j.d);
+}
+const stateOf = (kv) => JSON.parse(kv.m.get('state'));
+const isHello = async (res) => { assert.equal(res.status, 200); assert.match(await res.text(), /Hello World/); };
 
-test('NodeControl 没有 KV 时：getSettings 只读（storage:false，显示环境变量的值），setSettings / resetSettings 明确拒绝', async () => {
-  const env = baseEnv({ EDGEIP: 'env-alt.example:8443', ALT_MODE: 'off' });
-  const g = await control(env).getSettings();
+test('控制接口：任何不合规的请求都和其它路径一样返回 Hello World（方法、签名、密钥、时间偏差、重放、路径标记、畸形请求体）', async () => {
+  const env = baseEnv({ PATH: 'mynode' });
+  // 合规请求先通过一次
+  assert.equal((await call(env, 'status')).ok, true);
+  const n1 = 'replay-nonce-0001';
+  const first = await ctl(env, 'status', {}, { n: n1 });
+  assert.match(first.res.headers.get('content-type'), /json/);
+  await isHello((await ctl(env, 'status', {}, { n: n1 })).res);                 // 同一随机串第二次：重放
+  await isHello((await ctl(env, 'status', {}, { method: 'GET' })).res);          // 方法不对
+  await isHello((await ctl(env, 'status', {}, { key: 'another-key-0123456789-abcdefgh' })).res);   // 密钥不对
+  await isHello((await ctl(env, 'status', {}, { s: 'AAAA' })).res);              // 签名被改
+  await isHello((await ctl(env, 'status', {}, { ts: Date.now() - 31000 })).res);  // 太旧
+  await isHello((await ctl(env, 'status', {}, { ts: Date.now() + 31000 })).res);  // 太新
+  await isHello((await ctl(env, 'status', {}, { tag: 'wrongtag0123456' })).res);  // 路径标记不对
+  await isHello((await ctl(env, 'status', {}, { path: `/other/${TAG}` })).res);  // 路径不对
+  await isHello((await ctl(env, 'status', {}, { body: '{not json' })).res);
+  await isHello((await ctl(env, 'status', {}, { body: '[]' })).res);
+  await isHello((await ctl(env, 'status', {}, { body: JSON.stringify({ ts: 1, n: 'x', op: 'status', a: '', s: '' }) })).res);
+  await isHello((await ctl(env, 'status', {}, { body: 'x'.repeat(20000) })).res);
+  // 被篡改的参数（签名针对原参数）
+  const ts = Date.now(), n = 'tamper-nonce-0001';
+  const sig = hm(KEY, `${ts}.${n}.setIdentity.${JSON.stringify({ uuid: UUID })}`);
+  await isHello((await ctl(env, 'setIdentity', { uuid: 'ffffffff-2222-4333-8444-555555555555' }, { ts, n, s: sig })).res);
+  assert.equal(env.NODE_KV.puts, 0, '被拒绝的请求没有写入任何东西');
+  // 签名正确但操作未知：仍然是已认证的回应（只告诉持有密钥的一方）
+  assert.equal((await call(env, 'nope')).ok, false);
+});
+
+test('控制接口 status：在线、版本、是否已下发 UUID / 启用；不返回 UUID、路径、密钥、反代地址与出站代理的主机和密码', async () => {
+  const env = baseEnv({ PATH: 'secret-node-path', EDGEIP: 'alt.private.example:8443', HOP_ADDR: 'socks5://alice:hunter2@10.9.8.7:1080', HOP_MODE: 'only', ALT_MODE: 'custom', ALT_CUSTOM: 'a.example\nb.example' });
+  const st = await call(env, 'status');
+  assert.equal(st.ok, true);
+  assert.equal(st.version, PROXY_VERSION);
+  assert.deepEqual(st.problems, []);
+  assert.equal(st.storage, true); assert.equal(st.provisioned, true); assert.equal(st.enabled, true);
+  assert.equal(st.uuidTag, await internals.uuidTag(UUID));
+  assert.deepEqual(st.settings, { edgeIP: true, hopAddr: 'socks5', hopMode: 'only', altMode: 'custom', altRegion: '', altRegion2: '', altCustom: 2 });
+  const text = JSON.stringify(st);
+  for (const secret of [UUID, 'secret-node-path', KEY, 'alt.private.example', 'alice', 'hunter2', '10.9.8.7', 'a.example']) assert.ok(!text.includes(secret), secret);
+  // 没有 KV：照常在线，但 storage:false、尚未下发
+  const noKv = { PATH: 'secret-node-path', NODE_KEY: KEY };
+  const s2 = await call(noKv, 'status');
+  assert.equal(s2.storage, false); assert.equal(s2.provisioned, false);
+  // 公开响应里没有版本号
+  const pub = await worker.fetch(new Request('https://node.example.com/'), env, {});
+  assert.ok(!(await pub.text()).includes(PROXY_VERSION));
+});
+
+test('未下发 UUID（或没有 NODE_KV）的代理：节点路径与其它路径一样只是 Hello World，WebSocket 与 XHTTP 都不进入', async () => {
+  fakeNet({ 'x.example': { delay: 5 } });
+  for (const env of [{ PATH: 'mynode', NODE_KEY: KEY }, { PATH: 'mynode', NODE_KEY: KEY, NODE_KV: memKv() }]) {
+    const ws = await worker.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {});
+    await isHello(ws);
+    await isHello(await xhttpPost(env, '/mynode', vlessReq('x.example', 443, TLS_HELLO)));
+  }
+});
+
+test('下发 UUID：setIdentity 写入 KV，节点立即可用；格式错误被拒；getIdentity 供面板接管；状态里只有 UUID 的短标记', async () => {
+  const kv = memKv();
+  const env = baseEnv({ PATH: 'mynode', NODE_KV: kv });
+  assert.equal((await call(env, 'getIdentity')).ok, false, '还没有 UUID');
+  assert.equal((await call(env, 'setIdentity', { uuid: 'not-a-uuid' })).ok, false);
+  assert.equal(kv.puts, 0);
+  const r = await call(env, 'setIdentity', { uuid: UUID.toUpperCase() });
+  assert.equal(r.ok, true); assert.equal(r.uuidTag, await internals.uuidTag(UUID)); assert.equal(r.graceMs, 0);
+  assert.equal(stateOf(kv).uuid, UUID, '小写保存');
+  assert.deepEqual(await call(env, 'getIdentity'), { ok: true, uuid: UUID });
+  fakeNet({ 'id.example': { delay: 5 } });
+  const log = fakeNet({ 'id.example': { delay: 5 } });
+  const ws = await worker.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {});
+  assert.equal(ws.status, 101);
+  await lastServer.emit('message', { data: vlessReq('id.example', 443, TLS_HELLO).buffer });
+  await until(() => log.some(s => s.written.length));
+});
+
+test('更换 UUID：新的立即可用，旧的在 10 分钟宽限期内仍可用，过期后被拒绝；非轮换的覆盖不留旧值', async () => {
+  const kv = memKv({ state: { uuid: UUID } });
+  const env = baseEnv({ PATH: 'mynode', NODE_KV: kv });
+  const NEW = 'aaaaaaaa-2222-4333-8444-555555555555';
+  const withUuid = (u) => { const r = vlessReq('grace.example', 443, TLS_HELLO); r.set(u.replace(/-/g, '').match(/../g).map(h => parseInt(h, 16)), 1); return r; };
+  const realNow = Date.now; let t = realNow(); Date.now = () => t;
+  try {
+    const rot = await call(env, 'setIdentity', { uuid: NEW, rotate: true });
+    assert.equal(rot.ok, true); assert.equal(rot.graceMs, 600000);
+    assert.equal(stateOf(kv).prev, UUID);
+    const tryConnect = async (u) => {
+      const log = fakeNet({ 'grace.example': { delay: 5 } });
+      const res = await worker.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {});
+      assert.equal(res.status, 101);
+      const ws = lastServer;
+      await ws.emit('message', { data: withUuid(u).buffer });
+      await new Promise(r => setTimeout(r, 40));
+      return log.some(s => s.written.length);
+    };
+    assert.equal(await tryConnect(NEW), true, '新 UUID');
+    assert.equal(await tryConnect(UUID), true, '宽限期内的旧 UUID');
+    t += 10 * 60 * 1000 + 1000;
+    t += 25 * 1000;
+    assert.equal(await tryConnect(NEW), true);
+    assert.equal(await tryConnect(UUID), false, '宽限期过后旧 UUID 被拒绝');
+    // 非轮换的覆盖：不保留旧 UUID
+    const again = await call(env, 'setIdentity', { uuid: UUID });
+    assert.equal(again.graceMs, 0);
+    assert.equal(stateOf(kv).prev, '');
+  } finally { Date.now = realNow; }
+});
+
+test('停用：面板通过 setEnabled 让代理对外只显示 Hello World（WebSocket / XHTTP 都不进入），控制接口不受影响；启用后恢复', async () => {
+  const kv = memKv({ state: { uuid: UUID } });
+  const env = baseEnv({ PATH: 'mynode', NODE_KV: kv });
+  const log = fakeNet({ 'off.example': { delay: 5 } });
+  const wsReq = () => worker.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {});
+  assert.equal((await wsReq()).status, 101);
+  assert.equal((await call(env, 'setEnabled', { enabled: 'no' })).ok, false, '必须是布尔值');
+  assert.deepEqual(await call(env, 'setEnabled', { enabled: false }), { ok: true, enabled: false });
+  assert.equal(stateOf(kv).enabled, false);
+  assert.equal(stateOf(kv).uuid, UUID, '停用不丢 UUID');
+  // 同一 isolate 内立即生效（写入后缓存已更新）
+  await isHello(await wsReq());
+  await isHello(await xhttpPost(env, '/mynode', vlessReq('off.example', 443, TLS_HELLO)));
+  assert.equal(log.length, 0, '没有发起任何出站连接');
+  const st = await call(env, 'status');
+  assert.equal(st.enabled, false); assert.equal(st.ok, true);
+  assert.deepEqual(await call(env, 'setEnabled', { enabled: true }), { ok: true, enabled: true });
+  assert.equal((await wsReq()).status, 101);
+  const post = await xhttpPost(env, '/mynode', vlessReq('off.example', 443, TLS_HELLO));
+  assert.equal(post.headers.get('content-type'), 'application/octet-stream');
+});
+
+test('控制接口 getSettings：生效值、环境变量值与每项来源；没有 KV 时 storage:false，写操作被明确拒绝', async () => {
+  const noKv = { PATH: 'p', NODE_KEY: KEY, EDGEIP: 'env-alt.example:8443', ALT_MODE: 'off' };
+  const g = await call(noKv, 'getSettings');
   assert.equal(g.ok, true); assert.equal(g.storage, false);
   assert.equal(g.settings.edgeIP, 'env-alt.example:8443'); assert.equal(g.settings['alt.mode'], 'off');
   assert.deepEqual(g.source, { edgeIP: 'env', hopAddr: 'default', hopMode: 'default', 'alt.mode': 'env', 'alt.region': 'default', 'alt.region2': 'default', 'alt.custom': 'default' });
   assert.ok(g.regions.includes('HK') && g.regions.includes('Multacom'));
-  const s = await control(env).setSettings({ edgeIP: 'x.example' });
-  assert.equal(s.ok, false); assert.match(s.error, /NODE_KV/);
-  assert.equal((await control(env).resetSettings()).ok, false);
+  for (const [op, args] of [['setSettings', { edgeIP: 'x.example' }], ['resetSettings', {}], ['setIdentity', { uuid: UUID }], ['setEnabled', { enabled: false }]]) {
+    const r = await call(noKv, op, args);
+    assert.equal(r.ok, false, op); assert.match(r.error, /NODE_KV/, op);
+  }
 });
 
-test('NodeControl.setSettings：校验后保存到 KV，生效值 = KV > 环境变量 > 默认；与环境变量相同的值不落盘；只读入口 NodeStatus 没有这些方法', async () => {
-  const kv = memKv();
+test('setSettings：校验后保存到 KV 的 state.set，生效值 = KV > 环境变量 > 默认；与环境变量相同的值不落盘；UUID 与启用开关不受影响', async () => {
+  const kv = memKv({ state: { uuid: UUID, enabled: false } });
   const env = baseEnv({ NODE_KV: kv, EDGEIP: 'env-alt.example', HOP_ADDR: 'socks5://u:p@1.2.3.4:1080' });
-  const r = await control(env).setSettings({
+  const r = await call(env, 'setSettings', {
     edgeIP: ' mine.example:8443 ', hopAddr: 'socks5://u:p@1.2.3.4:1080', hopMode: 'only',
     'alt.mode': 'custom', 'alt.custom': 'A.Example.com, [2001:db8::1]:8443\nb.example.com:443', bogus: 'x',
   });
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.deepEqual(r.ignored, ['bogus']);
-  assert.deepEqual(storedOf(kv), { edgeIP: 'mine.example:8443', hopMode: 'only', 'alt.mode': 'custom', 'alt.custom': 'a.example.com\n[2001:db8::1]:8443\nb.example.com' }, '与环境变量相同的出站代理没有落盘');
+  assert.deepEqual(stateOf(kv).set, { edgeIP: 'mine.example:8443', hopMode: 'only', 'alt.mode': 'custom', 'alt.custom': 'a.example.com\n[2001:db8::1]:8443\nb.example.com' }, '与环境变量相同的出站代理没有落盘');
+  assert.equal(stateOf(kv).uuid, UUID); assert.equal(stateOf(kv).enabled, false);
   assert.equal(r.settings.hopAddr, 'socks5://u:p@1.2.3.4:1080');
   assert.equal(r.storage, true);
   assert.equal(r.source.edgeIP, 'kv'); assert.equal(r.source.hopAddr, 'env'); assert.equal(r.source['alt.region'], 'default');
   // 之后环境变量变化立即生效（KV 里没有它的快照）
   const later = baseEnv({ NODE_KV: kv, EDGEIP: 'env-alt.example', HOP_ADDR: 'socks5://u:p@9.9.9.9:1080' });
-  assert.equal((await control(later).getSettings()).settings.hopAddr, 'socks5://u:p@9.9.9.9:1080');
+  assert.equal((await call(later, 'getSettings')).settings.hopAddr, 'socks5://u:p@9.9.9.9:1080');
   // 改回与环境变量相同：该项从 KV 里移除
-  const back = await control(env).setSettings({ edgeIP: 'env-alt.example' });
+  const back = await call(env, 'setSettings', { edgeIP: 'env-alt.example' });
   assert.equal(back.ok, true);
-  assert.equal('edgeIP' in storedOf(kv), false);
+  assert.equal('edgeIP' in stateOf(kv).set, false);
   assert.equal(back.source.edgeIP, 'env');
-  // 只读入口没有写方法，也没有 getSettings
-  const ro = new proxyModule.NodeStatus({}, env);
-  for (const m of ['getSettings', 'setSettings', 'resetSettings']) assert.equal(ro[m], undefined, m);
 });
 
-test('NodeControl.setSettings 校验：每项给出字段级错误，整批都不保存；自定义模式必须有反代列表；UUID / PATH 改不了', async () => {
-  const kv = memKv();
+test('setSettings 校验：每项给出字段级错误，整批都不保存；自定义模式必须有反代列表；UUID / PATH / NODE_KEY 不是可修改的设置', async () => {
+  const kv = memKv({ state: { uuid: UUID } });
   const env = baseEnv({ NODE_KV: kv });
   const bad = [
     [{ edgeIP: 'bad host' }, 'edgeIP'], [{ edgeIP: 'a/b' }, 'edgeIP'], [{ edgeIP: 'x.example:99999' }, 'edgeIP'],
@@ -1014,63 +1116,74 @@ test('NodeControl.setSettings 校验：每项给出字段级错误，整批都�
     [{ 'alt.custom': 'x.example.com:70000' }, 'alt.custom'], [{ 'alt.mode': 'custom' }, 'alt.custom'], [{ edgeIP: 123 }, 'edgeIP'],
   ];
   for (const [patch, field] of bad) {
-    const r = await control(env).setSettings(patch);
+    const r = await call(env, 'setSettings', patch);
     assert.equal(r.ok, false, JSON.stringify(patch));
     assert.ok(r.errors.some(e => e.field === field), JSON.stringify(patch) + ' → ' + JSON.stringify(r.errors));
   }
-  // 一批里有一项出错：其它合法项也不保存
-  const mixed = await control(env).setSettings({ hopMode: 'no', edgeIP: 'bad host' });
+  const mixed = await call(env, 'setSettings', { hopMode: 'no', edgeIP: 'bad host' });
   assert.equal(mixed.ok, false);
   assert.equal(kv.puts, 0, '校验失败不写 KV');
-  assert.equal((await control(env).setSettings(null)).ok, false);
-  // UUID / PATH 不是可修改的设置：被报告为忽略，不会写入
-  const id = await control(env).setSettings({ UUID: 'x', PATH: 'y', uuid: 'z', path: 'w', hopMode: 'no' });
+  assert.equal((await call(env, 'setSettings', null)).ok, false);
+  const id = await call(env, 'setSettings', { UUID: 'x', PATH: 'y', NODE_KEY: 'k', uuid: 'z', hopMode: 'no' });
   assert.equal(id.ok, true);
-  assert.deepEqual(id.ignored.sort(), ['PATH', 'UUID', 'path', 'uuid']);
-  assert.deepEqual(storedOf(kv), { hopMode: 'no' });
-  assert.ok(!kv.m.get('settings').includes(UUID));
+  assert.deepEqual(id.ignored.sort(), ['NODE_KEY', 'PATH', 'UUID', 'uuid']);
+  assert.deepEqual(stateOf(kv).set, { hopMode: 'no' });
+  assert.equal(stateOf(kv).uuid, UUID);
 });
 
-test('NodeControl：KV 损坏时忽略并允许保存来修复；KV 读取失败时拒绝保存、不覆盖已有设置；resetSettings 清除覆盖项', async () => {
-  const kv = memKv({ settings: '{not json' });
+test('KV 状态：损坏时忽略并允许保存来修复；读取失败时拒绝保存、不覆盖已有状态；resetSettings 只清除设置覆盖项', async () => {
+  const kv = memKv({ state: '{not json' });
   const env = baseEnv({ NODE_KV: kv, ALT_MODE: 'off' });
-  const g = await control(env).getSettings();
-  assert.equal(g.error, 'corrupt'); assert.equal(g.settings['alt.mode'], 'off', '损坏的设置被忽略，用环境变量');
-  assert.equal((await control(env).setSettings({ hopMode: 'no' })).ok, true, '损坏时允许保存（修复）');
-  assert.deepEqual(storedOf(kv), { hopMode: 'no' });
+  const g = await call(env, 'getSettings');
+  assert.equal(g.error, 'corrupt'); assert.equal(g.settings['alt.mode'], 'off', '损坏的状态被忽略，用环境变量');
+  assert.equal((await call(env, 'status')).provisioned, false, '损坏时视为尚未下发');
+  assert.equal((await call(env, 'setSettings', { hopMode: 'no' })).ok, true, '损坏时允许保存（修复）');
+  assert.deepEqual(stateOf(kv).set, { hopMode: 'no' });
   // 无效项在读取时被丢弃，其它项保留
-  const kv2 = memKv({ settings: { hopMode: 'sideways', edgeIP: 'ok.example', bogus: 1 } });
-  const g2 = await control(baseEnv({ NODE_KV: kv2 })).getSettings();
+  const kv2 = memKv({ state: { uuid: UUID, set: { hopMode: 'sideways', edgeIP: 'ok.example', bogus: 1 } } });
+  const g2 = await call(baseEnv({ NODE_KV: kv2 }), 'getSettings');
   assert.equal(g2.settings.edgeIP, 'ok.example'); assert.equal(g2.settings.hopMode, '');
-  // 读取失败：拒绝保存
-  const kv3 = memKv({ settings: { edgeIP: 'keep.example' } });
+  // 读取失败：拒绝所有写操作
+  const kv3 = memKv({ state: { uuid: UUID, set: { edgeIP: 'keep.example' } } });
   kv3.down = true;
   const env3 = baseEnv({ NODE_KV: kv3 });
-  const refused = await control(env3).setSettings({ edgeIP: 'new.example' });
-  assert.equal(refused.ok, false); assert.match(refused.error, /KV 暂时无法读取/);
+  for (const [op, args] of [['setSettings', { edgeIP: 'new.example' }], ['setIdentity', { uuid: 'bbbbbbbb-2222-4333-8444-555555555555' }], ['setEnabled', { enabled: false }], ['resetSettings', {}]]) {
+    const refused = await call(env3, op, args);
+    assert.equal(refused.ok, false, op); assert.match(refused.error, /KV 暂时无法读取/, op);
+  }
   assert.equal(kv3.puts, 0);
-  kv3.down = false;
-  // reset
-  const kv4 = memKv({ settings: { edgeIP: 'x.example' } });
+  assert.equal((await call(env3, 'getIdentity')).ok, false);
+  // reset：只清设置，UUID 与启用开关保留
+  const kv4 = memKv({ state: { uuid: UUID, enabled: false, set: { edgeIP: 'x.example' } } });
   const env4 = baseEnv({ NODE_KV: kv4, EDGEIP: 'env.example' });
-  const rs = await control(env4).resetSettings();
-  assert.equal(rs.ok, true); assert.equal(rs.settings.edgeIP, 'env.example'); assert.equal(kv4.m.has('settings'), false);
-  assert.equal((await control(env4).getSettings()).settings.edgeIP, 'env.example');
+  const rs = await call(env4, 'resetSettings');
+  assert.equal(rs.ok, true); assert.equal(rs.settings.edgeIP, 'env.example');
+  assert.deepEqual(stateOf(kv4), { uuid: UUID, prev: '', prevUntil: 0, enabled: false, set: {} });
+  assert.equal((await call(env4, 'getSettings')).settings.edgeIP, 'env.example');
 });
 
-test('status()：control 标志、是否有 KV、摘要反映 KV 里的在线设置；仍不返回任何密钥', async () => {
-  const kv = memKv({ settings: { 'alt.mode': 'off', hopAddr: 'http://carol:s3cret@10.1.1.1:8080', hopMode: 'only' } });
-  const env = baseEnv({ NODE_KV: kv });
-  const full = await control(env).status();
-  assert.equal(full.control, true); assert.equal(full.storage, true);
-  assert.deepEqual(full.settings, { edgeIP: false, hopAddr: 'http', hopMode: 'only', altMode: 'off', altRegion: '', altRegion2: '', altCustom: 0 });
-  assert.ok(!JSON.stringify(full).includes('s3cret') && !JSON.stringify(full).includes('10.1.1.1'));
-  const ro = await new proxyModule.NodeStatus({}, baseEnv()).status();
-  assert.equal(ro.control, false); assert.equal(ro.storage, false);
+test('混淆版代理脚本：只导出默认入口，控制接口、UUID 下发与节点连接同样可用', async () => {
+  const obf = await import('../obf_Hopline-proxy.js?obf-test');
+  assert.deepEqual(Object.keys(obf), ['default']);
+  const kv = memKv();
+  const env = baseEnv({ PATH: 'mynode', NODE_KV: kv });
+  const send = async (op, args = {}) => {
+    const ts = Date.now(), n = 'obf-' + op + '-nonce-' + (++nonceSeq), a = JSON.stringify(args);
+    const res = await obf.default.fetch(new Request(`https://node.example.com/mynode/${TAG}`, { method: 'POST', body: JSON.stringify({ ts, n, op, a, s: hm(KEY, `${ts}.${n}.${op}.${a}`) }) }), env, {});
+    return JSON.parse((await res.json()).d);
+  };
+  const st = await send('status');
+  assert.equal(st.ok, true); assert.equal(st.version, PROXY_VERSION); assert.equal(st.provisioned, false);
+  await isHello(await obf.default.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {}));
+  assert.equal((await send('setIdentity', { uuid: UUID })).ok, true);
+  assert.equal((await send('setSettings', { hopMode: 'no' })).ok, true);
+  assert.deepEqual(stateOf(kv).set, { hopMode: 'no' });
+  const ws = await obf.default.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {});
+  assert.equal(ws.status, 101);
 });
 
 test('在线设置真正生效：节点路径上的连接按 KV 里的设置出站；KV 读取有缓存、伪装页请求不读 KV；KV 故障时沿用上次的设置', async () => {
-  const kv = memKv({ settings: { 'alt.mode': 'off' } });
+  const kv = memKv({ state: { uuid: UUID, set: { 'alt.mode': 'off' } } });
   const env = baseEnv({ NODE_KV: kv });
   const realNow = Date.now;
   let t = realNow();
@@ -1092,7 +1205,7 @@ test('在线设置真正生效：节点路径上的连接按 KV 里的设置出�
     assert.equal(dns.filter(d => d.name.startsWith('proxyip.')).length, 0, 'KV 里的 alt.mode=off 生效：没有解析内置反代');
     assert.equal(kv.gets, 1, '3 个连接只读了一次 KV（isolate 内存缓存）');
     // 改成自定义反代，缓存过期后新设置生效
-    kv.m.set('settings', JSON.stringify({ 'alt.mode': 'custom', 'alt.custom': 'kv-alt.example.com' }));
+    kv.m.set('state', JSON.stringify({ uuid: UUID, set: { 'alt.mode': 'custom', 'alt.custom': 'kv-alt.example.com' } }));
     t += 25 * 1000;
     log = fakeNet({ 'kv-cf.example': { delay: 'hang' }, '203.0.113.77': { delay: 10 } });
     await withFetch(cfDoh({ 'kv-alt.example.com': ['203.0.113.77'] }, []), async () => {
@@ -1102,7 +1215,7 @@ test('在线设置真正生效：节点路径上的连接按 KV 里的设置出�
     });
     assert.equal(log.find(s => s.written.length).hostname, '203.0.113.77', '缓存过期后读到新设置');
     assert.equal(kv.gets, 2);
-    // KV 故障：沿用上次读到的设置，连接不受影响
+    // KV 故障：沿用上次读到的状态（含 UUID），连接不受影响
     kv.down = true;
     t += 25 * 1000;
     log = fakeNet({ 'kv-cf.example': { delay: 'hang' }, '203.0.113.77': { delay: 10 } });
@@ -1113,15 +1226,15 @@ test('在线设置真正生效：节点路径上的连接按 KV 里的设置出�
     });
     assert.equal(log.find(s => s.written.length).hostname, '203.0.113.77', 'KV 读取失败时沿用上次的设置');
   } finally { Date.now = realNow; }
-  // 通过 NodeControl 保存后，同一 isolate 立即生效（不等缓存过期）
-  const kv2 = memKv();
+  // 通过控制接口保存后，同一 isolate 立即生效（不等缓存过期）
+  const kv2 = memKv({ state: { uuid: UUID } });
   const env2 = baseEnv({ NODE_KV: kv2 });
   fakeNet({});
   const dns2 = [];
   await withFetch(cfDoh({}, dns2), async () => {
     const before = await openWs(env2);
     await before.emit('message', { data: vlessReq('save-live.example', 443, TLS_HELLO).buffer });
-    await control(env2).setSettings({ 'alt.mode': 'off' });
+    await call(env2, 'setSettings', { 'alt.mode': 'off' });
     dns2.length = 0;
     const after = await openWs(env2);
     await after.emit('message', { data: vlessReq('save-live.example', 443, TLS_HELLO).buffer });

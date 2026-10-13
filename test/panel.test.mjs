@@ -8,7 +8,28 @@ import { PANEL_VERSION, PROXY_VERSION } from './helpers-version.mjs';
 import assert from 'node:assert/strict';
 
 // 订阅生成会拉取外部优选源：测试环境一律离线，走各处的失败兜底
-globalThis.fetch = async () => { throw new Error('offline in tests'); };
+// 面板通过 HTTPS 联系代理：发往已挂载域名的 fetch 直接交给真实的代理脚本（Hopline-proxy.js）
+import { register } from 'node:module';
+register('data:text/javascript,' + encodeURIComponent(`export async function resolve(spec, ctx, next) { if (spec === 'cloudflare:sockets') return { url: 'data:text/javascript,export function connect(){ throw new Error("sockets unavailable in tests"); }', shortCircuit: true }; return next(spec, ctx); }`));
+const proxyWorker = (await import('../Hopline-proxy.js')).default;
+// 代理的 WebSocket 升级需要 Workers 运行时对象：最小替身（只用来区分「进入代理」与「伪装页」）
+globalThis.WebSocketPair = function () { return { 0: {}, 1: { accept() {}, addEventListener() {}, send() {}, close() {} } }; };
+const NodeResponse = globalThis.Response;
+globalThis.Response = class extends NodeResponse {
+  constructor(body, init) {
+    if (init && init.status === 101) { super(null, { status: 200 }); Object.defineProperty(this, 'status', { value: 101 }); } else super(body, init);
+  }
+};
+const MOUNTED = new Map();   // 域名 → { env, hits, down, hang, reply }
+globalThis.fetch = async (url, opts = {}) => {
+  const m = MOUNTED.get(new URL(String(url)).host);
+  if (!m) throw new Error('offline in tests');
+  m.hits++;
+  if (m.down) throw new Error('connect failed');
+  if (m.hang) return new Promise((_, rej) => opts.signal && opts.signal.addEventListener('abort', () => rej(new Error('aborted'))));
+  if (m.reply) return m.reply();
+  return proxyWorker.fetch(new Request(url, opts), m.env, {});
+};
 
 const worker = (await import('../Hopline-panel.js')).default;
 
@@ -18,7 +39,11 @@ const UUID2 = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 
 const BROWSER = 'Mozilla/5.0 (X11; Linux x86_64)';
 
+const KEY = 'test-node-key-0123456789-abcdef';
+// 面板的代理列表保存在 KV 的 proxies 里；测试用的 KV 默认带一个已配置好的代理（传入 proxies 键则以传入的为准）
+const PROXY = { id: 'px-test-1', name: '代理 1', host: 'node.example.com', nodePath: UUID, uuid: UUID, key: KEY, enabled: true };
 function kv(init = {}) {
+  if (!('proxies' in init)) init = { proxies: [PROXY], ...init };
   const m = new Map(Object.entries(init).map(([k, v]) => [k, typeof v === 'string' ? v : JSON.stringify(v)]));
   return {
     m,
@@ -28,6 +53,18 @@ function kv(init = {}) {
   };
 }
 
+const plainKv = (init = {}) => {
+  const m = new Map(Object.entries(init).map(([k, v]) => [k, JSON.stringify(v)]));
+  return { m, async get(k) { return m.has(k) ? m.get(k) : null; }, async put(k, v) { m.set(k, v); } };
+};
+// 挂载一个代理：默认节点路径 np、密钥 KEY、有 NODE_KV；state 是预置在代理 NODE_KV 里的状态
+const mountProxy = (host, { PATH = 'np', NODE_KEY = KEY, state, NODE_KV } = {}) => {
+  const m = { env: { PATH, NODE_KEY, NODE_KV: NODE_KV === undefined ? plainKv(state ? { state } : {}) : NODE_KV }, hits: 0 };
+  MOUNTED.set(host, m);
+  return m;
+};
+const proxyState = (m) => JSON.parse(m.env.NODE_KV.m.get('state'));
+const storedProxies = (env) => JSON.parse(env.CONFIG_KV.m.get('proxies'));
 const stored = (env) => JSON.parse(env.CONFIG_KV.m.get('config'));
 
 async function call(env, path, { method = 'GET', body, cookie, ua = BROWSER, headers = {} } = {}) {
@@ -46,7 +83,7 @@ async function login(env, password = 'pw', panelPath = UUID, username = 'admin')
   return res.headers.get('Set-Cookie').split(';')[0];
 }
 
-const baseEnv = (extra = {}) => ({ UUID, PATH: UUID, ADMIN: 'pw', CONFIG_KV: kv(), HOST: 'node.example.com', NODE_PATH: UUID, ...extra });   // PATH、ADMIN 必填；路径取 UUID 的值，使 /<UUID> 即面板入口
+const baseEnv = (extra = {}) => ({ PATH: UUID, ADMIN: 'pw', CONFIG_KV: kv(), ...extra });   // PATH、ADMIN 必填；路径取 UUID 的值，使 /<UUID> 即面板入口；代理来自 KV 里的 proxies
 
 // 固定节点列表：把若干 `IP:端口#名称` 行托管为「自定义优选 API 1」的响应（默认模式下唯一的节点来源），测试里用它精确控制节点
 const NODE_LISTS = new Map();
@@ -59,7 +96,7 @@ const fixedNodes = (lines, extra = {}) => {
 
 const nodesFetch = (u) => NODE_LISTS.has(u) ? new Response(NODE_LISTS.get(u)) : new Response('Not Found', { status: 404 });
 
-test('GET /api/config 返回字段表默认值及派生信息；代理端点（域名 / UUID / 节点路径）来自环境变量默认值', async () => {
+test('GET /api/config 返回字段表默认值及派生信息；代理（域名 / 节点路径 / UUID）在代理列表里，不在面板配置里', async () => {
   const env = baseEnv();
   const cookie = await login(env);
   const r = await (await call(env, `/${UUID}/api/config`, { cookie })).json();
@@ -67,15 +104,15 @@ test('GET /api/config 返回字段表默认值及派生信息；代理端点（�
   const d = r.data;
   // 默认值（filter.region 为 ['all']，src 为面板保存的地址来源默认值）；XHTTP 默认开启，IP 类型默认只有 IPv4
   const legacy = {
-    host: 'node.example.com', nodePath: UUID, enableVless: true, enableXhttp: true,
+    enableVless: true, enableXhttp: true,
     alpn: '', ech: false, echHost: 'cloudflare-ech.com', echDns: '', tlsOnly: true,
     filter: { region: ['all'], ipType: ['IPv4'], isp: ['移动', '联通', '电信'] },
     src: { native: false, prefDomain: true, prefIp: true },
   };
   for (const [k, v] of Object.entries(legacy)) assert.deepEqual(d[k], v, k);
   for (const k of ['optimizer', 'preferredDomains', 'preferredIPs']) assert.equal(k in d, false, `已移除的自定义订阅 / 随机优选配置 ${k}`);
-  assert.equal(d.uuid, UUID);
-  assert.deepEqual(d.endpointMissing, [], '代理端点三项都有值');
+  for (const k of ['host', 'uuid', 'nodePath', 'proxies']) assert.equal(k in d, false, `${k} 属于代理列表，不在面板配置里`);
+  assert.deepEqual(d.endpointMissing, [], '有一个启用的代理且域名 / 节点路径 / UUID 齐全');
   for (const k of ['edgeIP', 'hopAddr', 'hopMode', 'alt']) assert.equal(k in d, false, `出站 / 地区反代设置 ${k} 属于代理脚本，面板不再有`);
   assert.equal(d.path, UUID, '面板路径来自环境变量 PATH');
   assert.equal(d.panelPath, UUID);
@@ -87,30 +124,6 @@ test('GET /api/config 返回字段表默认值及派生信息；代理端点（�
   assert.equal(d.ipsrc.wetest, false, '微测网默认关闭');
 });
 
-test('保存非法的代理 UUID / 域名 / 节点路径被拒绝并返回字段级错误；留空允许（回退环境变量，没有环境变量则订阅提示未填写）', async () => {
-  const env = baseEnv();
-  const cookie = await login(env);
-  for (const [bad, field] of [[{ uuid: 'not-a-uuid' }, 'uuid'], [{ host: 'bad host' }, 'host'], [{ nodePath: 'a/b' }, 'nodePath'], [{ nodePath: 'a b' }, 'nodePath']]) {
-    const res = await call(env, `/${UUID}/api/config`, { method: 'POST', cookie, body: bad });
-    assert.equal(res.status, 400, JSON.stringify(bad));
-    const r = await res.json();
-    assert.equal(r.ok, false);
-    assert.equal(r.errors[0].field, field);
-  }
-  assert.equal(env.CONFIG_KV.m.has('config'), false, '校验失败不写 KV');
-  const ok = await call(env, `/${UUID}/api/config`, { method: 'POST', cookie, body: { uuid: '', host: '', nodePath: '' } });
-  assert.equal(ok.status, 200);
-  assert.deepEqual((await ok.json()).data.endpointMissing, [], '留空 = 回退环境变量 HOST / UUID / NODE_PATH');
-});
-
-test('KV 中残留非法 UUID 时回退环境变量 U，面板仍可进入（问题 1）', async () => {
-  const env = baseEnv({ CONFIG_KV: kv({ config: { uuid: '', path: '' } }) });
-  const cookie = await login(env);
-  const res = await call(env, `/${UUID}/api/config`, { cookie });
-  assert.equal(res.status, 200);
-  assert.equal((await res.json()).data.uuid, UUID);
-});
-
 test('字段校验：范围、枚举、格式、全部协议关闭', async () => {
   const env = baseEnv();
   const cookie = await login(env);
@@ -118,8 +131,6 @@ test('字段校验：范围、枚举、格式、全部协议关闭', async () =>
     [{ subUrl: 'a/b' }, 'subUrl'],
     [{ subUrl: 'login' }, 'subUrl'],
     [{ subUrl: 'version' }, 'subUrl'],
-    [{ host: 'bad host' }, 'host'],
-    [{ nodePath: 'a/b' }, 'nodePath'],
     [{ prefDomains: 'a.example.com:443' }, 'prefDomains'],
     [{ filter: { region: ['XX'] } }, 'filter.region'],
     [{ enableVless: false, enableXhttp: false }, 'enableVless'],
@@ -139,7 +150,7 @@ test('保存只写入字段表登记的配置项，规范化取值，忽略未�
     method: 'POST', cookie,
     body: {
       admin: 'new-secret', _quotaCap: 1, version: '9.9.9', fragment: 'x', src: { customPref: true, native: true },
-      optimizer: { subRandomCount: '30', subMode: 'random' }, nodeLimitCount: 300, subUrl: '/mysub/sub', host: 'https://Node.Example.com/path', filter: { region: ['all', 'HK'] },
+      optimizer: { subRandomCount: '30', subMode: 'random' }, nodeLimitCount: 300, subUrl: '/mysub/sub', filter: { region: ['all', 'HK'] },
       preferredIPs: [{ ip: '[2606:4700::1]', port: '8443', name: ' 香港 ' }], preferredDomains: 'x.example.com',
     },
   });
@@ -153,7 +164,6 @@ test('保存只写入字段表登记的配置项，规范化取值，忽略未�
   for (const k of ['optimizer', 'preferredIPs', 'preferredDomains']) assert.equal(k in s, false, `${k}（已移除的自定义订阅 / 随机优选配置）不写入`);
   assert.equal('nodeLimitCount' in s, false, '已移除的字段不写入');
   assert.equal(s.subUrl, 'mysub');
-  assert.equal(s.host, 'Node.Example.com');
   assert.deepEqual(s.filter.region, ['all']);
   assert.ok(r.ignored.includes('admin') && r.ignored.includes('_quotaCap') && r.ignored.includes('src.customPref') && r.ignored.includes('nodeLimitCount'));
   assert.ok(r.ignored.includes('optimizer') && r.ignored.includes('preferredIPs') && r.ignored.includes('preferredDomains'));
@@ -168,56 +178,259 @@ test('未绑定 KV 时保存返回明确错误（问题 10）', async () => {
   assert.match((await res.json()).msg, /KV/);
 });
 
-test('修改代理端点（UUID / 域名 / 节点路径）与登录无关：不影响登录态，面板路径来自 PATH', async () => {
+test('代理列表 API：需登录；新增时校验字段、自动连接代理并生成 UUID 下发；密钥只写不读；订阅随即可用', async () => {
+  const env = baseEnv({ CONFIG_KV: kv({ proxies: [], config: customCfg() }) });
+  const api = (path, init) => call(env, `/${UUID}/api/${path}`, init);
+  for (const [path, method] of [['proxies', 'GET'], ['proxies', 'POST'], ['proxies/x', 'DELETE'], ['proxies/x/sync', 'POST'], ['proxy-status', 'GET']]) assert.equal((await api(path, { method })).status, 403, path + ' 未登录');
+  const cookie = await login(env);
+  assert.equal((await (await api('config', { cookie })).json()).data.endpointMissing.length, 1, '还没有代理');
+  const good = { host: 'p.example.com', nodePath: 'np', key: KEY };
+  for (const [patch, field] of [[{ host: 'bad host' }, 'host'], [{ host: '1.2.3.4' }, 'host'], [{ host: 'p.example.com:8443' }, 'host'], [{ host: '' }, 'host'], [{ nodePath: 'a/b' }, 'nodePath'], [{ nodePath: '' }, 'nodePath'],
+    [{ key: 'short' }, 'key'], [{ key: undefined }, 'key'], [{ uuid: 'not-a-uuid' }, 'uuid'], [{ enabled: 'yes' }, 'enabled']]) {
+    const res = await api('proxies', { method: 'POST', cookie, body: { ...good, ...patch } });
+    assert.equal(res.status, 400, JSON.stringify(patch));
+    assert.ok((await res.json()).errors.some(e => e.field === field), JSON.stringify(patch));
+  }
+  assert.equal(env.CONFIG_KV.m.get('proxies'), '[]', '校验失败不写 KV');
+  const m = mountProxy('p.example.com');
+  const res = await api('proxies', { method: 'POST', cookie, body: { host: 'P.Example.com', nodePath: '/np/', key: KEY, name: '主力' } });
+  const r = await res.json();
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const px = r.data.proxy;
+  assert.deepEqual([px.host, px.nodePath, px.name, px.keySet, px.enabled], ['p.example.com', 'np', '主力', true, true]);
+  assert.match(px.uuid, /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/, '面板生成 UUID');
+  assert.equal(r.data.sync.ok, true); assert.ok(r.data.sync.actions.some(a => /已生成 UUID/.test(a)) && r.data.sync.actions.some(a => /下发给代理/.test(a)));
+  assert.ok(!('key' in px) && !JSON.stringify(r).includes(KEY), '回应里没有密钥');
+  assert.equal(proxyState(m).uuid, px.uuid, 'UUID 已下发到代理的 NODE_KV');
+  assert.equal(storedProxies(env)[0].key, KEY); assert.equal(storedProxies(env)[0].uuid, px.uuid);
+  const list = await (await api('proxies', { cookie })).json();
+  assert.equal(list.data.proxies.length, 1); assert.ok(!JSON.stringify(list).includes(KEY));
+  assert.deepEqual((await (await api('config', { cookie })).json()).data.endpointMissing, []);
+  const links = await withFetch(nodesFetch, async () => (await (await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).text()).split('\n').filter(l => /^vless:\/\//.test(l)));
+  assert.ok(links.length > 0);
+  assert.ok(links.every(l => l.startsWith(`vless://${px.uuid}@`) && /[?&]sni=p\.example\.com(&|#)/.test(l) && /path=%2Fnp(%3F|&)/.test(l)), '链接用代理的 UUID / 域名 / 节点路径');
+});
+
+test('代理同步：面板没有 UUID 而代理已有则接管（不换新）；UUID 对不上则重新下发；代理连不上 / 密钥不对 / 同区 Worker（1042）都给出可读的原因，记录仍保存', async () => {
+  const env = baseEnv({ CONFIG_KV: kv({ proxies: [] }) });
+  const cookie = await login(env);
+  const api = (path, init) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
+  // 代理上已有 UUID：接管
+  const m1 = mountProxy('adopt.example.com', { state: { uuid: UUID2 } });
+  const a = await (await api('proxies', { method: 'POST', body: { host: 'adopt.example.com', nodePath: 'np', key: KEY } })).json();
+  assert.equal(a.data.proxy.uuid, UUID2); assert.ok(a.data.sync.actions.some(x => /接管/.test(x)));
+  assert.equal(proxyState(m1).uuid, UUID2, '代理上的 UUID 没有被换掉');
+  // 面板的 UUID 与代理对不上：重新下发
+  const id = a.data.proxy.id;
+  const set = await (await api(`proxies/${id}`, { method: 'POST', body: { uuid: UUID.toUpperCase() } })).json();
+  assert.equal(set.data.proxy.uuid, UUID); assert.ok(set.data.sync.actions.some(x => /重新下发/.test(x)));
+  assert.equal(proxyState(m1).uuid, UUID);
+  // 再同步一次：已经一致，什么都不用做
+  const again = await (await api(`proxies/${id}/sync`, { method: 'POST' })).json();
+  assert.equal(again.data.sync.ok, true); assert.deepEqual(again.data.sync.actions, []);
+  // 更新时留空密钥 = 保持不变；填新密钥 = 更换
+  assert.equal(storedProxies(env)[0].key, KEY);
+  // 失败原因（记录仍然保存）
+  const down = mountProxy('down.example.com'); down.down = true;
+  const d = await (await api('proxies', { method: 'POST', body: { host: 'down.example.com', nodePath: 'np', key: KEY } })).json();
+  assert.equal(d.ok, true); assert.equal(d.data.sync.ok, false); assert.match(d.data.sync.error, /无法连接代理/);
+  assert.equal(storedProxies(env).length, 2, '连不上也先保存');
+  mountProxy('wrongkey.example.com', { NODE_KEY: 'another-key-0123456789-abcdefgh' });
+  const w = await (await api('proxies', { method: 'POST', body: { host: 'wrongkey.example.com', nodePath: 'np', key: KEY } })).json();
+  assert.match(w.data.sync.error, /没有响应控制请求/);
+  const z = mountProxy('samezone.example.com'); z.reply = () => new Response('error code: 1042', { status: 403 });
+  const e = await (await api('proxies', { method: 'POST', body: { host: 'samezone.example.com', nodePath: 'np', key: KEY } })).json();
+  assert.match(e.data.sync.error, /1042.*自定义域名/);
+  mountProxy('noenv.example.com', { PATH: 'np', NODE_KEY: 'x' }).reply = () => new Response('请设置环境变量 NODE_KEY', { status: 503 });
+  const n = await (await api('proxies', { method: 'POST', body: { host: 'noenv.example.com', nodePath: 'np', key: KEY } })).json();
+  assert.match(n.data.sync.error, /NODE_KEY/);
+  mountProxy('nokv.example.com', { NODE_KV: null });
+  const k = await (await api('proxies', { method: 'POST', body: { host: 'nokv.example.com', nodePath: 'np', key: KEY } })).json();
+  assert.equal(k.data.sync.ok, false); assert.match(k.data.sync.error, /NODE_KV/);
+});
+
+test('停用 / 启用：面板立刻不再下发该代理（订阅 400 提示），并通知代理只显示 Hello World；启用恢复；代理不可达时面板照样停用并给出提醒', async () => {
+  const m = mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
+  const env = baseEnv({ CONFIG_KV: kv({ config: customCfg() }) });
+  const cookie = await login(env);
+  const api = (path, init) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
+  const id = PROXY.id;
+  const wsHello = async () => (await proxyWorker.fetch(new Request(`https://node.example.com/${UUID}`, { headers: { Upgrade: 'websocket' } }), m.env, {})).status;
+  assert.equal((await api('proxies/' + id + '/enabled', { method: 'POST', body: { enabled: 'no' } })).status, 400);
+  const off = await (await api(`proxies/${id}/enabled`, { method: 'POST', body: { enabled: false } })).json();
+  assert.equal(off.ok, true); assert.equal(off.data.synced, true); assert.equal(off.data.proxy.enabled, false);
+  assert.equal(storedProxies(env)[0].enabled, false);
+  assert.equal(proxyState(m).enabled, false, '代理端同步停用');
+  assert.equal(await wsHello(), 200, '停用后节点路径只是伪装页（不是 101）');
+  const sub = await withFetch(nodesFetch, () => call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' }));
+  assert.equal(sub.status, 400); assert.match(await sub.text(), /启用中的代理/);
+  assert.match((await (await api('config')).json()).data.endpointMissing[0], /启用中的代理/);
+  const st = (await (await api('proxy-status')).json()).data;
+  assert.equal(st.configured, true, '停用的代理仍可查看状态'); assert.equal(st.enabled, false);
+  const on = await (await api(`proxies/${id}/enabled`, { method: 'POST', body: { enabled: true } })).json();
+  assert.equal(on.data.synced, true); assert.equal(proxyState(m).enabled, true);
+  assert.equal(await wsHello(), 101);
+  assert.equal((await withFetch(nodesFetch, () => call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' }))).status, 200);
+  // 代理不可达：面板侧照样停用，提醒之后同步
+  m.down = true;
+  const off2 = await (await api(`proxies/${id}/enabled`, { method: 'POST', body: { enabled: false } })).json();
+  assert.equal(off2.ok, true); assert.equal(off2.data.synced, false); assert.match(off2.data.warning, /没能通知代理/);
+  assert.equal(storedProxies(env)[0].enabled, false);
+  m.down = false;
+  const sync = await (await api(`proxies/${id}/sync`, { method: 'POST' })).json();
+  assert.ok(sync.data.sync.actions.some(x => /停用/.test(x))); assert.equal(proxyState(m).enabled, false, '连接并同步补上代理端的状态');
+});
+
+test('更换 UUID：新 UUID 下发并写入面板，旧的在代理上保留宽限期；订阅用新的；代理失败时面板的 UUID 不变', async () => {
+  const m = mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
+  const env = baseEnv({ CONFIG_KV: kv({ config: customCfg() }) });
+  const cookie = await login(env);
+  const rot = await (await call(env, `/${UUID}/api/proxies/${PROXY.id}/rotate`, { method: 'POST', cookie })).json();
+  assert.equal(rot.ok, true, JSON.stringify(rot));
+  const fresh = rot.data.proxy.uuid;
+  assert.notEqual(fresh, UUID); assert.equal(rot.data.graceMs, 600000);
+  assert.equal(storedProxies(env)[0].uuid, fresh);
+  assert.equal(proxyState(m).uuid, fresh); assert.equal(proxyState(m).prev, UUID);
+  const links = await withFetch(nodesFetch, async () => (await (await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).text()).split('\n').filter(l => /^vless:\/\//.test(l)));
+  assert.ok(links.length > 0 && links.every(l => l.startsWith(`vless://${fresh}@`)));
+  m.down = true;
+  const fail = await call(env, `/${UUID}/api/proxies/${PROXY.id}/rotate`, { method: 'POST', cookie });
+  assert.equal(fail.status, 502);
+  assert.equal(storedProxies(env)[0].uuid, fresh, '代理没收到新 UUID 时，面板不改自己的');
+});
+
+test('删除与保存保护：删除只动面板的记录；代理上限；未绑定 KV / 代理列表读取失败时拒绝写入', async () => {
+  const m = mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
   const env = baseEnv();
   const cookie = await login(env);
-  const res = await call(env, `/${UUID}/api/config`, { method: 'POST', cookie, body: { uuid: UUID2.toUpperCase(), host: 'Other.Example.com', nodePath: '/other/' } });
-  const r = await res.json();
-  assert.equal(res.status, 200, JSON.stringify(r));
-  assert.equal(r.data.uuid, UUID2);
-  assert.equal(r.data.host, 'Other.Example.com');
-  assert.equal(r.data.nodePath, 'other');
-  assert.equal(r.data.panelPath, UUID, '面板路径来自 PATH，不随代理 UUID 变化');
-  assert.equal(res.headers.get('Set-Cookie'), null, '登录态签名不含代理 UUID：无需重新签发');
-  assert.equal((await call(env, `/${UUID}/api/config`, { cookie })).status, 200, '原登录态继续有效');
+  const api = (path, init) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
+  assert.equal((await api('proxies/nope', { method: 'DELETE' })).status, 404);
+  const del = await (await api(`proxies/${PROXY.id}`, { method: 'DELETE' })).json();
+  assert.equal(del.ok, true); assert.deepEqual(storedProxies(env), []);
+  assert.equal(proxyState(m).uuid, UUID, '代理本身没有被改动');
+  assert.equal((await withFetch(nodesFetch, () => call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' }))).status, 400);
+  const many = Array.from({ length: 8 }, (_, i) => ({ ...PROXY, id: 'px-many-' + i, host: `h${i}.example.com` }));
+  const full = baseEnv({ CONFIG_KV: kv({ proxies: many }) });
+  const c2 = await login(full);
+  const over = await call(full, `/${UUID}/api/proxies`, { method: 'POST', cookie: c2, body: { host: 'extra.example.com', nodePath: 'np', key: KEY } });
+  assert.equal(over.status, 400); assert.match((await over.json()).msg, /最多 8 个/);
+  // 未绑定 KV
+  const noKv = baseEnv({ CONFIG_KV: undefined });
+  const c3 = await login(noKv);
+  const nk = await call(noKv, `/${UUID}/api/proxies`, { method: 'POST', cookie: c3, body: { host: 'a.example.com', nodePath: 'np', key: KEY } });
+  assert.equal(nk.status, 400); assert.match((await nk.json()).msg, /CONFIG_KV/);
+  // 代理列表读取失败 / 损坏：不覆盖
+  const bad = failingKv({ proxies: [PROXY] });
+  const be = baseEnv({ CONFIG_KV: bad });
+  const c4 = await login(be);
+  const w = await call(be, `/${UUID}/api/proxies`, { method: 'POST', cookie: c4, body: { host: 'a.example.com', nodePath: 'np', key: KEY } });
+  assert.equal(w.status, 503); assert.equal(bad.puts, 0);
+  assert.match((await (await call(be, `/${UUID}/api/config`, { cookie: c4 })).json()).data.endpointMissing[0], /代理列表.*KV 暂时无法读取/);
+  const corrupt = baseEnv({ CONFIG_KV: kv({ proxies: '{not json' }) });
+  const c5 = await login(corrupt);
+  const cw = await call(corrupt, `/${UUID}/api/proxies/${PROXY.id}/enabled`, { method: 'POST', cookie: c5, body: { enabled: false } });
+  assert.equal(cw.status, 503); assert.equal(corrupt.CONFIG_KV.m.get('proxies'), '{not json');
 });
 
-test('代理端点没填全：面板照常使用并提示缺哪几项，订阅与预览返回明确的 400，填全后恢复', async () => {
-  const env = baseEnv({ PATH: 'pp', HOST: undefined, NODE_PATH: undefined, UUID: undefined, CONFIG_KV: kv({ config: customCfg() }) });
-  const cookie = await login(env, 'pw', 'pp');
-  const cfg = (await (await call(env, '/pp/api/config', { cookie })).json()).data;
-  assert.deepEqual(cfg.endpointMissing, ['代理域名', '代理 UUID', '代理节点路径']);
-  assert.equal((await call(env, '/pp', { cookie })).status, 200, '面板页面可打开');
-  const sub = await call(env, '/pp/sub', { ua: 'v2rayN/7.0' });
-  assert.equal(sub.status, 400);
-  assert.match(await sub.text(), /代理域名、代理 UUID、代理节点路径/);
-  const pv = await call(env, '/pp/api/sub', { cookie });
-  assert.equal(pv.status, 400);
-  assert.match((await pv.json()).msg, /请先在面板「代理端点」里填写/);
-  // 只填一部分：仍然提示还缺的
-  const part = await call(env, '/pp/api/config', { method: 'POST', cookie, body: { host: 'proxy.example.com' } });
-  assert.deepEqual((await part.json()).data.endpointMissing, ['代理 UUID', '代理节点路径']);
-  // 在面板里填全后即可生成订阅（订阅别名默认是代理 UUID）
-  const save = await call(env, '/pp/api/config', { method: 'POST', cookie, body: { host: 'proxy.example.com', uuid: UUID2, nodePath: 'np' } });
-  assert.equal(save.status, 200);
-  assert.deepEqual((await save.json()).data.endpointMissing, []);
-  const links = await withFetch(nodesFetch, async () => (await (await call(env, `/${UUID2}/sub`, { ua: 'v2rayN/7.0' })).text()).split('\n').filter(l => /^vless:\/\//.test(l)));
+test('代理状态 /api/proxy-status：需登录；没有代理时 configured:false；在线时给版本、UUID 是否一致、启用状态与非敏感摘要；连不上 / 密钥不对 / 超时都不会让面板报错', async () => {
+  const none = baseEnv({ CONFIG_KV: kv({ proxies: [] }) });
+  assert.equal((await call(none, `/${UUID}/api/proxy-status`)).status, 403, '未登录');
+  assert.deepEqual(await (await call(none, `/${UUID}/api/proxy-status`, { cookie: await login(none) })).json(), { ok: true, data: { configured: false } });
+  const get = async (env) => (await (await call(env, `/${UUID}/api/proxy-status`, { cookie: await login(env) })).json()).data;
+  const env = baseEnv();
+  const m = mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
+  const up = await get(env);
+  assert.deepEqual(up, { configured: true, id: PROXY.id, name: '代理 1', enabledHere: true, up: true, ok: true, version: PROXY_VERSION, problems: [], storage: true, kvError: '', provisioned: true, enabled: true, uuidMatch: true,
+    settings: { edgeIP: false, hopAddr: '', hopMode: '', altMode: 'builtin', altRegion: '', altRegion2: '', altCustom: 0 } });
+  assert.ok(!JSON.stringify(up).includes(KEY) && !JSON.stringify(up).includes(UUID));
+  m.env.NODE_KV = plainKv({ state: { uuid: UUID2 } });
+  assert.equal((await get(env)).uuidMatch, false, '代理上的 UUID 与面板的不一致');
+  m.down = true;
+  const down = await get(env);
+  assert.equal(down.up, false); assert.match(down.error, /无法连接代理/);
+  m.down = false;
+  const wrong = await get(baseEnv({ CONFIG_KV: kv({ proxies: [{ ...PROXY, key: 'another-key-0123456789-abcdefgh' }] }) }));
+  assert.equal(wrong.up, false); assert.match(wrong.error, /没有响应控制请求/);
+  const nokey = await get(baseEnv({ CONFIG_KV: kv({ proxies: [{ ...PROXY, key: '' }] }) }));
+  assert.equal(nokey.up, false); assert.match(nokey.error, /密钥/);
+  const forged = mountProxy('node.example.com', { PATH: UUID }); forged.reply = () => new Response(JSON.stringify({ ts: Date.now(), d: JSON.stringify({ ok: true, version: '9.9.9' }), s: 'forged' }));
+  const f = await get(env);
+  assert.equal(f.up, false); assert.match(f.error, /签名不对/);
+  const hung = mountProxy('node.example.com', { PATH: UUID }); hung.hang = true;
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...a) => realSetTimeout(fn, ms === 6000 ? 5 : ms, ...a);
+  try {
+    const h = await get(env);
+    assert.equal(h.up, false); assert.match(h.error, /调用超时/);
+  } finally { globalThis.setTimeout = realSetTimeout; }
+});
+
+test('代理设置 API：需登录；没有代理时给出明确提示；读取 / 保存 / 恢复都经签名 HTTPS 转给代理；代理的校验错误原样回给面板（400 + 字段级错误）；连不上时 502', async () => {
+  const none = baseEnv({ CONFIG_KV: kv({ proxies: [] }) });
+  const base = `/${UUID}/api/proxy-settings`;
+  for (const [path, method] of [[base, 'GET'], [base, 'POST'], [`/${UUID}/api/proxy-reset`, 'POST']]) assert.equal((await call(none, path, { method, body: method === 'POST' ? {} : undefined })).status, 403, path + ' 未登录');
+  const nc = await login(none);
+  const g0 = await call(none, base, { cookie: nc });
+  assert.equal(g0.status, 400); assert.match((await g0.json()).msg, /还没有代理/);
+  assert.equal((await call(none, `/${UUID}/api/proxy-reset`, { method: 'POST', cookie: nc })).status, 400);
+  const m = mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
+  const env = baseEnv();
+  const cookie = await login(env);
+  const api = (path, init = {}) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
+  assert.equal((await api('proxy-settings', { method: 'PUT' })).status, 405);
+  assert.equal((await api('proxy-settings', { method: 'POST', body: '{bad' })).status, 400);
+  assert.equal((await api('proxy-settings', { method: 'POST', body: '[1]' })).status, 400);
+  assert.equal((await api('proxy-reset')).status, 405, 'proxy-reset 只接受 POST');
+  const g = await (await api('proxy-settings')).json();
+  assert.equal(g.ok, true); assert.equal(g.data.storage, true); assert.ok(g.data.regions.includes('HK'));
+  const s = await (await api('proxy-settings', { method: 'POST', body: { hopMode: 'only', 'alt.mode': 'off' } })).json();
+  assert.equal(s.ok, true); assert.equal(s.data.settings.hopMode, 'only');
+  assert.deepEqual(proxyState(m).set, { hopMode: 'only', 'alt.mode': 'off' }, '设置保存在代理自己的 KV 里');
+  assert.equal(proxyState(m).uuid, UUID);
+  const e = await api('proxy-settings', { method: 'POST', body: { hopMode: 'bad' } });
+  assert.equal(e.status, 400);
+  const ej = await e.json();
+  assert.equal(ej.ok, false); assert.equal(ej.errors[0].field, 'hopMode'); assert.match(ej.msg, /出站方式/);
+  assert.equal((await (await api('proxy-reset', { method: 'POST' })).json()).ok, true);
+  assert.deepEqual(proxyState(m).set, {});
+  m.down = true;
+  const r = await api('proxy-settings');
+  assert.equal(r.status, 502); assert.match((await r.json()).msg, /无法连接代理/);
+  // 多个代理时用 ?id= 指定
+  const two = baseEnv({ CONFIG_KV: kv({ proxies: [PROXY, { ...PROXY, id: 'px-test-2', host: 'second.example.com' }] }) });
+  const m2 = mountProxy('second.example.com', { PATH: UUID, state: { uuid: UUID } });
+  const c2 = await login(two);
+  assert.equal((await call(two, `/${UUID}/api/proxy-settings?id=px-test-2`, { method: 'POST', cookie: c2, body: { hopMode: 'no' } })).status, 200);
+  assert.deepEqual(proxyState(m2).set, { hopMode: 'no' });
+});
+
+test('订阅使用第一个启用的代理：停用的跳过；多个代理时数据结构完整保留', async () => {
+  const second = { ...PROXY, id: 'px-test-2', name: '代理 2', host: 'second.example.com', nodePath: 'np2', uuid: UUID2 };
+  const env = baseEnv({ CONFIG_KV: kv({ proxies: [{ ...PROXY, enabled: false }, second], config: customCfg() }) });
+  const links = await withFetch(nodesFetch, async () => (await (await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).text()).split('\n').filter(l => /^vless:\/\//.test(l)));
   assert.ok(links.length > 0);
-  assert.ok(links.every(l => l.startsWith(`vless://${UUID2}@`) && /[?&]sni=proxy\.example\.com(&|#)/.test(l) && /path=%2Fnp(%3F|&)/.test(l)));
+  assert.ok(links.every(l => l.startsWith(`vless://${UUID2}@`) && /[?&]sni=second\.example\.com(&|#)/.test(l) && /path=%2Fnp2(%3F|&)/.test(l)), '跳过停用的第一个，用第二个');
+  const list = await (await call(env, `/${UUID}/api/proxies`, { cookie: await login(env) })).json();
+  assert.deepEqual(list.data.proxies.map(p => [p.id, p.enabled]), [['px-test-1', false], ['px-test-2', true]]);
+  // 缺 UUID：提示去「连接并同步」
+  const noUuid = baseEnv({ CONFIG_KV: kv({ proxies: [{ ...PROXY, uuid: '' }], config: customCfg() }) });
+  const r = await withFetch(nodesFetch, () => call(noUuid, `/${UUID}/sub`, { ua: 'v2rayN/7.0' }));
+  assert.equal(r.status, 400); assert.match(await r.text(), /UUID.*连接并同步/);
 });
 
-test('面板页面：代理端点三项在「面板设置」里，出站 / 落地 / 地区反代在单独的「代理设置」页（不属于面板配置）；页面内嵌，不依赖网络', async () => {
+test('面板页面：代理的连接信息在「面板设置 → 代理」里，出站 / 落地 / 地区反代在单独的「代理设置」页（不属于面板配置）；页面内嵌，不依赖网络', async () => {
   const env = baseEnv();
   const res = await call(env, `/${UUID}`, { cookie: await login(env) });
   assert.equal(res.status, 200);
   const html = await res.text();
-  for (const id of ['a-host', 'a-uuid', 'a-nodepath', 'epwarn']) assert.ok(html.includes(`id="${id}"`), id);
+  for (const id of ['a-host', 'a-uuid', 'a-nodepath', 'a-key', 'a-penabled', 'px-conn', 'px-connect', 'px-sync', 'px-rotate', 'px-del', 'epwarn']) assert.ok(html.includes(`id="${id}"`), id);
   for (const id of ['s-proxyIP', 's-outbound', 's-outmode', 'rl-mode', 'rl-region', 'rl-region2', 'rl-custom', 'px-note', 'px-save', 'px-reset']) assert.ok(html.includes(`id="${id}"`), id);
   assert.ok(html.includes('data-view="proxy"') && html.includes('function saveProxySettings(') && html.includes('function loadProxySettings('));
   assert.ok(html.includes('var SCHEMA = ') && !html.includes('/*@HOPLINE_SCHEMA@*/'), '字段表已注入');
   const schema = JSON.parse(html.match(/var SCHEMA = (\[.*?\]) \|\| \[\];/s)[1]);
   const keys = schema.map(d => d.key);
-  for (const k of ['host', 'uuid', 'nodePath']) assert.ok(keys.includes(k), k);
+  for (const k of ['host', 'uuid', 'nodePath', 'key']) assert.ok(!keys.includes(k), `${k} 在代理列表里，不在面板的字段表里`);
+  assert.ok(html.includes('function saveProxyEntry(') && html.includes('function rotateProxyUuid(') && html.includes('function genKey('));
   for (const k of ['edgeIP', 'hopAddr', 'hopMode', 'alt.mode', 'alt.region', 'alt.region2', 'alt.custom']) assert.ok(!keys.includes(k), `${k} 是代理的设置，不在面板的字段表里`);
   // 页面里每个字段表登记的控件都存在（回填 / 收集依赖它）
   for (const d of schema) for (const id of [d.el, ...Object.values(d.els || {})].filter(Boolean)) assert.ok(html.includes(`id="${id}"`), `${d.key} → #${id}`);
@@ -313,14 +526,16 @@ test('必填环境变量：PATH 未设置 / 非法时所有请求返回 503 设�
   assert.equal(st, 403); assert.match(body, /ADMIN/);
 });
 
-test('面板路径（PATH）与代理节点路径（NODE_PATH）互相独立：面板入口在 PATH 下，节点链接用代理端点的路径；面板没有任何代理入口；订阅仍可从 /<UUID>/sub 取得', async () => {
-  const env = baseEnv({ PATH: 'mypanel', NODE_PATH: 'mynode', HOST: 'proxy.example.org', CONFIG_KV: kv({ config: customCfg() }) });
+test('面板路径（PATH）与代理节点路径互相独立：面板入口在 PATH 下，节点链接用代理列表里的路径；面板没有任何代理入口', async () => {
+  const proxy = { ...PROXY, host: 'proxy.example.org', nodePath: 'mynode' };
+  const env = baseEnv({ PATH: 'mypanel', CONFIG_KV: kv({ proxies: [proxy], config: customCfg() }) });
   assert.equal((await call(env, `/${UUID}`, { ua: BROWSER })).status, 200, 'UUID 路径不是面板入口（返回伪装页）');
+  assert.ok(!/vless:\/\//.test(await (await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).text()), '代理 UUID 不再是订阅入口')
   assert.equal((await call(env, '/mypanel', { ua: BROWSER })).status, 302, '面板入口在 PATH 下，未登录跳转登录页');
-  const links = await withFetch(nodesFetch, async () => (await (await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).text()).split('\n').filter(l => /^vless:\/\//.test(l)));
+  const links = await withFetch(nodesFetch, async () => (await (await call(env, '/mypanel/sub', { ua: 'v2rayN/7.0' })).text()).split('\n').filter(l => /^vless:\/\//.test(l)));
   assert.ok(links.length > 0);
   assert.ok(links.every(l => l.startsWith(`vless://${UUID}@`)), '代理 UUID 作为用户 ID');
-  assert.ok(links.every(l => /path=%2Fmynode(%3F|&)/.test(l)), '节点 ws 路径为代理节点路径 /<NODE_PATH>，而不是面板路径');
+  assert.ok(links.every(l => /path=%2Fmynode(%3F|&)/.test(l)), '节点 ws 路径为代理节点路径 /<节点路径>，而不是面板路径');
   assert.ok(links.every(l => /[?&]host=proxy\.example\.org(&|#)/.test(l) && /[?&]sni=proxy\.example\.org(&|#)/.test(l)), 'SNI / Host 为代理域名，而不是访问面板的域名');
   // 面板脚本没有代理：无论面板路径还是节点路径，WebSocket 升级与 XHTTP POST 都不会被代理
   for (const p of ['/mypanel', '/mynode']) {
@@ -331,20 +546,23 @@ test('面板路径（PATH）与代理节点路径（NODE_PATH）互相独立：�
   }
 });
 
-test('环境变量：使用当前名称；旧版短变量名（U / D / S / K / ECH / OUTBOUND / admin）不再识别', async () => {
+test('环境变量：使用当前名称；旧版短变量名（D / K / ECH / admin）与已移到代理列表的 UUID / HOST / NODE_PATH 不再识别', async () => {
   const read = async (env, path) => {
     const cookie = await login(env, 'pw', path);
     return (await (await call(env, `/${path}/api/config`, { cookie })).json()).data;
   };
-  const base = { UUID: undefined, PATH: undefined, ADMIN: 'pw', CONFIG_KV: kv() };
-  const a = await read({ ...base, UUID: UUID2, PATH: 'newpath', HOST: 'https://Node.Example.com/x', NODE_PATH: '/np/', ALPN: 'h2', ENABLE_ECH: 'true' }, 'newpath');
-  assert.equal(a.uuid, UUID2); assert.equal(a.host, 'Node.Example.com'); assert.equal(a.nodePath, 'np'); assert.equal(a.alpn, 'h2'); assert.equal(a.ech, true);
-  assert.deepEqual(a.endpointMissing, []);
+  const base = { PATH: undefined, ADMIN: 'pw', CONFIG_KV: kv() };
+  const a = await read({ ...base, PATH: 'newpath', ALPN: 'h2', ENABLE_ECH: 'true', UUID: UUID2, HOST: 'env.example.com', NODE_PATH: 'envnode' }, 'newpath');
+  assert.equal(a.alpn, 'h2'); assert.equal(a.ech, true);
+  for (const k of ['uuid', 'host', 'nodePath']) assert.equal(k in a, false, k);
+  assert.deepEqual(a.endpointMissing, [], '代理来自 KV 里的代理列表，环境变量 UUID / HOST / NODE_PATH 被忽略');
   assert.equal(a.envLocked.path, 'PATH');
-  // 旧名称被忽略：代理端点未填写（不再自动生成 UUID），ECH 保持默认；代理的出站设置（HOP_ADDR 等）面板不再读取
-  const b = await read({ ...base, PATH: 'p1', U: UUID2, OUTBOUND: 'socks5://2.2.2.2:2', HOP_ADDR: 'socks5://3.3.3.3:3', S: 'socks5://3.3.3.3:3', ECH: 'true' }, 'p1');
-  assert.equal(b.uuid, ''); assert.equal('hopAddr' in b, false); assert.equal(b.ech, false);
-  assert.deepEqual(b.endpointMissing, ['代理域名', '代理 UUID', '代理节点路径']);
+  // 没有代理：环境变量不能代替
+  const none = await read({ ...base, CONFIG_KV: kv({ proxies: [] }), PATH: 'p0', UUID: UUID2, HOST: 'env.example.com', NODE_PATH: 'envnode' }, 'p0');
+  assert.equal(none.endpointMissing.length, 1); assert.match(none.endpointMissing[0], /代理/);
+  // 旧名称被忽略：ECH 保持默认；代理的出站设置（HOP_ADDR 等）面板不再读取
+  const b = await read({ ...base, PATH: 'p1', OUTBOUND: 'socks5://2.2.2.2:2', HOP_ADDR: 'socks5://3.3.3.3:3', S: 'socks5://3.3.3.3:3', ECH: 'true' }, 'p1');
+  assert.equal('hopAddr' in b, false); assert.equal(b.ech, false);
   // 旧名 D / admin 不再提供 PATH / ADMIN：面板仍未配置，无法登录
   const unconfigured = baseEnv({ PATH: undefined, ADMIN: undefined, D: 'oldpath', admin: 'pw', CONFIG_KV: kv() });
   assert.equal((await call(unconfigured, '/oldpath', {})).status === 200, false);
@@ -377,21 +595,25 @@ test('订阅别名只输出订阅，不开放面板 / 管理接口（问题 6）
   assert.equal((await call(env, `/${UUID}`, { cookie })).status, 200, '面板路径不受影响');
 });
 
-test('自定义订阅路径留空：订阅地址为 /<UUID>/sub（面板路径自定义时同样如此），面板路径下的 /sub 继续可用；UUID 路径下不开放面板 / 管理接口', async () => {
+test('自定义订阅路径留空：订阅地址为 /<面板路径>/sub；设置了自定义订阅路径后 /<别名>/sub 与面板路径下的 /sub 都可用；别名路径下不开放面板 / 管理接口', async () => {
   const env = baseEnv({ PATH: 'panel', CONFIG_KV: kv({ config: { filter: { ipType: ['IPv4'] } } }) });
   const cookie = await login(env, 'pw', 'panel');
-  for (const p of [`/${UUID}/sub`, '/panel/sub', `/${UUID}/sub/clash`]) {
+  for (const p of ['/panel/sub', '/panel/sub/clash']) {
     const r = await call(env, p, { ua: 'v2rayN/7.0' });
     assert.equal(r.status, 200, p);
   }
-  assert.match(await (await call(env, `/${UUID}`, { ua: 'v2rayN/7.0' })).text(), /^vless:\/\//m, '客户端 UA 访问 /<UUID> 同样得到订阅');
-  assert.equal((await call(env, `/${UUID}`, { cookie })).status, 200, 'UUID 路径下不提供面板');
-  assert.equal((await call(env, `/${UUID}/api/config`, { cookie })).status, 200, 'UUID 路径下不提供管理接口');
-  assert.equal((await call(env, '/panel', { cookie })).status, 200, '面板路径不受影响');
-  // 设置了自定义订阅路径：UUID 不再作为订阅入口（面板路径与 UUID 不同时）
+  assert.match(await (await call(env, '/panel', { ua: 'v2rayN/7.0' })).text(), /^vless:\/\//m, '客户端 UA 访问面板路径同样得到订阅');
+  assert.equal((await call(env, '/panel', { cookie })).status, 200, '面板路径下是面板');
+  for (const p of [`/${UUID}/sub`, `/${UUID}`]) assert.ok(!/vless:\/\//.test(await (await call(env, p, { ua: 'v2rayN/7.0' })).text()), `${p}：代理 UUID 不再是订阅入口`);
+  // 设置了自定义订阅路径
   const env2 = baseEnv({ PATH: 'panel', CONFIG_KV: kv({ config: { subUrl: 'mysub' } }) });
   assert.equal((await call(env2, '/mysub/sub', { ua: 'v2rayN/7.0' })).status, 200);
-  assert.equal((await call(env2, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).status, 200);
+  assert.equal((await call(env2, '/panel/sub', { ua: 'v2rayN/7.0' })).status, 200);
+  const c2 = await login(env2, 'pw', 'panel');
+  for (const p of ['/mysub/api/config', '/mysub/api/proxies']) {
+    const r = await call(env2, p, { cookie: c2 });
+    assert.ok(!(r.headers.get('content-type') || '').includes('json'), `${p}：别名路径不开放管理接口`);
+  }
 });
 
 test('预览与订阅同一流程：返回节点数，订阅不写 KV（问题 7）', async () => {
@@ -406,7 +628,8 @@ test('预览与订阅同一流程：返回节点数，订阅不写 KV（问题 7
     const sub = await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' });
     assert.equal((await sub.text()).trim().split('\n').length, 10);
   });
-  assert.deepEqual([...env.CONFIG_KV.m.keys()], ['config'], '订阅不再写入轮询窗口（issued）');
+  assert.deepEqual([...env.CONFIG_KV.m.keys()].sort(), ['config', 'proxies'], '订阅不写入任何东西（只有预置的配置和代理列表）');
+  assert.equal(JSON.parse(env.CONFIG_KV.m.get('proxies'))[0].uuid, UUID);
 });
 
 test('面板页面注入字段表与共用校验函数', async () => {
@@ -419,7 +642,8 @@ test('面板页面注入字段表与共用校验函数', async () => {
   const schemaJson = html.match(/var SCHEMA = (\[.*?\]) \|\| \[\];/s);
   assert.ok(schemaJson, '字段表已注入');
   const schema = JSON.parse(schemaJson[1]);
-  assert.ok(schema.some(d => d.key === 'uuid' && d.el === 'a-uuid'));
+  assert.ok(schema.some(d => d.key === 'subUrl' && d.el === 'a-suburl'));
+  assert.ok(!schema.some(d => d.key === 'uuid'), '代理的 UUID 不在面板配置字段表里');
   assert.ok(schema.every(d => !('check' in d)), '仅服务端属性不下发');
   // 注入的校验函数可在页面独立执行（不依赖外部变量）；用下一条语句（var SCHEMA_BY_KEY = {};）定位结尾，
   // 不假设函数源码是单行（构建产物不再经 terser 压缩，toString() 下来的是原始多行格式）
@@ -428,7 +652,7 @@ test('面板页面注入字段表与共用校验函数', async () => {
   const check = new Function('return ' + src[1])();
   assert.deepEqual(check({ type: 'int', min: 1, max: 99 }, '42'), { value: 42 });
   assert.ok(check({ type: 'int', min: 1, max: 99 }, '500').error);
-  assert.ok(check(schema.find(d => d.key === 'uuid'), 'x').error);
+  assert.ok(check(schema.find(d => d.key === 'subUrl'), 'a/b').error);
   // 页面中的每个字段控件都存在
   for (const d of schema) {
     for (const id of [d.el, ...Object.values(d.els || {})].filter(Boolean)) assert.ok(html.includes(`id="${id}"`), `缺少控件 #${id}（${d.key}）`);
@@ -887,14 +1111,14 @@ test('Trojan 已移除：KV 中遗留的 enableTrojan / trojanPassword 与旧环
 // ---------------- 批次 2 修复：Clash 本地凭据 / 登录加固 / 管理密码存储 / 环境变量不固化 / 页面安全头 ----------------
 const nextQs = (path) => '?next=' + encodeURIComponent('/' + path);
 
-test('Clash 模板不再包含公开的默认凭据：SS 密码 / 认证 / API 密钥按 UUID 派生且稳定，CORS 不再是 *，DNS 只监听本机', async () => {
+test('Clash 模板不再包含公开的默认凭据：SS 密码 / 认证 / API 密钥按代理 UUID 派生且稳定，CORS 不再是 *，DNS 只监听本机', async () => {
   const get = async (env) => (await subOf(env, 'clash')).text();
   const a = await get(baseEnv({ CONFIG_KV: kv({ config: customCfg() }) }));
   assert.ok(!/yyds666|Xf3#Lp9WqZ|__HOPLINE_/.test(a), '无默认密码 / 未替换的占位符');
   const d = (purpose, uuid = UUID) => createHash('sha224').update(`hopline-clash|${purpose}|${uuid}`).digest('hex').slice(0, 20);
   assert.ok(a.includes(`password: "${d('ss')}"`) && a.includes(`- "mihomo:${d('auth')}"`) && a.includes(`secret: "${d('api')}"`), '与 UUID 派生一致（同时校验 SHA-224 实现）');
   assert.equal(await get(baseEnv({ CONFIG_KV: kv({ config: customCfg() }) })), a, '同一部署每次订阅结果稳定');
-  const other = await (await withFetch(nodesFetch, () => call(baseEnv({ UUID: UUID2, CONFIG_KV: kv({ config: customCfg() }) }), `/${UUID2}/sub/clash`, { ua: 'x' }))).text();
+  const other = await (await withFetch(nodesFetch, () => call(baseEnv({ CONFIG_KV: kv({ proxies: [{ ...PROXY, uuid: UUID2 }], config: customCfg() }) }), `/${UUID}/sub/clash`, { ua: 'x' }))).text();
   assert.ok(!other.includes(d('api')) && other.includes(`secret: "${d('api', UUID2)}"`), '不同部署密钥不同');
   assert.ok(!/allow-origins:\n\s+- "\*"/.test(a), 'CORS 不是 *');
   assert.match(a, /listen: 127\.0\.0\.1:1053/);
@@ -989,26 +1213,21 @@ test('登录加固：/login 与 /version 对不知道面板路径的人返回 40
 });
 
 test('环境变量提供的值不会因为一次保存被固化进 KV；面板改成不同的值才保存为覆盖', async () => {
-  const env = baseEnv({ ADMIN: undefined, HOST: 'env.example.com', NODE_PATH: 'envnode', ALPN: 'h2',
-    CONFIG_KV: kv({ config: { admin: 'pw' } }) });
+  const env = baseEnv({ ADMIN: undefined, ALPN: 'h2', CONFIG_KV: kv({ config: { admin: 'pw' } }) });
   const first = await call(env, `/${UUID}/api/config`, { method: 'POST', cookie: await login(env), body: { tlsOnly: false } });
   const r = await first.json();
   assert.equal(r.ok, true);
   const cookie = first.headers.get('Set-Cookie').split(';')[0];   // 旧版明文密码升级为摘要后登录态重新签发
   const s = stored(env);
-  for (const k of ['host', 'nodePath', 'alpn', 'uuid']) assert.equal(k in s, false, `${k} 不应固化进 KV`);
+  assert.equal('alpn' in s, false, 'alpn 不应固化进 KV');
   assert.equal(s.tlsOnly, false, '面板里改动的其它项正常保存');
   // 环境变量之后变更，立即生效（KV 中没有旧快照）
-  const later = { ...env, HOST: 'new-env.example.com', NODE_PATH: 'newnode' };
-  const cfgRes = await call(later, `/${UUID}/api/config`, { cookie });
-  const cfg = await cfgRes.json();
-  assert.equal(cfg.data.host, 'new-env.example.com');
-  assert.equal(cfg.data.nodePath, 'newnode');
+  const later = { ...env, ALPN: 'http/1.1' };
+  const cfg = await (await call(later, `/${UUID}/api/config`, { cookie })).json();
+  assert.equal(cfg.data.alpn, 'http/1.1');
   // 面板中改成不同的值：保存为覆盖
-  await call(env, `/${UUID}/api/config`, { method: 'POST', cookie, body: { host: 'mine.example.com', nodePath: 'mine', alpn: 'http/1.1' } });
-  assert.equal(stored(env).host, 'mine.example.com');
-  assert.equal(stored(env).nodePath, 'mine');
-  assert.equal(stored(env).alpn, 'http/1.1');
+  await call(env, `/${UUID}/api/config`, { method: 'POST', cookie, body: { alpn: 'h2,http/1.1' } });
+  assert.equal(stored(env).alpn, 'h2,http/1.1');
 });
 
 test('页面安全头：面板 / 登录页带 CSP、frame-ancestors、nosniff；订阅不受影响；二维码脚本带 SRI；支持退出登录', async () => {
@@ -1044,31 +1263,31 @@ const failingKv = (init = {}) => {
     async put(key, v) { this.puts++; k.m.set(key, v); } });
 };
 
-test('节点 SNI / Host 取代理域名（环境变量 HOST 或面板设置），不再取访问面板的域名；链接、Clash、sing-box 均如此', async () => {
+test('节点 SNI / Host 取代理列表里的域名，不再取访问面板的域名；链接、Clash、sing-box 均如此；换成别的代理后随之变化', async () => {
   const sub = (env, ua, fmt = '') => withFetch(nodesFetch, async () => (await (await call(env, `/${UUID}/sub${fmt}`, { ua })).text()));
-  const fromEnv = baseEnv({ HOST: 'proxy.example.net', CONFIG_KV: kv({ config: customCfg() }) });
-  const links = (await sub(fromEnv, 'v2rayN/7.0')).split('\n').filter(l => /^vless:\/\//.test(l));
+  const fromList = baseEnv({ CONFIG_KV: kv({ proxies: [{ ...PROXY, host: 'proxy.example.net' }], config: customCfg() }) });
+  const links = (await sub(fromList, 'v2rayN/7.0')).split('\n').filter(l => /^vless:\/\//.test(l));
   assert.ok(links.length > 0);
   for (const l of links) {
     assert.match(l, /[?&]sni=proxy\.example\.net(&|#)/, l);
     assert.match(l, /[?&]host=proxy\.example\.net(&|#)/, l);
     assert.ok(!l.includes('node.example.com'), '访问面板用的域名 node.example.com 不出现在节点里');
   }
-  assert.match(await sub(fromEnv, 'clash.meta', '?fmt=clash'), /servername: proxy\.example\.net/);
-  assert.match(await sub(fromEnv, 'sing-box/1.9', '?fmt=singbox'), /"server_name":\s*"proxy\.example\.net"/);
-  // 面板里填写的以面板为准
-  const bound = baseEnv({ HOST: 'proxy.example.net', CONFIG_KV: kv({ config: customCfg({ host: 'sub.example.org' }) }) });
-  for (const l of (await sub(bound, 'v2rayN/7.0')).split('\n').filter(l => /^vless:\/\//.test(l))) {
+  assert.match(await sub(fromList, 'clash.meta', '?fmt=clash'), /servername: proxy\.example\.net/);
+  assert.match(await sub(fromList, 'sing-box/1.9', '?fmt=singbox'), /"server_name":\s*"proxy\.example\.net"/);
+  const other = baseEnv({ CONFIG_KV: kv({ proxies: [{ ...PROXY, host: 'sub.example.org' }], config: customCfg() }) });
+  for (const l of (await sub(other, 'v2rayN/7.0')).split('\n').filter(l => /^vless:\/\//.test(l))) {
     assert.match(l, /[?&]sni=sub\.example\.org(&|#)/, l);
     assert.match(l, /[?&]host=sub\.example\.org(&|#)/, l);
   }
 });
 
-test('KV 读取失败：用环境变量的默认值照常出订阅，保存与重置被拒绝且不会覆盖已有配置；恢复后原有配置还在', async () => {
-  const k = failingKv({ config: { alpn: 'h2' } });
+test('KV 读取失败：订阅暂时无法生成（代理列表在 KV 里），保存与重置被拒绝且不会覆盖已有配置；恢复后原有配置和代理还在', async () => {
+  const k = failingKv({ config: { alpn: 'h2' }, proxies: [PROXY] });
   const env = baseEnv({ CONFIG_KV: k });
   const cookie = await login(env);                                   // ADMIN 来自环境变量，不依赖 KV
-  assert.equal((await withFetch(notFound, async () => call(env, `/${UUID}/sub`, { ua: 'v2rayN/7' }))).status, 200, '订阅仍可用');
+  const down = await withFetch(notFound, async () => call(env, `/${UUID}/sub`, { ua: 'v2rayN/7' }));
+  assert.equal(down.status, 400); assert.match(await down.text(), /代理列表.*KV 暂时无法读取/);
   const cfg = await (await call(env, `/${UUID}/api/config`, { cookie })).json();
   assert.match(cfg.data.kvError, /KV 暂时无法读取/);
   const save = await call(env, `/${UUID}/api/config`, { method: 'POST', cookie, body: { alpn: 'http/1.1' } });
@@ -1076,10 +1295,12 @@ test('KV 读取失败：用环境变量的默认值照常出订阅，保存与�
   assert.equal(k.puts, 0, '没有向 KV 写入任何内容');
   assert.equal((await call(env, `/${UUID}/api/reset`, { method: 'POST', cookie })).status, 503);
   assert.equal(k.m.has('config'), true, '配置未被删除');
+  assert.equal(k.m.has('proxies'), true, '代理列表未被删除');
   k.setDown(false);
   const after = await (await call(env, `/${UUID}/api/config`, { cookie })).json();
   assert.equal(after.data.alpn, 'h2');
   assert.equal(after.data.kvError, '');
+  assert.deepEqual(after.data.endpointMissing, []);
 });
 
 test('检测更新：仓库 main 上没有 Hopline-panel.js（404）时给出明确原因，而不是只说 HTTP 404；其它错误码照旧', async () => {
@@ -1102,35 +1323,6 @@ test('检测更新：仓库 main 上没有 Hopline-panel.js（404）时给出明
   } finally { globalThis.fetch = offline; Date.now = realNow; }
 });
 
-test('代理状态 /api/proxy-status：需登录；没有服务绑定 PROXY 时返回 bound:false，面板其它功能不受影响', async () => {
-  const env = baseEnv();
-  assert.equal((await call(env, `/${UUID}/api/proxy-status`)).status, 403, '未登录');
-  const r = await (await call(env, `/${UUID}/api/proxy-status`, { cookie: await login(env) })).json();
-  assert.deepEqual(r, { ok: true, data: { bound: false } });
-});
-
-test('代理状态：绑定后显示在线与版本、非敏感设置摘要；代理配置有问题、调用失败、超时都不会让面板报错', async () => {
-  const get = async (proxy) => {
-    const env = baseEnv({ PROXY: proxy });
-    return (await (await call(env, `/${UUID}/api/proxy-status`, { cookie: await login(env) })).json()).data;
-  };
-  const up = await get({ status: async () => ({ ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { edgeIP: true, hopAddr: 'socks5', hopMode: '', altMode: 'builtin', altRegion: '', altRegion2: '', altCustom: 0 } }) });
-  assert.deepEqual(up, { bound: true, up: true, ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { edgeIP: true, hopAddr: 'socks5', hopMode: '', altMode: 'builtin', altRegion: '', altRegion2: '', altCustom: 0 } });
-  const bad = await get({ status: async () => ({ ok: false, version: '3.0.1', problems: ['请设置环境变量 UUID（节点用户 ID）。'] }) });
-  assert.equal(bad.up, true); assert.equal(bad.ok, false); assert.deepEqual(bad.problems, ['请设置环境变量 UUID（节点用户 ID）。']);
-  const down = await get({ status: async () => { throw new Error('The RPC receiver does not implement the method "status".'); } });
-  assert.equal(down.bound, true); assert.equal(down.up, false); assert.match(down.error, /does not implement/);
-  const junk = await get({ status: async () => 'not an object' });
-  assert.equal(junk.up, false); assert.match(junk.error, /返回内容不正确/);
-  // 超时：状态调用一直不返回（把 4 秒的超时缩短到 5ms 来测）
-  const realSetTimeout = globalThis.setTimeout;
-  globalThis.setTimeout = (fn, ms, ...a) => realSetTimeout(fn, ms === 4000 ? 5 : ms, ...a);
-  try {
-    const hung = await get({ status: () => new Promise(() => {}) });
-    assert.equal(hung.up, false); assert.match(hung.error, /调用超时/);
-  } finally { globalThis.setTimeout = realSetTimeout; }
-});
-
 test('面板页面有「代理状态」行与检测按钮；两个脚本的横幅版本号各自对应自己的版本文件', async () => {
   const env = baseEnv();
   const html = await (await call(env, `/${UUID}`, { cookie: await login(env) })).text();
@@ -1139,60 +1331,6 @@ test('面板页面有「代理状态」行与检测按钮；两个脚本的横�
   const v = (f) => readFileSync(new URL(f, import.meta.url), 'utf8').match(/^\/\*!Hopline-\w+ v([\d.]+)\*\//)[1];
   assert.equal(v('../Hopline-panel.js'), PANEL_VERSION);
   assert.equal(v('../Hopline-proxy.js'), PROXY_VERSION);
-});
-
-test('代理设置 API：需登录；没有服务绑定时给出明确提示；方法与请求体校验', async () => {
-  const env = baseEnv();
-  const base = `/${UUID}/api/proxy-settings`;
-  for (const [path, method] of [[base, 'GET'], [base, 'POST'], [`/${UUID}/api/proxy-reset`, 'POST']]) assert.equal((await call(env, path, { method, body: method === 'POST' ? {} : undefined })).status, 403, path + ' 未登录');
-  const cookie = await login(env);
-  const g = await call(env, base, { cookie });
-  assert.equal(g.status, 400);
-  assert.match((await g.json()).msg, /没有绑定服务绑定 PROXY.*NodeControl/);
-  assert.equal((await call(env, `/${UUID}/api/proxy-reset`, { method: 'POST', cookie })).status, 400);
-  const bound = baseEnv({ PROXY: { setSettings: async () => ({ ok: true }) } });
-  const c2 = await login(bound);
-  assert.equal((await call(bound, base, { method: 'PUT', cookie: c2 })).status, 405);
-  assert.equal((await call(bound, base, { method: 'POST', cookie: c2, body: '{bad' })).status, 400);
-  assert.equal((await call(bound, base, { method: 'POST', cookie: c2, body: '[1]' })).status, 400);
-  assert.equal((await call(bound, `/${UUID}/api/proxy-reset`, { cookie: c2 })).status, 405, 'proxy-reset 只接受 POST');
-});
-
-test('代理设置 API：读取 / 保存 / 恢复都转给代理的 NodeControl；代理的校验错误原样回给面板（400 + 字段级错误）；调用失败 / 超时 / 绑定了只读入口时给出提示', async () => {
-  const calls = [];
-  const settings = { edgeIP: 'p.example', hopAddr: '', hopMode: '', 'alt.mode': 'builtin', 'alt.region': '', 'alt.region2': '', 'alt.custom': '' };
-  const proxy = {
-    getSettings: async () => { calls.push(['get']); return { ok: true, storage: true, settings, env: settings, source: {}, regions: ['HK'], error: '' }; },
-    setSettings: async (b) => { calls.push(['set', b]); return b.hopMode === 'bad' ? { ok: false, error: '出站方式：不支持的选项', errors: [{ field: 'hopMode', msg: '出站方式：不支持的选项' }] } : { ok: true, storage: true, settings: { ...settings, ...b }, ignored: [] }; },
-    resetSettings: async () => { calls.push(['reset']); return { ok: true, storage: true, settings }; },
-  };
-  const env = baseEnv({ PROXY: proxy });
-  const cookie = await login(env);
-  const api = (path, init = {}) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
-  const g = await (await api('proxy-settings')).json();
-  assert.equal(g.ok, true); assert.equal(g.data.settings.edgeIP, 'p.example'); assert.deepEqual(g.data.regions, ['HK']);
-  const s = await (await api('proxy-settings', { method: 'POST', body: { hopMode: 'only', 'alt.mode': 'off' } })).json();
-  assert.equal(s.ok, true); assert.equal(s.data.settings.hopMode, 'only');
-  assert.deepEqual(calls[1], ['set', { hopMode: 'only', 'alt.mode': 'off' }], '请求体原样转给代理');
-  const e = await api('proxy-settings', { method: 'POST', body: { hopMode: 'bad' } });
-  assert.equal(e.status, 400);
-  const ej = await e.json();
-  assert.equal(ej.ok, false); assert.equal(ej.errors[0].field, 'hopMode'); assert.match(ej.msg, /不支持的选项/);
-  assert.equal((await (await api('proxy-reset', { method: 'POST' })).json()).ok, true);
-  assert.equal(calls.at(-1)[0], 'reset');
-  // 代理调用失败（如绑定的是只读入口 NodeStatus，没有这些方法）
-  const ro = baseEnv({ PROXY: { status: async () => ({ ok: true }) } });
-  const r = await call(ro, `/${UUID}/api/proxy-settings`, { cookie: await login(ro) });
-  assert.equal(r.status, 502);
-  assert.match((await r.json()).msg, /无法调用代理.*入口是 NodeControl/);
-  // 超时
-  const realSetTimeout = globalThis.setTimeout;
-  globalThis.setTimeout = (fn, ms, ...a) => realSetTimeout(fn, ms === 4000 ? 5 : ms, ...a);
-  try {
-    const hung = baseEnv({ PROXY: { getSettings: () => new Promise(() => {}) } });
-    const h = await call(hung, `/${UUID}/api/proxy-settings`, { cookie: await login(hung) });
-    assert.equal(h.status, 502); assert.match((await h.json()).msg, /调用超时/);
-  } finally { globalThis.setTimeout = realSetTimeout; }
 });
 
 test('KV 中的配置损坏（不是合法 JSON）：显示提示并禁止保存，但允许重置修复', async () => {

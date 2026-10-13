@@ -22,12 +22,9 @@
 //   custom    面板中由专用代码回填 / 收集（通用逻辑跳过）
 // ---------------------------------------------------------------------------
 // 环境变量名（旧版短变量名 U / D / S / K / ECH 等已不再识别）。
-// PATH 与 ADMIN 为必填；其余均可选。uuid / nodePath / host 描述的是代理脚本（Hopline-proxy.js）的 UUID、节点路径与域名，
-// 环境变量只提供默认值，面板里填写后以面板为准
+// PATH 与 ADMIN 为必填；其余均可选。代理（域名、节点路径、密钥、UUID）不是面板配置项，保存在面板 KV 的 proxies 里（见 proxies.js）
 const ENV_NAMES = {
-  uuid: ['UUID'],
   path: ['PATH'],
-  nodePath: ['NODE_PATH'],
   admin: ['ADMIN'],
   adminUser: ['ADMIN_USER'],
   ech: ['ENABLE_ECH'],
@@ -43,19 +40,11 @@ function kvStore(env) {
   for (const n of ENV_NAMES.kv) if (env && env[n] && typeof env[n] === 'object') return env[n];
   return null;
 }
-const UUID_PATTERN = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
 const PATH_SEG_PATTERN = '^[A-Za-z0-9._~-]+$';
 const HOSTNAME_PATTERN = '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$';
 const RESERVED_PATHS = ['login', 'version'];
 
 const CONFIG_SCHEMA = [
-  // ---- 代理端点：订阅里的节点指向哪里（填写代理脚本的 域名、UUID 与节点路径；三项都填了才能生成订阅） ----
-  { key: 'host', type: 'string', def: '', el: 'a-host', label: '代理域名', maxLen: 253, strip: ['^https?://', '[/?#].*$'],
-    pattern: HOSTNAME_PATTERN, hint: '请填写代理的域名，如 node.example.com' },
-  { key: 'uuid', type: 'string', def: '', el: 'a-uuid', label: '代理 UUID', lower: true,
-    pattern: UUID_PATTERN, hint: 'UUID 格式不正确（应为 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx，可点「生成」）' },
-  { key: 'nodePath', type: 'string', def: '', el: 'a-nodepath', label: '代理节点路径', maxLen: 128, strip: ['^/+', '/+$'],
-    pattern: PATH_SEG_PATTERN, hint: '只能包含字母、数字及 . _ ~ -（不含 /），须与代理脚本的 PATH 相同' },
   // ---- 面板设置 ----
   // 面板与订阅的访问路径：由必填的环境变量 PATH 提供（面板中只读）；与代理的节点路径互相独立
   { key: 'path', type: 'string', def: '', el: 'a-path', label: '面板路径', maxLen: 128, strip: ['^/+', '/+$'],

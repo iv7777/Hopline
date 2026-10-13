@@ -17,9 +17,7 @@ function decodeEarlyData(header, cfg) {
   } catch (e) { return null; }
   if (!bytes.byteLength || bytes.byteLength > 6144) return null;
   if (bytes.byteLength < 17 || bytes[0] !== 0) return null;
-  let want;
-  try { want = uuidToBytes(cfg.uuid); } catch (e) { return null; }
-  for (let i = 0; i < 16; i++) if (bytes[i + 1] !== want[i]) return null;
+  if (!uuidAccepted((i) => bytes[i + 1], cfg)) return null;
   return bytes;
 }
 
