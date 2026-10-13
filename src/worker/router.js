@@ -184,7 +184,7 @@ async function proxySettingsCall(env, method, ...args) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     if (e && e.unbound) return json({ ok: false, msg: '没有绑定服务绑定 PROXY：请在面板 Worker 添加变量名 PROXY、入口 ProxyControl 的服务绑定' }, 400);
-    return json({ ok: false, msg: '无法调用代理：' + msg + '。请确认服务绑定 PROXY 的入口是 ProxyControl，且代理已更新到 3.2.0 或更高版本' }, 502);
+    return json({ ok: false, msg: '无法调用代理：' + msg + '。请确认服务绑定 PROXY 的入口是 ProxyControl，且代理已更新到 3.0.2 或更高版本' }, 502);
   }
 }
 

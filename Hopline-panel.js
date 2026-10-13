@@ -1,4 +1,4 @@
-/*!Hopline-panel v3.2.0*/
+/*!Hopline-panel v3.0.2*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -19,7 +19,7 @@
 //                    入口 ProxyControl = 另可在面板「代理设置」里在线修改代理的出站 / 地区反代设置（代理还需绑定 PROXY_KV）
 // ============================================================================
 // 版本号：两个脚本共用（面板用于检测更新与显示；代理只通过服务绑定的 status() 报告）
-const VERSION = '3.2.0';
+const VERSION = '3.0.2';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
 // 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
@@ -3259,7 +3259,7 @@ function checkProxy(){
     }
     if (!d.up){
       v.textContent = '无法连接'; v.className = 'v bad';
-      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus 或 ProxyControl，且代理已更新到 3.2.0 或更高版本';
+      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus 或 ProxyControl，且代理已更新到 3.0.2 或更高版本';
       return;
     }
     var t = '在线 · v' + (d.version || '?');
@@ -4102,7 +4102,7 @@ async function proxySettingsCall(env, method, ...args) {
   } catch (e) {
     const msg = String((e && e.message) || e);
     if (e && e.unbound) return json({ ok: false, msg: '没有绑定服务绑定 PROXY：请在面板 Worker 添加变量名 PROXY、入口 ProxyControl 的服务绑定' }, 400);
-    return json({ ok: false, msg: '无法调用代理：' + msg + '。请确认服务绑定 PROXY 的入口是 ProxyControl，且代理已更新到 3.2.0 或更高版本' }, 502);
+    return json({ ok: false, msg: '无法调用代理：' + msg + '。请确认服务绑定 PROXY 的入口是 ProxyControl，且代理已更新到 3.0.2 或更高版本' }, 502);
   }
 }
 

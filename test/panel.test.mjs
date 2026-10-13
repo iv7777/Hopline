@@ -1116,7 +1116,7 @@ test('代理状态：绑定后显示在线与版本、非敏感设置摘要；�
   };
   const up = await get({ status: async () => ({ ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 } }) });
   assert.deepEqual(up, { bound: true, up: true, ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 }, panelVersion: VERSION_FOR_TEST });
-  const bad = await get({ status: async () => ({ ok: false, version: '3.1.0', problems: ['请设置环境变量 UUID（节点用户 ID）。'] }) });
+  const bad = await get({ status: async () => ({ ok: false, version: '3.0.1', problems: ['请设置环境变量 UUID（节点用户 ID）。'] }) });
   assert.equal(bad.up, true); assert.equal(bad.ok, false); assert.deepEqual(bad.problems, ['请设置环境变量 UUID（节点用户 ID）。']);
   const down = await get({ status: async () => { throw new Error('The RPC receiver does not implement the method "status".'); } });
   assert.equal(down.bound, true); assert.equal(down.up, false); assert.match(down.error, /does not implement/);

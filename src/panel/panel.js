@@ -344,7 +344,7 @@ function checkProxy(){
     }
     if (!d.up){
       v.textContent = '无法连接'; v.className = 'v bad';
-      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus 或 ProxyControl，且代理已更新到 3.2.0 或更高版本';
+      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus 或 ProxyControl，且代理已更新到 3.0.2 或更高版本';
       return;
     }
     var t = '在线 · v' + (d.version || '?');
