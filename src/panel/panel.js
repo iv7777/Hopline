@@ -50,10 +50,11 @@ var NAV = [
   { id:'dashboard', name:'仪表盘', icon:'<path d="M4 4h7v7H4zM13 4h7v4h-7zM4 13h7v7H4zM13 11h7v9h-7z"/>' },
   { id:'nodes', name:'节点配置', icon:'<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9zM12 12l8-4.5M12 12L4 7.5"/>' },
   { id:'optimizer', name:'优选配置', icon:'<path d="M12 19a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM12 8v4l2.5 2.5M3 3l3 3"/>' },
+  { id:'proxy', name:'代理设置', icon:'<path d="M4 7h16M4 12h16M4 17h16M8 5v4M15 10v4M10 15v4"/>' },
   { id:'account', name:'面板设置', icon:'<path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21c0-3.5 3.6-6 8-6s8 2.5 8 6"/>' },
   { id:'about', name:'关于项目', icon:'<path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 11v5M12 8h.01"/>' }
 ];
-var TITLES = { dashboard:'仪表盘', nodes:'节点配置', optimizer:'优选配置', account:'面板设置', about:'关于项目' };
+var TITLES = { dashboard:'仪表盘', nodes:'节点配置', optimizer:'优选配置', proxy:'代理设置', account:'面板设置', about:'关于项目' };
 function buildNav(){
   var html = '';
   NAV.forEach(function(n){
@@ -62,6 +63,8 @@ function buildNav(){
   $('nav').innerHTML = html;
 }
 function switchView(id){
+  var fb = document.querySelector('.fbar');
+  if (fb) fb.style.display = (id === 'proxy') ? 'none' : '';   // 「代理设置」页有自己的保存按钮：它保存到代理，不是面板的「保存全部」
   document.querySelectorAll('.nav-item').forEach(function(b){
     b.classList.toggle('on', b.getAttribute('data-v') === id);
   });
@@ -187,6 +190,7 @@ function loadAll(){
     if (r && r.ok) renderStatus(r.data);
   }).catch(function(){});
   checkProxy();
+  loadProxySettings();
   api('config').then(function(r){
     if (r && r.ok){
       CFG = r.data;
@@ -212,6 +216,111 @@ function setConn(ok){
   p.className = 'pill ' + (ok ? '' : 'off');
   $('connText').textContent = ok ? '运行中' : '无法连接';
 }
+/* ===== 代理设置：通过服务绑定 PROXY 在线修改代理的 7 项出站 / 地区反代设置（保存在代理自己的 KV，不属于面板配置） ===== */
+var PROXY_FIELDS = { 'proxyIP': 's-proxyIP', 'outboundProxy': 's-outbound', 'outboundMode': 's-outmode', 'relay.mode': 'rl-mode', 'relay.region': 'rl-region', 'relay.region2': 'rl-region2', 'relay.custom': 'rl-custom' };
+var PROXY_ENV_NAMES = { 'proxyIP': 'PROXYIP', 'outboundProxy': 'OUTBOUND_PROXY', 'outboundMode': 'OUTBOUND_MODE', 'relay.mode': 'RELAY_MODE', 'relay.region': 'RELAY_REGION', 'relay.region2': 'RELAY_REGION2', 'relay.custom': 'RELAY_CUSTOM' };
+var RELAY_ZH = { HK: '香港', US: '美国', SG: '新加坡', JP: '日本', KR: '韩国', DE: '德国', SE: '瑞典', NL: '荷兰', FI: '芬兰', GB: '英国' };
+function proxyNote(text, kind){
+  var n = $('px-note');
+  n.textContent = text;
+  n.style.borderColor = kind === 'err' ? 'var(--err)' : '';
+}
+function setProxyFormEnabled(on){
+  Object.keys(PROXY_FIELDS).forEach(function(k){ var el = $(PROXY_FIELDS[k]); if (el) el.disabled = !on; });
+  $('px-save').disabled = !on;
+  $('px-reset').disabled = !on;
+}
+function clearProxyErrors(){
+  Object.keys(PROXY_FIELDS).forEach(function(k){ clearFieldError($(PROXY_FIELDS[k])); });
+}
+function showProxyErrors(errors){
+  clearProxyErrors();
+  var unplaced = [], first = null;
+  (errors || []).forEach(function(e){
+    var el = PROXY_FIELDS[e.field] ? $(PROXY_FIELDS[e.field]) : null;
+    if (!el){ unplaced.push(e.msg); return; }
+    el.classList.add('invalid');
+    if (el._errTip) el._errTip.textContent += '；' + e.msg;
+    else el._errTip = attachMsg(el, 'field-err', e.msg);
+    if (!first) first = el;
+  });
+  if (first){ try { first.scrollIntoView({ block: 'center', behavior: 'smooth' }); first.focus({ preventScroll: true }); } catch (e) {} }
+  return unplaced;
+}
+function onRelayMode(){
+  var m = $('rl-mode').value;
+  $('rl-builtin-box').style.display = (m === 'builtin') ? '' : 'none';
+  $('rl-custom-box').style.display = (m === 'custom') ? '' : 'none';
+}
+function fillProxy(d){
+
+  clearProxyErrors();
+  [['rl-region', 'relay.region', '自动（按 Worker 机房）'], ['rl-region2', 'relay.region2', '自动（默认的另一地区）']].forEach(function(c){
+    var el = $(c[0]);
+    el.innerHTML = '';
+    var opts = c[1] === 'relay.region2' ? ['', 'none'].concat(d.regions || []) : [''].concat(d.regions || []);
+    opts.forEach(function(o){
+      var op = document.createElement('option');
+      op.value = o;
+      op.textContent = o === '' ? c[2] : (o === 'none' ? '不使用' : (RELAY_ZH[o] ? o + ' ' + RELAY_ZH[o] : o));
+      el.appendChild(op);
+    });
+  });
+  Object.keys(PROXY_FIELDS).forEach(function(k){ $(PROXY_FIELDS[k]).value = (d.settings && d.settings[k] != null) ? d.settings[k] : ''; });
+  document.querySelectorAll('[data-src]').forEach(function(h){
+    var k = h.getAttribute('data-src'), s = d.source && d.source[k];
+    h.textContent = s === 'kv' ? '当前值来自这里保存的设置（覆盖了环境变量）' : (s === 'env' ? '当前值来自代理的环境变量 ' + PROXY_ENV_NAMES[k] : '未设置，使用默认值');
+  });
+  onRelayMode();
+}
+function collectProxy(){
+  var out = {};
+  Object.keys(PROXY_FIELDS).forEach(function(k){ out[k] = $(PROXY_FIELDS[k]).value; });
+  return out;
+}
+function loadProxySettings(){
+  proxyNote('读取中…');
+  setProxyFormEnabled(false);
+  return api('proxy-settings').then(function(r){
+    if (!r || !r.ok || !r.data){
+      proxyNote((r && r.msg) || '读取失败', 'err');
+      return;
+    }
+    fillProxy(r.data);
+    if (!r.data.storage){
+      proxyNote('代理没有绑定 KV（变量名 PROXY_KV），这些设置目前只读：显示的是代理环境变量里的值。给代理 Worker 绑定一个单独的 KV 命名空间后即可在这里修改。', 'err');
+      return;
+    }
+    proxyNote(r.data.error === 'unavailable' ? '代理的 KV 暂时无法读取：下面显示的可能不是最新的设置，保存会被拒绝，稍后重新读取。' : (r.data.error === 'corrupt' ? '代理 KV 里保存的设置已损坏，已忽略；保存一次即可修复。' : '已连接代理，可以在线修改。'), r.data.error ? 'err' : '');
+    setProxyFormEnabled(r.data.error !== 'unavailable');
+  }).catch(function(){ proxyNote('无法连接服务器', 'err'); });
+}
+function saveProxySettings(){
+  var btn = $('px-save');
+  btn.disabled = true;
+  api('proxy-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(collectProxy()) })
+    .then(function(r){
+      if (r && r.ok && r.data){
+        fillProxy(r.data);
+        toast('已保存到代理：约 1 分钟内生效', 'ok');
+        proxyNote('已保存：' + new Date().toLocaleTimeString() + '，代理约 1 分钟内生效。');
+        checkProxy();
+      } else {
+        var unplaced = showProxyErrors(r && r.errors);
+        toast((unplaced.length ? unplaced.join('；') : (r && r.msg)) || '保存失败', 'err');
+      }
+    })
+    .catch(function(){ toast('保存失败：无法连接服务器', 'err'); })
+    .then(function(){ btn.disabled = false; });
+}
+function resetProxySettings(){
+  if (!confirm('确定恢复？将清除这里保存的全部覆盖项，代理回到环境变量 + 默认值。')) return;
+  api('proxy-reset', { method: 'POST' }).then(function(r){
+    if (r && r.ok && r.data){ fillProxy(r.data); toast('已恢复为环境变量设置：代理约 1 分钟内生效', 'ok'); checkProxy(); }
+    else toast((r && r.msg) || '恢复失败', 'err');
+  }).catch(function(){ toast('恢复失败：无法连接服务器', 'err'); });
+}
+
 /* ===== 代理状态：服务绑定 PROXY → 代理 Worker 的 ProxyStatus.status()（只读） ===== */
 function proxySummary(s){
   s = s || {};
@@ -230,19 +339,19 @@ function checkProxy(){
     if (!d){ v.textContent = '检测失败'; v.className = 'v bad'; return; }
     if (!d.bound){
       v.textContent = '未绑定（可选）';
-      h.textContent = '给面板 Worker 添加服务绑定：变量名 PROXY → 代理 Worker，入口 ProxyStatus，就能在这里看到代理是否在线与版本';
+      h.textContent = '给面板 Worker 添加服务绑定：变量名 PROXY → 代理 Worker，入口 ProxyStatus（只读）或 ProxyControl（可在线修改代理设置），就能在这里看到代理是否在线与版本';
       return;
     }
     if (!d.up){
       v.textContent = '无法连接'; v.className = 'v bad';
-      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus，且代理已更新到 3.1.0 或更高版本';
+      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus 或 ProxyControl，且代理已更新到 3.2.0 或更高版本';
       return;
     }
     var t = '在线 · v' + (d.version || '?');
     if (d.panelVersion && d.version && d.version !== d.panelVersion) t += '（面板 v' + d.panelVersion + '）';
     v.textContent = t;
     v.className = 'v ' + (d.ok ? 'ok' : 'bad');
-    h.textContent = d.ok ? proxySummary(d.settings) : '代理配置有问题：' + (d.problems || []).join(' ');
+    h.textContent = d.ok ? proxySummary(d.settings) + (d.control ? ' · 可在线修改（入口 ProxyControl' + (d.storage ? '，已绑定 KV' : '，代理未绑定 PROXY_KV') + '）' : ' · 只读入口（要在线修改请把入口改为 ProxyControl）') : '代理配置有问题：' + (d.problems || []).join(' ');
   }).catch(function(){ v.textContent = '检测失败'; v.className = 'v bad'; });
 }
 function renderStatus(d){

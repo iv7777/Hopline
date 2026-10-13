@@ -154,19 +154,37 @@ function formatConfigErrors(errors) {
   return errors.map(e => (e.label ? e.label + '：' : '') + e.msg).join('；');
 }
 
-// 代理状态（服务绑定 PROXY → 代理 Worker 的 ProxyStatus 入口）：绑定缺失、调用失败或超时都不抛错，返回 { bound, up, ... } 给面板显示
+// 调用代理的 RPC（服务绑定 PROXY → 代理 Worker 的 ProxyStatus / ProxyControl 入口）：带超时，失败时抛 Error，由调用方转成面板能显示的结果
+const PROXY_CALL_TIMEOUT = 4000;
+async function callProxy(env, method, ...args) {
+  if (!(env && env.PROXY)) throw Object.assign(new Error('没有绑定服务绑定 PROXY'), { unbound: true });
+  const r = await Promise.race([
+    env.PROXY[method](...args),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('调用超时')), PROXY_CALL_TIMEOUT)),
+  ]);
+  if (!r || typeof r !== 'object') throw new Error('返回内容不正确');
+  return r;
+}
+// 代理状态：绑定缺失、调用失败或超时都不抛错，返回 { bound, up, ... } 给面板显示
 async function proxyStatus(env) {
-  const bound = env && env.PROXY;
-  if (!bound) return { bound: false };
+  if (!(env && env.PROXY)) return { bound: false };
   try {
-    const r = await Promise.race([
-      bound.status(),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('调用超时')), 4000)),
-    ]);
-    if (!r || typeof r !== 'object') throw new Error('返回内容不正确');
-    return { bound: true, up: true, ok: r.ok === true, version: String(r.version || ''), problems: Array.isArray(r.problems) ? r.problems.map(String) : [], settings: r.settings && typeof r.settings === 'object' ? r.settings : {}, panelVersion: VERSION };
+    const r = await callProxy(env, 'status');
+    return { bound: true, up: true, ok: r.ok === true, version: String(r.version || ''), problems: Array.isArray(r.problems) ? r.problems.map(String) : [], control: r.control === true, storage: r.storage === true, settings: r.settings && typeof r.settings === 'object' ? r.settings : {}, panelVersion: VERSION };
   } catch (e) {
     return { bound: true, up: false, error: String((e && e.message) || e), panelVersion: VERSION };
+  }
+}
+// 在线修改代理设置：把面板的请求转给代理的 ProxyControl 入口；绑定的是只读入口 ProxyStatus 时代理会报「does not implement」
+async function proxySettingsCall(env, method, ...args) {
+  try {
+    const r = await callProxy(env, method, ...args);
+    if (r.ok === false) return json({ ok: false, msg: String(r.error || '代理拒绝了这次操作'), errors: Array.isArray(r.errors) ? r.errors : [] }, 400);
+    return json({ ok: true, data: r });
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (e && e.unbound) return json({ ok: false, msg: '没有绑定服务绑定 PROXY：请在面板 Worker 添加变量名 PROXY、入口 ProxyControl 的服务绑定' }, 400);
+    return json({ ok: false, msg: '无法调用代理：' + msg + '。请确认服务绑定 PROXY 的入口是 ProxyControl，且代理已更新到 3.2.0 或更高版本' }, 502);
   }
 }
 
@@ -328,6 +346,21 @@ async function handleRequest(request, env, state) {
 
     // 代理状态：通过服务绑定 PROXY（入口 ProxyStatus）读取代理的在线状态与版本；没绑定就只返回 bound:false，面板其它功能不受影响
     if (apiName === 'proxy-status') return json({ ok: true, data: await proxyStatus(env) });
+    // 在线修改代理设置（7 项出站 / 地区反代设置）：GET 读取、POST 保存（只提交出现的项，整批校验）、proxy-reset 恢复为环境变量 + 默认值
+    if (apiName === 'proxy-settings') {
+      if (request.method === 'GET') return proxySettingsCall(env, 'getSettings');
+      if (request.method === 'POST') {
+        let body;
+        try { body = await request.json(); } catch (e) { return json({ ok: false, msg: '请求体不是合法的 JSON' }, 400); }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ ok: false, msg: '请求体必须为 JSON 对象' }, 400);
+        return proxySettingsCall(env, 'setSettings', body);
+      }
+      return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
+    }
+    if (apiName === 'proxy-reset') {
+      if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);
+      return proxySettingsCall(env, 'resetSettings');
+    }
 
     if (apiName === 'logout') {
       if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);

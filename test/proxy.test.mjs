@@ -499,7 +499,7 @@ import { assemble } from '../build.mjs';
 // 去掉 import / export default 后在函数作用域内求值，取出要测的纯函数
 const internals = (() => {
   const src = assemble('proxy')
-    .replace(/^import .*$/gm, '').replace('export default {', 'const __default = {').replace('export class ', 'class ');
+    .replace(/^import .*$/gm, '').replace('export default {', 'const __default = {').replace(/^export class /gm, 'class ');
   return new Function('connect', 'WorkerEntrypoint', src + '\n;return { md5Bytes, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVssProtoHeader, isValidIp, parseProxyAddress, relayPlan, RELAY_DOMAINS, proxyConfig, pumpReadable };')(() => { throw new Error('no sockets'); }, class { constructor(ctx, env) { this.ctx = ctx; this.env = env; } });
 })();
 
@@ -937,13 +937,194 @@ test('状态只能通过服务绑定读取：没有任何 HTTP 路由能拿到�
       assert.ok(!body.includes(VERSION_FOR_TEST), path);
     }
   }
-  assert.deepEqual(Object.keys(proxyModule).sort(), ['ProxyStatus', 'default'], '模块只导出默认入口与 ProxyStatus');
+  assert.deepEqual(Object.keys(proxyModule).sort(), ['ProxyControl', 'ProxyStatus', 'default'], '模块只导出默认入口与两个 RPC 入口');
 });
 
-test('混淆版代理脚本保留入口名 ProxyStatus（服务绑定按名字找入口）', async () => {
+test('混淆版代理脚本保留入口名 ProxyStatus / ProxyControl（服务绑定按名字找入口），在线设置同样可用', async () => {
   const obf = await import('../obf_Hopline-proxy.js?obf-test');
-  assert.deepEqual(Object.keys(obf).sort(), ['ProxyStatus', 'default']);
-  const st = await new obf.ProxyStatus({}, baseEnv()).status();
+  assert.deepEqual(Object.keys(obf).sort(), ['ProxyControl', 'ProxyStatus', 'default']);
+  const kv = memKv();
+  const st = await new obf.ProxyControl({}, baseEnv({ PROXY_KV: kv })).status();
   assert.equal(st.ok, true);
   assert.equal(st.version, VERSION_FOR_TEST);
+  assert.equal(st.control, true);
+  assert.equal((await new obf.ProxyControl({}, baseEnv({ PROXY_KV: kv })).setSettings({ outboundMode: 'no' })).ok, true);
+  assert.deepEqual(JSON.parse(kv.m.get('settings')), { outboundMode: 'no' });
+});
+
+// ---------------- 在线修改设置：ProxyControl + 代理自己的 KV（PROXY_KV） ----------------
+function memKv(init = {}) {
+  const m = new Map(Object.entries(init).map(([k, v]) => [k, typeof v === 'string' ? v : JSON.stringify(v)]));
+  const kv = { m, gets: 0, puts: 0, down: false,
+    async get(k) { kv.gets++; if (kv.down) throw new Error('KV unavailable'); return m.has(k) ? m.get(k) : null; },
+    async put(k, v) { kv.puts++; if (kv.down) throw new Error('KV unavailable'); m.set(k, v); },
+    async delete(k) { m.delete(k); } };
+  return kv;
+}
+const control = (env) => new proxyModule.ProxyControl({}, env);
+const storedOf = (kv) => JSON.parse(kv.m.get('settings'));
+
+test('ProxyControl 没有 KV 时：getSettings 只读（storage:false，显示环境变量的值），setSettings / resetSettings 明确拒绝', async () => {
+  const env = baseEnv({ PROXYIP: 'env-relay.example:8443', RELAY_MODE: 'off' });
+  const g = await control(env).getSettings();
+  assert.equal(g.ok, true); assert.equal(g.storage, false);
+  assert.equal(g.settings.proxyIP, 'env-relay.example:8443'); assert.equal(g.settings['relay.mode'], 'off');
+  assert.deepEqual(g.source, { proxyIP: 'env', outboundProxy: 'default', outboundMode: 'default', 'relay.mode': 'env', 'relay.region': 'default', 'relay.region2': 'default', 'relay.custom': 'default' });
+  assert.ok(g.regions.includes('HK') && g.regions.includes('Multacom'));
+  const s = await control(env).setSettings({ proxyIP: 'x.example' });
+  assert.equal(s.ok, false); assert.match(s.error, /PROXY_KV/);
+  assert.equal((await control(env).resetSettings()).ok, false);
+});
+
+test('ProxyControl.setSettings：校验后保存到 KV，生效值 = KV > 环境变量 > 默认；与环境变量相同的值不落盘；只读入口 ProxyStatus 没有这些方法', async () => {
+  const kv = memKv();
+  const env = baseEnv({ PROXY_KV: kv, PROXYIP: 'env-relay.example', OUTBOUND_PROXY: 'socks5://u:p@1.2.3.4:1080' });
+  const r = await control(env).setSettings({
+    proxyIP: ' mine.example:8443 ', outboundProxy: 'socks5://u:p@1.2.3.4:1080', outboundMode: 'only',
+    'relay.mode': 'custom', 'relay.custom': 'A.Example.com, [2001:db8::1]:8443\nb.example.com:443', bogus: 'x',
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(r.ignored, ['bogus']);
+  assert.deepEqual(storedOf(kv), { proxyIP: 'mine.example:8443', outboundMode: 'only', 'relay.mode': 'custom', 'relay.custom': 'a.example.com\n[2001:db8::1]:8443\nb.example.com' }, '与环境变量相同的出站代理没有落盘');
+  assert.equal(r.settings.outboundProxy, 'socks5://u:p@1.2.3.4:1080');
+  assert.equal(r.storage, true);
+  assert.equal(r.source.proxyIP, 'kv'); assert.equal(r.source.outboundProxy, 'env'); assert.equal(r.source['relay.region'], 'default');
+  // 之后环境变量变化立即生效（KV 里没有它的快照）
+  const later = baseEnv({ PROXY_KV: kv, PROXYIP: 'env-relay.example', OUTBOUND_PROXY: 'socks5://u:p@9.9.9.9:1080' });
+  assert.equal((await control(later).getSettings()).settings.outboundProxy, 'socks5://u:p@9.9.9.9:1080');
+  // 改回与环境变量相同：该项从 KV 里移除
+  const back = await control(env).setSettings({ proxyIP: 'env-relay.example' });
+  assert.equal(back.ok, true);
+  assert.equal('proxyIP' in storedOf(kv), false);
+  assert.equal(back.source.proxyIP, 'env');
+  // 只读入口没有写方法，也没有 getSettings
+  const ro = new proxyModule.ProxyStatus({}, env);
+  for (const m of ['getSettings', 'setSettings', 'resetSettings']) assert.equal(ro[m], undefined, m);
+});
+
+test('ProxyControl.setSettings 校验：每项给出字段级错误，整批都不保存；自定义模式必须有反代列表；UUID / PATH 改不了', async () => {
+  const kv = memKv();
+  const env = baseEnv({ PROXY_KV: kv });
+  const bad = [
+    [{ proxyIP: 'bad host' }, 'proxyIP'], [{ proxyIP: 'a/b' }, 'proxyIP'], [{ proxyIP: 'x.example:99999' }, 'proxyIP'],
+    [{ outboundProxy: 'ss://rc4:pw@1.2.3.4:8388' }, 'outboundProxy'], [{ outboundProxy: 'ss://aes-256-gcm@1.2.3.4:8388' }, 'outboundProxy'],
+    [{ outboundProxy: 'socks5://has space@1.2.3.4:1' }, 'outboundProxy'], [{ outboundMode: 'sideways' }, 'outboundMode'],
+    [{ 'relay.mode': 'sideways' }, 'relay.mode'], [{ 'relay.region': 'Atlantis' }, 'relay.region'], [{ 'relay.region2': 'Atlantis' }, 'relay.region2'],
+    [{ 'relay.custom': 'a.example.com\nb.example.com\nc.example.com\nd.example.com' }, 'relay.custom'], [{ 'relay.custom': 'bad host' }, 'relay.custom'],
+    [{ 'relay.custom': 'x.example.com:70000' }, 'relay.custom'], [{ 'relay.mode': 'custom' }, 'relay.custom'], [{ proxyIP: 123 }, 'proxyIP'],
+  ];
+  for (const [patch, field] of bad) {
+    const r = await control(env).setSettings(patch);
+    assert.equal(r.ok, false, JSON.stringify(patch));
+    assert.ok(r.errors.some(e => e.field === field), JSON.stringify(patch) + ' → ' + JSON.stringify(r.errors));
+  }
+  // 一批里有一项出错：其它合法项也不保存
+  const mixed = await control(env).setSettings({ outboundMode: 'no', proxyIP: 'bad host' });
+  assert.equal(mixed.ok, false);
+  assert.equal(kv.puts, 0, '校验失败不写 KV');
+  assert.equal((await control(env).setSettings(null)).ok, false);
+  // UUID / PATH 不是可修改的设置：被报告为忽略，不会写入
+  const id = await control(env).setSettings({ UUID: 'x', PATH: 'y', uuid: 'z', path: 'w', outboundMode: 'no' });
+  assert.equal(id.ok, true);
+  assert.deepEqual(id.ignored.sort(), ['PATH', 'UUID', 'path', 'uuid']);
+  assert.deepEqual(storedOf(kv), { outboundMode: 'no' });
+  assert.ok(!kv.m.get('settings').includes(UUID));
+});
+
+test('ProxyControl：KV 损坏时忽略并允许保存来修复；KV 读取失败时拒绝保存、不覆盖已有设置；resetSettings 清除覆盖项', async () => {
+  const kv = memKv({ settings: '{not json' });
+  const env = baseEnv({ PROXY_KV: kv, RELAY_MODE: 'off' });
+  const g = await control(env).getSettings();
+  assert.equal(g.error, 'corrupt'); assert.equal(g.settings['relay.mode'], 'off', '损坏的设置被忽略，用环境变量');
+  assert.equal((await control(env).setSettings({ outboundMode: 'no' })).ok, true, '损坏时允许保存（修复）');
+  assert.deepEqual(storedOf(kv), { outboundMode: 'no' });
+  // 无效项在读取时被丢弃，其它项保留
+  const kv2 = memKv({ settings: { outboundMode: 'sideways', proxyIP: 'ok.example', bogus: 1 } });
+  const g2 = await control(baseEnv({ PROXY_KV: kv2 })).getSettings();
+  assert.equal(g2.settings.proxyIP, 'ok.example'); assert.equal(g2.settings.outboundMode, '');
+  // 读取失败：拒绝保存
+  const kv3 = memKv({ settings: { proxyIP: 'keep.example' } });
+  kv3.down = true;
+  const env3 = baseEnv({ PROXY_KV: kv3 });
+  const refused = await control(env3).setSettings({ proxyIP: 'new.example' });
+  assert.equal(refused.ok, false); assert.match(refused.error, /KV 暂时无法读取/);
+  assert.equal(kv3.puts, 0);
+  kv3.down = false;
+  // reset
+  const kv4 = memKv({ settings: { proxyIP: 'x.example' } });
+  const env4 = baseEnv({ PROXY_KV: kv4, PROXYIP: 'env.example' });
+  const rs = await control(env4).resetSettings();
+  assert.equal(rs.ok, true); assert.equal(rs.settings.proxyIP, 'env.example'); assert.equal(kv4.m.has('settings'), false);
+  assert.equal((await control(env4).getSettings()).settings.proxyIP, 'env.example');
+});
+
+test('status()：control 标志、是否有 KV、摘要反映 KV 里的在线设置；仍不返回任何密钥', async () => {
+  const kv = memKv({ settings: { 'relay.mode': 'off', outboundProxy: 'http://carol:s3cret@10.1.1.1:8080', outboundMode: 'only' } });
+  const env = baseEnv({ PROXY_KV: kv });
+  const full = await control(env).status();
+  assert.equal(full.control, true); assert.equal(full.storage, true);
+  assert.deepEqual(full.settings, { proxyIP: false, outboundProxy: 'http', outboundMode: 'only', relayMode: 'off', relayRegion: '', relayRegion2: '', relayCustom: 0 });
+  assert.ok(!JSON.stringify(full).includes('s3cret') && !JSON.stringify(full).includes('10.1.1.1'));
+  const ro = await new proxyModule.ProxyStatus({}, baseEnv()).status();
+  assert.equal(ro.control, false); assert.equal(ro.storage, false);
+});
+
+test('在线设置真正生效：节点路径上的连接按 KV 里的设置出站；KV 读取有缓存、伪装页请求不读 KV；KV 故障时沿用上次的设置', async () => {
+  const kv = memKv({ settings: { 'relay.mode': 'off' } });
+  const env = baseEnv({ PROXY_KV: kv });
+  const realNow = Date.now;
+  let t = realNow();
+  Date.now = () => t;
+  try {
+    // 伪装页 / 其它路径：不读 KV
+    for (const path of ['/', '/other', '/login']) await worker.fetch(new Request('https://node.example.com' + path), env, {});
+    assert.equal(kv.gets, 0, '没有节点路径上的连接就不读 KV');
+    // relay off：直连失败后不尝试任何反代
+    let log = fakeNet({});
+    const dns = [];
+    await withFetch(cfDoh({}, dns), async () => {
+      for (let i = 0; i < 3; i++) {
+        const ws = await openWs(env);
+        await ws.emit('message', { data: vlessReq('kv-off.example', 443, TLS_HELLO).buffer });
+        assert.equal(ws.closed.code, 1011);
+      }
+    });
+    assert.equal(dns.filter(d => d.name.startsWith('proxyip.')).length, 0, 'KV 里的 relay.mode=off 生效：没有解析内置反代');
+    assert.equal(kv.gets, 1, '3 个连接只读了一次 KV（isolate 内存缓存）');
+    // 改成自定义反代，缓存过期后新设置生效
+    kv.m.set('settings', JSON.stringify({ 'relay.mode': 'custom', 'relay.custom': 'kv-relay.example.com' }));
+    t += 25 * 1000;
+    log = fakeNet({ 'kv-cf.example': { delay: 'hang' }, '203.0.113.77': { delay: 10 } });
+    await withFetch(cfDoh({ 'kv-relay.example.com': ['203.0.113.77'] }, []), async () => {
+      const ws = await openWs(env);
+      await ws.emit('message', { data: vlessReq('kv-cf.example', 443, TLS_HELLO).buffer });
+      await until(() => log.some(s => s.written.length));
+    });
+    assert.equal(log.find(s => s.written.length).hostname, '203.0.113.77', '缓存过期后读到新设置');
+    assert.equal(kv.gets, 2);
+    // KV 故障：沿用上次读到的设置，连接不受影响
+    kv.down = true;
+    t += 25 * 1000;
+    log = fakeNet({ 'kv-cf.example': { delay: 'hang' }, '203.0.113.77': { delay: 10 } });
+    await withFetch(cfDoh({ 'kv-relay.example.com': ['203.0.113.77'] }, []), async () => {
+      const ws = await openWs(env);
+      await ws.emit('message', { data: vlessReq('kv-cf.example', 443, TLS_HELLO).buffer });
+      await until(() => log.some(s => s.written.length));
+    });
+    assert.equal(log.find(s => s.written.length).hostname, '203.0.113.77', 'KV 读取失败时沿用上次的设置');
+  } finally { Date.now = realNow; }
+  // 通过 ProxyControl 保存后，同一 isolate 立即生效（不等缓存过期）
+  const kv2 = memKv();
+  const env2 = baseEnv({ PROXY_KV: kv2 });
+  fakeNet({});
+  const dns2 = [];
+  await withFetch(cfDoh({}, dns2), async () => {
+    const before = await openWs(env2);
+    await before.emit('message', { data: vlessReq('save-live.example', 443, TLS_HELLO).buffer });
+    await control(env2).setSettings({ 'relay.mode': 'off' });
+    dns2.length = 0;
+    const after = await openWs(env2);
+    await after.emit('message', { data: vlessReq('save-live.example', 443, TLS_HELLO).buffer });
+  });
+  assert.equal(dns2.filter(d => d.name.startsWith('proxyip.')).length, 0, '保存后新连接不再用内置反代');
 });

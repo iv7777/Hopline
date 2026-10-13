@@ -135,3 +135,53 @@ test('服务绑定：面板通过 PROXY 绑定读到真实代理的在线状态�
   assert.equal(bad.up, true); assert.equal(bad.ok, false);
   assert.match(bad.problems.join(' '), /UUID/);
 });
+
+test('面板在线修改代理设置：面板 → ProxyControl → 代理自己的 KV → 代理按新设置出站；改不了 UUID / PATH；只读入口 ProxyStatus 不能写', async () => {
+  const proxyKv = kv();
+  const xenv = { UUID: PROXY_UUID, PATH: PROXY_PATH, PROXYIP: 'env-relay.example', PROXY_KV: proxyKv };
+  const penv = { PATH: 'my-panel', ADMIN: 'pw', CONFIG_KV: kv(), PROXY: new proxyModule.ProxyControl({}, xenv) };
+  const loginRes = await panel.fetch(new Request('https://panel.example.org/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': '203.0.113.9' },
+    body: 'username=admin&password=pw&next=' + encodeURIComponent('/my-panel'),
+  }), penv, {});
+  const cookie = loginRes.headers.get('Set-Cookie').split(';')[0];
+  const api = async (path, init = {}) => {
+    const res = await panel.fetch(new Request('https://panel.example.org/my-panel/api/' + path, { ...init, headers: { Cookie: cookie, 'Content-Type': 'application/json' } }), penv, {});
+    return { status: res.status, body: await res.json() };
+  };
+  const got = await api('proxy-settings');
+  assert.equal(got.body.data.storage, true);
+  assert.equal(got.body.data.settings.proxyIP, 'env-relay.example');
+  assert.equal(got.body.data.source.proxyIP, 'env');
+  const saved = await api('proxy-settings', { method: 'POST', body: JSON.stringify({ proxyIP: 'panel-set.example:8443', 'relay.mode': 'off', UUID: 'hijack', PATH: 'hijack' }) });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+  assert.equal(saved.body.data.settings.proxyIP, 'panel-set.example:8443');
+  assert.deepEqual(JSON.parse(proxyKv.m.get('settings')), { proxyIP: 'panel-set.example:8443', 'relay.mode': 'off' });
+  assert.ok(!proxyKv.m.get('settings').includes('hijack'));
+  const st = (await api('proxy-status')).body.data;
+  assert.equal(st.control, true); assert.equal(st.storage, true);
+  assert.equal(st.settings.proxyIP, true); assert.equal(st.settings.relayMode, 'off');
+  // 代理按新设置工作：relay.mode=off → 目标直连失败后不尝试任何反代
+  const upgrade = await proxy.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}`, { headers: { Upgrade: 'websocket' } }), xenv, {});
+  assert.equal(upgrade.status, 101);
+  connections.length = 0;
+  const failing = globalThis.__connect;
+  globalThis.__connect = ({ hostname, port }) => { connections.push({ hostname, port }); throw new Error('refused'); };
+  const uuidBytes = PROXY_UUID.replace(/-/g, '').match(/../g).map(h => parseInt(h, 16));
+  const host = 'nowhere.example';
+  const req = new Uint8Array([0, ...uuidBytes, 0, 1, 1, 187, 2, host.length, ...Buffer.from(host), 0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5]);
+  await lastServer.emit('message', { data: req.buffer });
+  await new Promise(r => setTimeout(r, 50));
+  globalThis.__connect = failing;
+  assert.ok(connections.length >= 1 && connections.every(c => c.hostname === host || c.hostname === 'panel-set.example'), '没有尝试任何地区反代');
+  // 恢复为环境变量
+  const reset = await api('proxy-reset', { method: 'POST' });
+  assert.equal(reset.body.data.settings.proxyIP, 'env-relay.example');
+  assert.equal(proxyKv.m.has('settings'), false);
+  // 只读入口：能看状态，不能改
+  const roEnv = { ...penv, PROXY: new proxyModule.ProxyStatus({}, xenv) };
+  const roRes = await panel.fetch(new Request('https://panel.example.org/my-panel/api/proxy-settings', { method: 'POST', body: '{}', headers: { Cookie: cookie, 'Content-Type': 'application/json' } }), roEnv, {});
+  assert.equal(roRes.status, 502);
+  const roStatus = await panel.fetch(new Request('https://panel.example.org/my-panel/api/proxy-status', { headers: { Cookie: cookie } }), roEnv, {});
+  assert.equal((await roStatus.json()).data.control, false);
+});

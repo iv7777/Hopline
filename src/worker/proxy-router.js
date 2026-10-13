@@ -16,9 +16,11 @@ export default {
     }
     const path = url.pathname.replace(/^\/+|\/+$/g, '');
     if (path === cfg.path) {
-      if (upgrade === 'websocket') return handleWebSocketProxy(request, cfg);
+      // 只有节点路径上的连接才会读 PROXY_KV 里的在线设置（伪装页请求不触发任何 KV 读取）
+      const live = await loadProxyConfig(env, cfg);
+      if (upgrade === 'websocket') return handleWebSocketProxy(request, live);
       if (request.method === 'POST') {
-        try { return await handleXhttpProxy(request, cfg); }
+        try { return await handleXhttpProxy(request, live); }
         catch (e) { return json({ ok: false, msg: 'xhttp 代理错误: ' + (e.message || e) }, 500); }
       }
     }
@@ -26,16 +28,21 @@ export default {
   }
 };
 
-// 只读状态入口：面板 Worker 通过服务绑定（入口名 ProxyStatus）调用 status()，没有 HTTP 路由，公网访问不到。
-// 只返回「是否在线 / 版本 / 配置问题 / 非敏感的设置摘要」，绝不返回 UUID、路径、反代地址或出站代理的主机与密码
+// 面板 Worker 通过服务绑定调用的 RPC 入口，没有 HTTP 路由，公网访问不到：
+//   ProxyStatus   只读：status() 返回是否在线 / 版本 / 配置问题 / 非敏感的设置摘要（不含 UUID、路径、反代地址与出站代理的主机和密码）
+//   ProxyControl  在 ProxyStatus 之上再加 getSettings() / setSettings() / resetSettings()：读写 7 项运行设置（见 proxy-settings.js）。
+//                 getSettings() 会返回完整的设置值，包括出站代理里的用户名与密码——面板里需要显示并编辑它们；
+//                 UUID 与 PATH 永远不在其中，也改不了。想让面板只读时，服务绑定的入口选 ProxyStatus 即可
 export class ProxyStatus extends WorkerEntrypoint {
   async status() {
-    const cfg = proxyConfig(this.env);
+    const cfg = await loadProxyConfig(this.env);
     const out = cfg.outboundProxy ? parseProxyAddress(cfg.outboundProxy) : null;
     return {
       ok: cfg._problems.length === 0,
       version: VERSION,
       problems: cfg._problems,
+      control: this instanceof ProxyControl,
+      storage: !!proxyKv(this.env),
       settings: {
         proxyIP: !!cfg.proxyIP,
         outboundProxy: out ? out.type : '',
@@ -47,4 +54,9 @@ export class ProxyStatus extends WorkerEntrypoint {
       },
     };
   }
+}
+export class ProxyControl extends ProxyStatus {
+  getSettings() { return getProxySettings(this.env); }
+  setSettings(patch) { return saveProxySettings(this.env, patch); }
+  resetSettings() { return resetProxySettings(this.env); }
 }

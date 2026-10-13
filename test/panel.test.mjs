@@ -206,25 +206,26 @@ test('代理端点没填全：面板照常使用并提示缺哪几项，订阅�
   assert.ok(links.every(l => l.startsWith(`vless://${UUID2}@`) && /[?&]sni=proxy\.example\.com(&|#)/.test(l) && /path=%2Fnp(%3F|&)/.test(l)));
 });
 
-test('面板页面：代理端点三项在「面板设置」里，出站 / 落地 / 地区反代设置已移到代理脚本；页面内嵌，不依赖网络', async () => {
+test('面板页面：代理端点三项在「面板设置」里，出站 / 落地 / 地区反代在单独的「代理设置」页（不属于面板配置）；页面内嵌，不依赖网络', async () => {
   const env = baseEnv();
   const res = await call(env, `/${UUID}`, { cookie: await login(env) });
   assert.equal(res.status, 200);
   const html = await res.text();
   for (const id of ['a-host', 'a-uuid', 'a-nodepath', 'epwarn']) assert.ok(html.includes(`id="${id}"`), id);
-  for (const id of ['s-proxyIP', 's-outbound', 's-outmode', 'rl-mode', 'rl-region', 'rl-custom']) assert.ok(!html.includes(`id="${id}"`), id);
+  for (const id of ['s-proxyIP', 's-outbound', 's-outmode', 'rl-mode', 'rl-region', 'rl-region2', 'rl-custom', 'px-note', 'px-save', 'px-reset']) assert.ok(html.includes(`id="${id}"`), id);
+  assert.ok(html.includes('data-view="proxy"') && html.includes('function saveProxySettings(') && html.includes('function loadProxySettings('));
   assert.ok(html.includes('var SCHEMA = ') && !html.includes('/*@HOPLINE_SCHEMA@*/'), '字段表已注入');
   const schema = JSON.parse(html.match(/var SCHEMA = (\[.*?\]) \|\| \[\];/s)[1]);
   const keys = schema.map(d => d.key);
   for (const k of ['host', 'uuid', 'nodePath']) assert.ok(keys.includes(k), k);
-  for (const k of ['proxyIP', 'outboundProxy', 'outboundMode', 'relay.mode', 'relay.region', 'relay.region2', 'relay.custom']) assert.ok(!keys.includes(k), k);
+  for (const k of ['proxyIP', 'outboundProxy', 'outboundMode', 'relay.mode', 'relay.region', 'relay.region2', 'relay.custom']) assert.ok(!keys.includes(k), `${k} 是代理的设置，不在面板的字段表里`);
   // 页面里每个字段表登记的控件都存在（回填 / 收集依赖它）
   for (const d of schema) for (const id of [d.el, ...Object.values(d.els || {})].filter(Boolean)) assert.ok(html.includes(`id="${id}"`), `${d.key} → #${id}`);
 });
 
 test('构建产物：面板脚本不含任何代理代码（sockets、WebSocket、XHTTP、出站、VLESS 头解析），也不再从网络拉取面板页面或 Clash 模板', () => {
   const code = readFileSync(new URL('../Hopline-panel.js', import.meta.url), 'utf8');
-  for (const needle of ['cloudflare:sockets', 'WebSocketPair', 'handleWebSocketProxy', 'handleXhttpProxy', 'openOutbound', 'connectViaSocks5', 'parseVssProtoHeader', 'RELAY_DOMAINS', 'cmliussss', 'assetFromNetwork', 'sha256Hex', 'IS_OBFUSCATED', 'dist/panel.html', 'clash-template.yaml']) {
+  for (const needle of ['cloudflare:sockets', 'WebSocketPair', 'handleWebSocketProxy', 'handleXhttpProxy', 'openOutbound', 'connectViaSocks5', 'parseVssProtoHeader', 'RELAY_DOMAINS', 'proxyip.hk.cmliussss.net', 'assetFromNetwork', 'sha256Hex', 'IS_OBFUSCATED', 'dist/panel.html', 'clash-template.yaml']) {
     assert.ok(!code.includes(needle), needle);
   }
   assert.match(code, /^\/\*!Hopline-panel v\d+\.\d+\.\d+\*\//);
@@ -1113,8 +1114,8 @@ test('代理状态：绑定后显示在线与版本、非敏感设置摘要；�
     const env = baseEnv({ PROXY: proxy });
     return (await (await call(env, `/${UUID}/api/proxy-status`, { cookie: await login(env) })).json()).data;
   };
-  const up = await get({ status: async () => ({ ok: true, version: '9.9.9', problems: [], settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 } }) });
-  assert.deepEqual(up, { bound: true, up: true, ok: true, version: '9.9.9', problems: [], settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 }, panelVersion: VERSION_FOR_TEST });
+  const up = await get({ status: async () => ({ ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 } }) });
+  assert.deepEqual(up, { bound: true, up: true, ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 }, panelVersion: VERSION_FOR_TEST });
   const bad = await get({ status: async () => ({ ok: false, version: '3.1.0', problems: ['请设置环境变量 UUID（节点用户 ID）。'] }) });
   assert.equal(bad.up, true); assert.equal(bad.ok, false); assert.deepEqual(bad.problems, ['请设置环境变量 UUID（节点用户 ID）。']);
   const down = await get({ status: async () => { throw new Error('The RPC receiver does not implement the method "status".'); } });
@@ -1138,6 +1139,60 @@ test('面板页面有「代理状态」行与检测按钮；版本号两个脚�
   const v = (f) => readFileSync(new URL(f, import.meta.url), 'utf8').match(/^\/\*!Hopline-\w+ v([\d.]+)\*\//)[1];
   assert.equal(v('../Hopline-panel.js'), VERSION_FOR_TEST);
   assert.equal(v('../Hopline-proxy.js'), VERSION_FOR_TEST);
+});
+
+test('代理设置 API：需登录；没有服务绑定时给出明确提示；方法与请求体校验', async () => {
+  const env = baseEnv();
+  const base = `/${UUID}/api/proxy-settings`;
+  for (const [path, method] of [[base, 'GET'], [base, 'POST'], [`/${UUID}/api/proxy-reset`, 'POST']]) assert.equal((await call(env, path, { method, body: method === 'POST' ? {} : undefined })).status, 403, path + ' 未登录');
+  const cookie = await login(env);
+  const g = await call(env, base, { cookie });
+  assert.equal(g.status, 400);
+  assert.match((await g.json()).msg, /没有绑定服务绑定 PROXY.*ProxyControl/);
+  assert.equal((await call(env, `/${UUID}/api/proxy-reset`, { method: 'POST', cookie })).status, 400);
+  const bound = baseEnv({ PROXY: { setSettings: async () => ({ ok: true }) } });
+  const c2 = await login(bound);
+  assert.equal((await call(bound, base, { method: 'PUT', cookie: c2 })).status, 405);
+  assert.equal((await call(bound, base, { method: 'POST', cookie: c2, body: '{bad' })).status, 400);
+  assert.equal((await call(bound, base, { method: 'POST', cookie: c2, body: '[1]' })).status, 400);
+  assert.equal((await call(bound, `/${UUID}/api/proxy-reset`, { cookie: c2 })).status, 405, 'proxy-reset 只接受 POST');
+});
+
+test('代理设置 API：读取 / 保存 / 恢复都转给代理的 ProxyControl；代理的校验错误原样回给面板（400 + 字段级错误）；调用失败 / 超时 / 绑定了只读入口时给出提示', async () => {
+  const calls = [];
+  const settings = { proxyIP: 'p.example', outboundProxy: '', outboundMode: '', 'relay.mode': 'builtin', 'relay.region': '', 'relay.region2': '', 'relay.custom': '' };
+  const proxy = {
+    getSettings: async () => { calls.push(['get']); return { ok: true, storage: true, settings, env: settings, source: {}, regions: ['HK'], error: '' }; },
+    setSettings: async (b) => { calls.push(['set', b]); return b.outboundMode === 'bad' ? { ok: false, error: '出站方式：不支持的选项', errors: [{ field: 'outboundMode', msg: '出站方式：不支持的选项' }] } : { ok: true, storage: true, settings: { ...settings, ...b }, ignored: [] }; },
+    resetSettings: async () => { calls.push(['reset']); return { ok: true, storage: true, settings }; },
+  };
+  const env = baseEnv({ PROXY: proxy });
+  const cookie = await login(env);
+  const api = (path, init = {}) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
+  const g = await (await api('proxy-settings')).json();
+  assert.equal(g.ok, true); assert.equal(g.data.settings.proxyIP, 'p.example'); assert.deepEqual(g.data.regions, ['HK']);
+  const s = await (await api('proxy-settings', { method: 'POST', body: { outboundMode: 'only', 'relay.mode': 'off' } })).json();
+  assert.equal(s.ok, true); assert.equal(s.data.settings.outboundMode, 'only');
+  assert.deepEqual(calls[1], ['set', { outboundMode: 'only', 'relay.mode': 'off' }], '请求体原样转给代理');
+  const e = await api('proxy-settings', { method: 'POST', body: { outboundMode: 'bad' } });
+  assert.equal(e.status, 400);
+  const ej = await e.json();
+  assert.equal(ej.ok, false); assert.equal(ej.errors[0].field, 'outboundMode'); assert.match(ej.msg, /不支持的选项/);
+  assert.equal((await (await api('proxy-reset', { method: 'POST' })).json()).ok, true);
+  assert.equal(calls.at(-1)[0], 'reset');
+  // 代理调用失败（如绑定的是只读入口 ProxyStatus，没有这些方法）
+  const ro = baseEnv({ PROXY: { status: async () => ({ ok: true }) } });
+  const r = await call(ro, `/${UUID}/api/proxy-settings`, { cookie: await login(ro) });
+  assert.equal(r.status, 502);
+  assert.match((await r.json()).msg, /无法调用代理.*入口是 ProxyControl/);
+  // 超时
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...a) => realSetTimeout(fn, ms === 4000 ? 5 : ms, ...a);
+  try {
+    const hung = baseEnv({ PROXY: { getSettings: () => new Promise(() => {}) } });
+    const h = await call(hung, `/${UUID}/api/proxy-settings`, { cookie: await login(hung) });
+    assert.equal(h.status, 502); assert.match((await h.json()).msg, /调用超时/);
+  } finally { globalThis.setTimeout = realSetTimeout; }
 });
 
 test('KV 中的配置损坏（不是合法 JSON）：显示提示并禁止保存，但允许重置修复', async () => {
