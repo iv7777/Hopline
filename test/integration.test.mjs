@@ -5,6 +5,9 @@ import { register } from 'node:module';
 
 const hooks = `
 export async function resolve(spec, ctx, next) {
+  if (spec === 'cloudflare:workers') {
+    return { url: 'data:text/javascript,export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }', shortCircuit: true };
+  }
   if (spec === 'cloudflare:sockets') {
     return { url: 'data:text/javascript,export function connect(a){ return globalThis.__connect(a); }', shortCircuit: true };
   }
@@ -42,7 +45,8 @@ globalThis.__connect = ({ hostname, port }) => {
   return sock;
 };
 
-const proxy = (await import('../Hopline-proxy.js')).default;
+const proxyModule = await import('../Hopline-proxy.js');
+const proxy = proxyModule.default;
 const panel = (await import('../Hopline-panel.js')).default;
 
 const PROXY_UUID = '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d';
@@ -107,4 +111,27 @@ test('面板里填写代理端点后生成的 vless 链接，可被代理（只�
   // 代理不接受面板路径，也不认识别的 UUID
   const wrongPath = await proxy.fetch(new Request(`https://${PROXY_HOST}/my-panel`, { headers: { Upgrade: 'websocket' } }), xenv, {});
   assert.notEqual(wrongPath.status, 101);
+});
+
+test('服务绑定：面板通过 PROXY 绑定读到真实代理的在线状态与版本；代理未配置好时面板显示配置问题', async () => {
+  const login = async (penv) => {
+    const res = await panel.fetch(new Request('https://panel.example.org/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': '203.0.113.8' },
+      body: 'username=admin&password=pw&next=' + encodeURIComponent('/my-panel'),
+    }), penv, {});
+    return res.headers.get('Set-Cookie').split(';')[0];
+  };
+  const status = async (proxyEnv) => {
+    const penv = { PATH: 'my-panel', ADMIN: 'pw', CONFIG_KV: kv(), PROXY: new proxyModule.ProxyStatus({}, proxyEnv) };
+    const res = await panel.fetch(new Request('https://panel.example.org/my-panel/api/proxy-status', { headers: { Cookie: await login(penv) } }), penv, {});
+    return (await res.json()).data;
+  };
+  const good = await status({ UUID: PROXY_UUID, PATH: PROXY_PATH, OUTBOUND_PROXY: 'http://user:pw@1.2.3.4:8080' });
+  assert.equal(good.up, true); assert.equal(good.ok, true);
+  assert.equal(good.version, good.panelVersion, '两个脚本同一版本号');
+  assert.equal(good.settings.outboundProxy, 'http');
+  assert.ok(!JSON.stringify(good).includes('user:pw') && !JSON.stringify(good).includes(PROXY_UUID));
+  const bad = await status({ PATH: PROXY_PATH });
+  assert.equal(bad.up, true); assert.equal(bad.ok, false);
+  assert.match(bad.problems.join(' '), /UUID/);
 });

@@ -1,6 +1,5 @@
-const VERSION = '3.0.0';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
-// 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，也不暴露版本）
+// 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
 const UPDATE_FILE = 'Hopline-panel.js';
 let UPDATE_CACHE = null; // { t, r } 60 秒缓存
@@ -30,6 +29,8 @@ function updateFileUrl(name){
 async function fetchRepoFile(name){
   try {
     const res = await fetch(updateFileUrl(name), { headers: { 'User-Agent': 'Mozilla/5.0 (Hopline)' } });
+    // 404：main 上没有这个文件——常见于新版本还没合并发布到 main，或仓库不是公开的（raw.githubusercontent.com 不带凭据，私有仓库一律 404）
+    if (res.status === 404) return { error: '仓库 main 分支上没有 ' + name + '（HTTP 404）：新版本可能还没有合并发布到 main，或仓库不是公开的' };
     if (!res.ok) return { error: name + ' HTTP ' + res.status };
     const txt = await res.text();
     return { txt, version: extractVersion(txt) };

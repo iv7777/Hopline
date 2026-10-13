@@ -186,6 +186,7 @@ function loadAll(){
   api('status').then(function(r){
     if (r && r.ok) renderStatus(r.data);
   }).catch(function(){});
+  checkProxy();
   api('config').then(function(r){
     if (r && r.ok){
       CFG = r.data;
@@ -210,6 +211,39 @@ function setConn(ok){
   var p = $('connPill');
   p.className = 'pill ' + (ok ? '' : 'off');
   $('connText').textContent = ok ? '运行中' : '无法连接';
+}
+/* ===== 代理状态：服务绑定 PROXY → 代理 Worker 的 ProxyStatus.status()（只读） ===== */
+function proxySummary(s){
+  s = s || {};
+  var a = [];
+  a.push('出站代理：' + (s.outboundProxy || '无'));
+  if (s.outboundMode) a.push('出站方式：' + s.outboundMode);
+  a.push('反代 / 落地 IP：' + (s.proxyIP ? '已设置' : '无'));
+  a.push('地区反代：' + (s.relayMode || 'builtin') + (s.relayMode === 'custom' ? '（' + (s.relayCustom || 0) + ' 个）' : ''));
+  return a.join(' · ');
+}
+function checkProxy(){
+  var v = $('stProxy'), h = $('stProxyHint');
+  v.textContent = '检测中…'; v.className = 'v'; h.textContent = '';
+  api('proxy-status').then(function(r){
+    var d = r && r.ok && r.data;
+    if (!d){ v.textContent = '检测失败'; v.className = 'v bad'; return; }
+    if (!d.bound){
+      v.textContent = '未绑定（可选）';
+      h.textContent = '给面板 Worker 添加服务绑定：变量名 PROXY → 代理 Worker，入口 ProxyStatus，就能在这里看到代理是否在线与版本';
+      return;
+    }
+    if (!d.up){
+      v.textContent = '无法连接'; v.className = 'v bad';
+      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus，且代理已更新到 3.1.0 或更高版本';
+      return;
+    }
+    var t = '在线 · v' + (d.version || '?');
+    if (d.panelVersion && d.version && d.version !== d.panelVersion) t += '（面板 v' + d.panelVersion + '）';
+    v.textContent = t;
+    v.className = 'v ' + (d.ok ? 'ok' : 'bad');
+    h.textContent = d.ok ? proxySummary(d.settings) : '代理配置有问题：' + (d.problems || []).join(' ');
+  }).catch(function(){ v.textContent = '检测失败'; v.className = 'v bad'; });
 }
 function renderStatus(d){
   $('stEntry').textContent = location.origin + '/' + (d.path || '');

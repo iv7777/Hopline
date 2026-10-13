@@ -1,4 +1,4 @@
-/*!Hopline-proxy v3.0.0*/
+/*!Hopline-proxy v3.1.0*/
 // ============================================================================
 //  Hopline 代理 —— 只做一件事：在节点路径上接收 VLESS（WebSocket / XHTTP）并转发
 //  ----------------------------------------------------------------------------
@@ -15,9 +15,14 @@
 //    RELAY_REGION2    builtin 的次选地区（同上；留空自动，none = 不使用）
 //    RELAY_CUSTOM     custom 的反代列表（最多 3 个 host[:port]，换行或逗号分隔）
 //  VLESS 的 WebSocket 与 XHTTP 两种传输始终同时启用。
+//  另有一个只读的 RPC 入口 ProxyStatus（status()）：面板 Worker 可通过服务绑定调用它查看代理是否在线与版本；
+//  它不是 HTTP 路由，公网访问不到，也不返回任何密钥（见 proxy-router.js）。
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
+import { WorkerEntrypoint } from 'cloudflare:workers';
 
+// 版本号：两个脚本共用（面板用于检测更新与显示；代理只通过服务绑定的 status() 报告）
+const VERSION = '3.1.0';
 // ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
@@ -1495,3 +1500,26 @@ export default {
     return helloPage();
   }
 };
+
+// 只读状态入口：面板 Worker 通过服务绑定（入口名 ProxyStatus）调用 status()，没有 HTTP 路由，公网访问不到。
+// 只返回「是否在线 / 版本 / 配置问题 / 非敏感的设置摘要」，绝不返回 UUID、路径、反代地址或出站代理的主机与密码
+export class ProxyStatus extends WorkerEntrypoint {
+  async status() {
+    const cfg = proxyConfig(this.env);
+    const out = cfg.outboundProxy ? parseProxyAddress(cfg.outboundProxy) : null;
+    return {
+      ok: cfg._problems.length === 0,
+      version: VERSION,
+      problems: cfg._problems,
+      settings: {
+        proxyIP: !!cfg.proxyIP,
+        outboundProxy: out ? out.type : '',
+        outboundMode: cfg.outboundMode,
+        relayMode: cfg.relay.mode,
+        relayRegion: cfg.relay.region,
+        relayRegion2: cfg.relay.region2,
+        relayCustom: cfg.relay.custom ? cfg.relay.custom.split('\n').length : 0,
+      },
+    };
+  }
+}

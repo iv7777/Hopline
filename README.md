@@ -15,8 +15,10 @@
 | 代理 | **多协议** | VLESS 的 WebSocket 与 XHTTP 两种传输始终同时启用，没有开关 |
 | 代理 | **落地与出站** | 反代 / 落地 IP（填写后作为固定出口优先使用）+ 出站代理（SOCKS5 / HTTP(S) / Shadowsocks）+ 出站模式（默认 / 直连优先 / 仅走代理）；直连与出站都不通时由地区反代兜底 |
 | 代理 | **地区反代** | 直连不通时使用：内置（按 Worker 机房自动选，可固定首选 / 次选地区）/ 仅使用自己的反代列表 / 关闭 |
+| 代理 | **只读状态入口** | 一个只能通过服务绑定调用的 RPC 入口 `ProxyStatus.status()`，返回是否在线、版本、配置问题与非敏感的设置摘要；不是 HTTP 路由，公网访问不到 |
 | 代理 | **路径伪装** | 只有节点路径上的 WebSocket 升级与 XHTTP POST 进入代理，其余一律返回 `Hello World !` 页面 |
 | 面板 | **图形化面板** | 仪表盘 / 节点配置 / 优选配置 / 面板设置 / 关于项目，保存即生效，主题默认跟随系统，也可一键切换日间 / 夜间（见「四、面板使用」） |
+| 面板 | **代理状态** | 给面板 Worker 加一个服务绑定 `PROXY`（指向代理 Worker、入口 `ProxyStatus`），仪表盘「运行状态」就显示代理是否在线与版本；可选，不绑定不影响任何功能 |
 | 面板 | **代理端点** | 在「面板设置」填入代理的域名、UUID 与节点路径，订阅里的节点就指向它 |
 | 面板 | **协议下发** | VLESS / XHTTP 两种节点各自独立开关，决定订阅里下发哪些节点（代理本身始终两种都接受） |
 | 面板 | **地址来源** | 原生地址、优选域名、在线优选 IP（HostMonit / uouin / 微测网 / 自定义 API），各自独立开关（见「五、地址来源与优选」） |
@@ -71,7 +73,8 @@
 
 3. 创建一个 **KV 命名空间**，在面板 Worker 里绑定，**变量名必须是 `CONFIG_KV`**。不绑定 KV 的话面板无法保存配置
 4. （可选）给面板 Worker 也添加自定义域名
-5. 访问 `https://面板域名/<PATH>`，用用户名 `admin`（默认）和 `ADMIN` 密码登录
+5. （可选）**代理状态**：面板 Worker → **设置 → 绑定 → 添加 → 服务绑定**（Service binding），变量名填 `PROXY`，服务选择代理 Worker，**入口（Entrypoint）填 `ProxyStatus`**，保存并部署。要求两个 Worker 在同一个 Cloudflare 账号里，代理脚本为 3.1.0 或更高版本；Pages 部署不支持指定入口，因此这项只适用于 Workers 部署
+6. 访问 `https://面板域名/<PATH>`，用用户名 `admin`（默认）和 `ADMIN` 密码登录
 
 ### 2.4 填写代理端点
 
@@ -101,7 +104,7 @@
 ### 2.6 更新
 
 1. 取最新的脚本，**覆盖粘贴**到对应的 Worker 里并部署；环境变量与 KV 里的配置原样保留，无需重新设置。两个脚本之间只通过 `vless://` 链接联系，没有版本兼容问题，可以分别更新；代理脚本很少需要更新
-2. 面板里点击版本号可检测更新：读取仓库 `main` 分支的 `Hopline-panel.js` 比对版本号，有新版本时把它的内容复制到剪贴板（只检测面板脚本，代理脚本没有面板，也不暴露版本）
+2. 面板里点击版本号可检测更新：读取仓库 `main` 分支的 `Hopline-panel.js` 比对版本号，有新版本时把它的内容复制到剪贴板（只检测面板脚本；代理脚本的版本通过 `PROXY` 服务绑定在「运行状态」里查看）。提示「仓库 main 分支上没有 Hopline-panel.js（HTTP 404）」说明这个文件还不在 `main` 上——新版本尚未合并发布，或仓库不是公开的（`raw.githubusercontent.com` 不带凭据，私有仓库一律 404）
 
 ### 2.7 从 2.x（一体版）升级
 
@@ -123,6 +126,8 @@
 | 保存时报错 / 无法保存 | 面板没有绑定 KV，变量名必须是 `CONFIG_KV` |
 | 面板顶部提示「尚未填写代理端点」 / 订阅返回 400 | 到「面板设置 → 代理端点」填好代理域名、UUID 与节点路径并保存 |
 | 节点连不上 | 检查面板里的代理域名、代理 UUID、代理节点路径是否与代理脚本的域名、`UUID`、`PATH` 完全一致 |
+| 检测更新提示「仓库 main 分支上没有 Hopline-panel.js（HTTP 404）」 | 该文件不在仓库 `main` 分支上：3.x 的拆分版本还没有合并到 `main`，或仓库是私有的。合并发布后即恢复；在此之前可直接从对应分支取脚本部署 |
+| 仪表盘「代理状态」显示「无法连接」 | 检查面板 Worker 的服务绑定：变量名必须是 `PROXY`，入口必须是 `ProxyStatus`，两个 Worker 在同一账号，代理脚本版本 ≥ 3.1.0；提示「does not implement the method」通常是入口没填 |
 | 客户端更新订阅提示「无效订阅」 | `*.workers.dev` 域名可能被限制，给面板绑定自定义域名，或让客户端通过代理更新订阅 |
 | 登录后过一段时间被退出 | 24 小时未使用面板自动退出，最长 7 天需重新登录 |
 | 改了代理的 `PATH` 后节点连不上 | 同步修改面板里的「代理节点路径」，客户端重新更新订阅 |
@@ -164,6 +169,7 @@
 | `NODE_PATH` | 代理节点路径 | 可选，「代理节点路径」的默认值，须与代理脚本的 `PATH` 相同；同样以面板为准、留空回退 |
 | `ENABLE_ECH` | true / 1 | 启用 ECH 加密客户端握手（开启后自动仅 TLS 端口） |
 | `ALPN` | h2 / http/1.1 | ALPN 协商（逗号分隔），VLESS / XHTTP 链接、Clash、Sing-box 均按此下发；留空时 ws 用 http/1.1、XHTTP 用 h2 |
+| `PROXY`（服务绑定，不是文本变量） | 指向代理 Worker、入口 `ProxyStatus` | 可选。绑定后仪表盘「运行状态」显示代理是否在线与版本，见 2.3 第 5 步 |
 
 ### 3.3 面板配置项（保存于 KV，也是 `/api/config` 的字段名）
 
@@ -264,6 +270,7 @@
 - **内嵌页面**：面板页面、登录页与 Clash 模板都内嵌在 `Hopline-panel.js` 里，运行时不从 GitHub / jsDelivr 拉取任何代码或页面，没有第三方内容被当作页面执行（浏览器只加载带 SRI 校验的二维码脚本）
 - **路径与 UUID 鉴权**：面板脚本里请求路径与 `PATH` 一致才进入面板；代理脚本里请求路径与 `PATH` 一致才进入代理，VLESS 头部的 UUID 与 `UUID` 一致才转发；订阅别名路径只输出订阅
 - **路径伪装**：路径不对（根路径、未知路由）时两个脚本都返回 200 的 `Hello World !` 页面，不暴露部署；面板的 `/login`、`/version` 只对知道面板路径的人可用，否则返回 404。代理上没有 `/login`、`/api`、`/sub` 等任何路由，也看不出它和面板有关
+- **状态入口只读且不公开**：`ProxyStatus.status()` 只能由绑定了它的 Worker 调用，没有 HTTP 路由；只返回在线 / 版本 / 配置问题 / 设置摘要（有无反代 IP、出站代理的类型、地区反代模式），不返回 UUID、路径、反代地址或出站代理的主机与密码；代理的任何公开响应里都没有版本号
 - **拆分带来的隔离**：代理脚本不含面板、登录、订阅与管理接口的任何代码，没有 KV，也不访问 GitHub；面板脚本不含任何代理代码（没有 `cloudflare:sockets`、WebSocket 与出站连接）。两者只通过 `vless://` 链接联系
 - **Clash 本地凭据**：订阅里的 Shadowsocks 入站密码、认证与 API secret 按 UUID 为每个部署派生，不使用公开的默认密码
 - **配置存储保护**：配置读取走 KV 边缘缓存（30 秒）；KV 读取失败或配置损坏时拒绝保存，面板与订阅按环境变量 + 默认值工作，避免用默认值覆盖已有配置
@@ -278,7 +285,7 @@
 |---|---|
 | `src/proxy-worker.js` | 代理入口：环境变量说明与 `// @include worker/xxx.js` 清单，构建时按顺序拼接成 `Hopline-proxy.js` |
 | `src/panel-worker.js` | 面板入口：同上，拼接成 `Hopline-panel.js` |
-| `src/worker/*.js` | 按主题拆分的逻辑。**代理专用**：`protocol`（VLESS 头、UDP DNS→DoH）、`outbound-proxies` / `relay`（出站与反代）、`proxy`（WS / XHTTP）、`proxy-config`（环境变量配置）、`proxy-router`（路由）；**面板专用**：`config-schema`（字段表 `CONFIG_SCHEMA`）、`config`（加载 / 保存）、`ip-sources` / `nodes`（优选来源与节点生成）、`formats`（各客户端格式）、`subscription`、`pages`（内嵌页面）、`router`（鉴权、路由、管理 API）、`update`（版本与检测更新）、`hashes`、`constants`；**两者共用**：`utils`、`cf-ranges`（Cloudflare 地址段）、`doh` |
+| `src/worker/*.js` | 按主题拆分的逻辑（`version` 是两个脚本共用的版本号）。**代理专用**：`protocol`（VLESS 头、UDP DNS→DoH）、`outbound-proxies` / `relay`（出站与反代）、`proxy`（WS / XHTTP）、`proxy-config`（环境变量配置）、`proxy-router`（路由）；**面板专用**：`config-schema`（字段表 `CONFIG_SCHEMA`）、`config`（加载 / 保存）、`ip-sources` / `nodes`（优选来源与节点生成）、`formats`（各客户端格式）、`subscription`、`pages`（内嵌页面）、`router`（鉴权、路由、管理 API）、`update`（版本与检测更新）、`hashes`、`constants`；**两者共用**：`utils`、`cf-ranges`（Cloudflare 地址段）、`doh` |
 | `src/panel/panel.html` | 管理面板页面结构（`@include` 引入样式与脚本） |
 | `src/panel/panel.css` | 面板样式（日间 / 夜间主题） |
 | `src/panel/panel.js` | 面板前端脚本（由字段表驱动的表单回填、收集、校验与错误提示） |
@@ -316,6 +323,13 @@ npm run lint            # eslint 静态检查（通过 npx 获取，仓库本身
 ---
 
 ## 更新日志
+
+### V3.1.0
+
+- **代理状态（服务绑定）**：代理脚本新增只读 RPC 入口 `ProxyStatus`（`status()`），面板 Worker 加一个名为 `PROXY` 的服务绑定（入口 `ProxyStatus`）后，仪表盘「运行状态」显示代理是否在线、版本（与面板版本不同时标注）、配置问题与非敏感的设置摘要，并可随时「检测代理」。该入口没有 HTTP 路由，不返回任何密钥，代理的公开响应里仍然没有版本号；不绑定则一切照旧。需要同一账号下的两个 Workers 部署
+- 两个脚本共用 `src/worker/version.js` 里的版本号
+- **修复：检测更新提示「HTTP 404」不清楚**：该提示的原因是仓库 `main` 分支上没有 `Hopline-panel.js`（拆分版本尚未合并发布，或仓库不是公开的）。现在会明确说明这一点；合并发布到 `main` 后检测恢复正常
+- 混淆版代理脚本保留入口名 `ProxyStatus`（有测试覆盖）
 
 ### V3.0.0
 

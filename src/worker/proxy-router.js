@@ -25,3 +25,26 @@ export default {
     return helloPage();
   }
 };
+
+// 只读状态入口：面板 Worker 通过服务绑定（入口名 ProxyStatus）调用 status()，没有 HTTP 路由，公网访问不到。
+// 只返回「是否在线 / 版本 / 配置问题 / 非敏感的设置摘要」，绝不返回 UUID、路径、反代地址或出站代理的主机与密码
+export class ProxyStatus extends WorkerEntrypoint {
+  async status() {
+    const cfg = proxyConfig(this.env);
+    const out = cfg.outboundProxy ? parseProxyAddress(cfg.outboundProxy) : null;
+    return {
+      ok: cfg._problems.length === 0,
+      version: VERSION,
+      problems: cfg._problems,
+      settings: {
+        proxyIP: !!cfg.proxyIP,
+        outboundProxy: out ? out.type : '',
+        outboundMode: cfg.outboundMode,
+        relayMode: cfg.relay.mode,
+        relayRegion: cfg.relay.region,
+        relayRegion2: cfg.relay.region2,
+        relayCustom: cfg.relay.custom ? cfg.relay.custom.split('\n').length : 0,
+      },
+    };
+  }
+}

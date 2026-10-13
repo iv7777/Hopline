@@ -7,10 +7,13 @@ import assert from 'node:assert/strict';
 
 import { register } from 'node:module';
 
-// cloudflare:sockets 仅存在于 Workers 运行时：测试中替换为不可用的桩
+// cloudflare:sockets / cloudflare:workers 仅存在于 Workers 运行时：测试中替换为桩
 const hooks = `
 
 export async function resolve(spec, ctx, next) {
+  if (spec === 'cloudflare:workers') {
+    return { url: 'data:text/javascript,export class WorkerEntrypoint { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }', shortCircuit: true };
+  }
   if (spec === 'cloudflare:sockets') {
     // 默认不可用；出站测试通过 globalThis.__connect 注入可控的假连接
     return { url: 'data:text/javascript,export function connect(a){ if (globalThis.__connect) return globalThis.__connect(a); throw new Error("sockets unavailable in tests"); }', shortCircuit: true };
@@ -22,7 +25,8 @@ register('data:text/javascript,' + encodeURIComponent(hooks));
 // 外网一律离线（DoH 等由各用例用 withFetch 注入）
 globalThis.fetch = async () => { throw new Error('offline in tests'); };
 
-const worker = (await import('../Hopline-proxy.js')).default;
+const proxyModule = await import('../Hopline-proxy.js');
+const worker = proxyModule.default;
 
 const UUID = '11111111-2222-4333-8444-555555555555';
 const baseEnv = (extra = {}) => ({ UUID, PATH: UUID, ...extra });   // 代理只需要 UUID 与 PATH 两个环境变量；路径取 UUID 的值，使 /<UUID> 即节点入口
@@ -495,8 +499,8 @@ import { assemble } from '../build.mjs';
 // 去掉 import / export default 后在函数作用域内求值，取出要测的纯函数
 const internals = (() => {
   const src = assemble('proxy')
-    .replace(/^import .*$/m, '').replace('export default {', 'const __default = {');
-  return new Function('connect', src + '\n;return { md5Bytes, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVssProtoHeader, isValidIp, parseProxyAddress, relayPlan, RELAY_DOMAINS, proxyConfig, pumpReadable };')(() => { throw new Error('no sockets'); });
+    .replace(/^import .*$/gm, '').replace('export default {', 'const __default = {').replace('export class ', 'class ');
+  return new Function('connect', 'WorkerEntrypoint', src + '\n;return { md5Bytes, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVssProtoHeader, isValidIp, parseProxyAddress, relayPlan, RELAY_DOMAINS, proxyConfig, pumpReadable };')(() => { throw new Error('no sockets'); }, class { constructor(ctx, env) { this.ctx = ctx; this.env = env; } });
 })();
 
 const hex = (u8) => Buffer.from(u8).toString('hex');
@@ -896,4 +900,50 @@ test('构建产物：代理脚本不含面板 / 登录 / 订阅 / 管理接口 /
   for (const needle of ['hopline_auth', '/api/', 'CONFIG_KV', 'loginHTML', 'generateSubscription', 'raw.githubusercontent.com', 'clash-template', 'PBKDF2', 'ADMIN']) {
     assert.ok(!code.includes(needle), needle);
   }
+});
+
+// ---------------- 只读状态入口 ProxyStatus（服务绑定） ----------------
+import { VERSION_FOR_TEST } from './helpers-version.mjs';
+
+test('ProxyStatus.status()：在线与否、版本、配置问题与非敏感的设置摘要；不返回 UUID / 路径 / 反代地址 / 出站代理的主机与密码', async () => {
+  assert.equal(typeof proxyModule.ProxyStatus, 'function');
+  const env = baseEnv({ PATH: 'secret-node-path', PROXYIP: 'relay.private.example:8443', OUTBOUND_PROXY: 'socks5://alice:hunter2@10.9.8.7:1080', OUTBOUND_MODE: 'only', RELAY_MODE: 'custom', RELAY_CUSTOM: 'a.example\nb.example' });
+  const st = await new proxyModule.ProxyStatus({}, env).status();
+  assert.equal(st.ok, true);
+  assert.equal(st.version, VERSION_FOR_TEST);
+  assert.deepEqual(st.problems, []);
+  assert.deepEqual(st.settings, { proxyIP: true, outboundProxy: 'socks5', outboundMode: 'only', relayMode: 'custom', relayRegion: '', relayRegion2: '', relayCustom: 2 });
+  const text = JSON.stringify(st);
+  for (const secret of [UUID, 'secret-node-path', 'relay.private.example', 'alice', 'hunter2', '10.9.8.7', 'a.example']) assert.ok(!text.includes(secret), secret);
+  // 默认设置
+  const d = await new proxyModule.ProxyStatus({}, baseEnv()).status();
+  assert.deepEqual(d.settings, { proxyIP: false, outboundProxy: '', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 });
+  // 配置有问题时仍在线，但 ok 为 false 并列出原因
+  const bad = await new proxyModule.ProxyStatus({}, {}).status();
+  assert.equal(bad.ok, false);
+  assert.equal(bad.version, VERSION_FOR_TEST);
+  assert.equal(bad.problems.length, 2);
+});
+
+test('状态只能通过服务绑定读取：没有任何 HTTP 路由能拿到版本或状态，公开响应里没有版本号', async () => {
+  const env = baseEnv({ PATH: 'mynode' });
+  for (const path of ['/', '/status', '/version', '/ProxyStatus', '/mynode', '/mynode/status', '/mynode/version', '/api/status']) {
+    for (const init of [{}, { method: 'POST', body: 'x' }, { headers: { 'User-Agent': 'Mozilla/5.0' } }]) {
+      if (path === '/mynode' && init.method === 'POST') continue;   // 节点路径上的 POST 是 XHTTP 入口，不是伪装页
+      const res = await worker.fetch(new Request('https://node.example.com' + path, init), env, {});
+      const body = await res.text();
+      assert.equal(res.status, 200, path);
+      assert.match(body, /Hello World/, path);
+      assert.ok(!body.includes(VERSION_FOR_TEST), path);
+    }
+  }
+  assert.deepEqual(Object.keys(proxyModule).sort(), ['ProxyStatus', 'default'], '模块只导出默认入口与 ProxyStatus');
+});
+
+test('混淆版代理脚本保留入口名 ProxyStatus（服务绑定按名字找入口）', async () => {
+  const obf = await import('../obf_Hopline-proxy.js?obf-test');
+  assert.deepEqual(Object.keys(obf).sort(), ['ProxyStatus', 'default']);
+  const st = await new obf.ProxyStatus({}, baseEnv()).status();
+  assert.equal(st.ok, true);
+  assert.equal(st.version, VERSION_FOR_TEST);
 });

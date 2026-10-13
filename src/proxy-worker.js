@@ -14,9 +14,13 @@
 //    RELAY_REGION2    builtin 的次选地区（同上；留空自动，none = 不使用）
 //    RELAY_CUSTOM     custom 的反代列表（最多 3 个 host[:port]，换行或逗号分隔）
 //  VLESS 的 WebSocket 与 XHTTP 两种传输始终同时启用。
+//  另有一个只读的 RPC 入口 ProxyStatus（status()）：面板 Worker 可通过服务绑定调用它查看代理是否在线与版本；
+//  它不是 HTTP 路由，公网访问不到，也不返回任何密钥（见 proxy-router.js）。
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
+import { WorkerEntrypoint } from 'cloudflare:workers';
 
+// @include worker/version.js
 // @include worker/utils.js
 // @include worker/cf-ranges.js
 // @include worker/protocol.js

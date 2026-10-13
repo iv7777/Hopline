@@ -1,4 +1,4 @@
-/*!Hopline-panel v3.0.0*/
+/*!Hopline-panel v3.1.0*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -14,10 +14,13 @@
 //    NODE_PATH       代理节点路径的默认值（须与代理脚本的 PATH 相同）；面板里填写后以面板为准
 //    ENABLE_ECH      设为 true/1 开启 ECH 加密
 //    ALPN            自定义 ALPN 协商
+//  服务绑定（可选）：
+//    PROXY           指向代理 Worker、入口（entrypoint）为 ProxyStatus 的服务绑定；绑定后面板的「运行状态」显示代理是否在线与版本
 // ============================================================================
-const VERSION = '3.0.0';
+// 版本号：两个脚本共用（面板用于检测更新与显示；代理只通过服务绑定的 status() 报告）
+const VERSION = '3.1.0';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
-// 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，也不暴露版本）
+// 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
 const UPDATE_FILE = 'Hopline-panel.js';
 let UPDATE_CACHE = null; // { t, r } 60 秒缓存
@@ -47,6 +50,8 @@ function updateFileUrl(name){
 async function fetchRepoFile(name){
   try {
     const res = await fetch(updateFileUrl(name), { headers: { 'User-Agent': 'Mozilla/5.0 (Hopline)' } });
+    // 404：main 上没有这个文件——常见于新版本还没合并发布到 main，或仓库不是公开的（raw.githubusercontent.com 不带凭据，私有仓库一律 404）
+    if (res.status === 404) return { error: '仓库 main 分支上没有 ' + name + '（HTTP 404）：新版本可能还没有合并发布到 main，或仓库不是公开的' };
     if (!res.ok) return { error: name + ' HTTP ' + res.status };
     const txt = await res.text();
     return { txt, version: extractVersion(txt) };
@@ -2697,6 +2702,8 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
         <div class="kv"><span class="k">协议</span><span class="v" id="stProto">—</span></div>
         <div class="kv"><span class="k">KV 持久化</span><span class="v" id="stKv">—</span></div>
         <div class="kv"><span class="k">面板入口</span><span class="v" id="stEntry">—</span></div>
+        <div class="kv"><span class="k">代理状态</span><span class="v" id="stProxy">—</span></div>
+        <div class="inrow" style="margin-top:10px;align-items:center"><button class="btn sm" onclick="checkProxy()">检测代理</button><span class="hint" id="stProxyHint" style="margin:0"></span></div>
       </div>
     </section>
 
@@ -3040,6 +3047,7 @@ function loadAll(){
   api('status').then(function(r){
     if (r && r.ok) renderStatus(r.data);
   }).catch(function(){});
+  checkProxy();
   api('config').then(function(r){
     if (r && r.ok){
       CFG = r.data;
@@ -3064,6 +3072,39 @@ function setConn(ok){
   var p = $('connPill');
   p.className = 'pill ' + (ok ? '' : 'off');
   $('connText').textContent = ok ? '运行中' : '无法连接';
+}
+
+function proxySummary(s){
+  s = s || {};
+  var a = [];
+  a.push('出站代理：' + (s.outboundProxy || '无'));
+  if (s.outboundMode) a.push('出站方式：' + s.outboundMode);
+  a.push('反代 / 落地 IP：' + (s.proxyIP ? '已设置' : '无'));
+  a.push('地区反代：' + (s.relayMode || 'builtin') + (s.relayMode === 'custom' ? '（' + (s.relayCustom || 0) + ' 个）' : ''));
+  return a.join(' · ');
+}
+function checkProxy(){
+  var v = $('stProxy'), h = $('stProxyHint');
+  v.textContent = '检测中…'; v.className = 'v'; h.textContent = '';
+  api('proxy-status').then(function(r){
+    var d = r && r.ok && r.data;
+    if (!d){ v.textContent = '检测失败'; v.className = 'v bad'; return; }
+    if (!d.bound){
+      v.textContent = '未绑定（可选）';
+      h.textContent = '给面板 Worker 添加服务绑定：变量名 PROXY → 代理 Worker，入口 ProxyStatus，就能在这里看到代理是否在线与版本';
+      return;
+    }
+    if (!d.up){
+      v.textContent = '无法连接'; v.className = 'v bad';
+      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus，且代理已更新到 3.1.0 或更高版本';
+      return;
+    }
+    var t = '在线 · v' + (d.version || '?');
+    if (d.panelVersion && d.version && d.version !== d.panelVersion) t += '（面板 v' + d.panelVersion + '）';
+    v.textContent = t;
+    v.className = 'v ' + (d.ok ? 'ok' : 'bad');
+    h.textContent = d.ok ? proxySummary(d.settings) : '代理配置有问题：' + (d.problems || []).join(' ');
+  }).catch(function(){ v.textContent = '检测失败'; v.className = 'v bad'; });
 }
 function renderStatus(d){
   $('stEntry').textContent = location.origin + '/' + (d.path || '');
@@ -3868,6 +3909,22 @@ function formatConfigErrors(errors) {
   return errors.map(e => (e.label ? e.label + '：' : '') + e.msg).join('；');
 }
 
+// 代理状态（服务绑定 PROXY → 代理 Worker 的 ProxyStatus 入口）：绑定缺失、调用失败或超时都不抛错，返回 { bound, up, ... } 给面板显示
+async function proxyStatus(env) {
+  const bound = env && env.PROXY;
+  if (!bound) return { bound: false };
+  try {
+    const r = await Promise.race([
+      bound.status(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('调用超时')), 4000)),
+    ]);
+    if (!r || typeof r !== 'object') throw new Error('返回内容不正确');
+    return { bound: true, up: true, ok: r.ok === true, version: String(r.version || ''), problems: Array.isArray(r.problems) ? r.problems.map(String) : [], settings: r.settings && typeof r.settings === 'object' ? r.settings : {}, panelVersion: VERSION };
+  } catch (e) {
+    return { bound: true, up: false, error: String((e && e.message) || e), panelVersion: VERSION };
+  }
+}
+
 // 生成订阅：/sub 与面板预览共用同一流程，保证预览与客户端实际拿到的一致
 async function serveSubscription(request, cfg, fmt) {
   const UA = request.headers.get('User-Agent') || '';
@@ -4023,6 +4080,9 @@ async function handleRequest(request, env, state) {
       }
       return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
     }
+
+    // 代理状态：通过服务绑定 PROXY（入口 ProxyStatus）读取代理的在线状态与版本；没绑定就只返回 bound:false，面板其它功能不受影响
+    if (apiName === 'proxy-status') return json({ ok: true, data: await proxyStatus(env) });
 
     if (apiName === 'logout') {
       if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);

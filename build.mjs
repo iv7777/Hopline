@@ -11,7 +11,7 @@
 //   1. 合并入口文件中的  // @include worker/xxx.js  （保持模块级顺序，保留注释与原始名称）
 //   2. /* @inline 文件 */ '' 占位符替换为 String.raw 模板字符串：登录页、面板页面（HTML / CSS / JS 合并并按语言各自去掉注释，
 //      保留 @HOPLINE_ 占位注释）和 Clash 配置模板
-//   3. 顶部加一行版本横幅 /*!Hopline-proxy vX.Y.Z*/ / /*!Hopline-panel vX.Y.Z*/（版本号取自 src/worker/update.js 的 VERSION，两者同号）
+//   3. 顶部加一行版本横幅 /*!Hopline-proxy vX.Y.Z*/ / /*!Hopline-panel vX.Y.Z*/（版本号取自 src/worker/version.js 的 VERSION，两者同号）
 //
 // 产物不经压缩/重命名：内容即 src/ 原样拼接。代理脚本如需混淆发布，见 obfuscate.mjs（面板脚本不提供混淆版）。
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
@@ -25,7 +25,7 @@ export const TARGETS = {
   proxy: { entry: 'proxy-worker.js', out: 'Hopline-proxy.js', banner: 'Hopline-proxy' },
   panel: { entry: 'panel-worker.js', out: 'Hopline-panel.js', banner: 'Hopline-panel' },
 };
-const VERSION_FILE = join(SRC, 'worker', 'update.js');   // VERSION 常量所在文件（面板脚本包含它；两个产物共用同一个版本号）
+const VERSION_FILE = join(SRC, 'worker', 'version.js');   // VERSION 常量所在文件（两个脚本都包含它，共用同一个版本号）
 const KEEP_COMMENT = /@HOPLINE_/;          // 内联面板代码时唯一保留的注释（运行时占位符）
 
 function read(path) {
@@ -133,7 +133,7 @@ export function assemble(kind = 'panel') {
 
 export function versionOf() {
   const m = read(VERSION_FILE).match(/const\s+VERSION\s*=\s*['"]([^'"]+)['"]/);
-  if (!m) throw new Error('未在 src/worker/update.js 中找到 VERSION');
+  if (!m) throw new Error('未在 src/worker/version.js 中找到 VERSION');
   return m[1];
 }
 

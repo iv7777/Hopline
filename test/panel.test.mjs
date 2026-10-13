@@ -3,6 +3,7 @@
 // 用内存 Map 模拟 KV、桩替换外网 fetch。运行：npm test
 import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
+import { VERSION_FOR_TEST } from './helpers-version.mjs';
 
 import assert from 'node:assert/strict';
 
@@ -1078,6 +1079,65 @@ test('KV 读取失败：用环境变量的默认值照常出订阅，保存与�
   const after = await (await call(env, `/${UUID}/api/config`, { cookie })).json();
   assert.equal(after.data.alpn, 'h2');
   assert.equal(after.data.kvError, '');
+});
+
+test('检测更新：仓库 main 上没有 Hopline-panel.js（404）时给出明确原因，而不是只说 HTTP 404；其它错误码照旧', async () => {
+  const realNow = Date.now;
+  Date.now = () => realNow() + 10 * 60 * 1000;   // 越过其它用例留在模块里的 60 秒更新缓存
+  const env = baseEnv();
+  const cookie = await login(env);
+  const offline = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response('404: Not Found', { status: 404 });
+    const r = await (await call(env, `/${UUID}/api/update`, { cookie })).json();
+    assert.equal(r.ok, true);
+    assert.equal(r.data.hasUpdate, false);
+    assert.equal(r.data.latest, null);
+    assert.match(r.data.error, /仓库 main 分支上没有 Hopline-panel\.js（HTTP 404）/);
+    assert.match(r.data.error, /还没有合并发布到 main|不是公开的/);
+    globalThis.fetch = async () => new Response('boom', { status: 502 });
+    const r2 = await (await call(env, `/${UUID}/api/update`, { cookie })).json();
+    assert.equal(r2.data.error, 'Hopline-panel.js HTTP 502');
+  } finally { globalThis.fetch = offline; Date.now = realNow; }
+});
+
+test('代理状态 /api/proxy-status：需登录；没有服务绑定 PROXY 时返回 bound:false，面板其它功能不受影响', async () => {
+  const env = baseEnv();
+  assert.equal((await call(env, `/${UUID}/api/proxy-status`)).status, 403, '未登录');
+  const r = await (await call(env, `/${UUID}/api/proxy-status`, { cookie: await login(env) })).json();
+  assert.deepEqual(r, { ok: true, data: { bound: false } });
+});
+
+test('代理状态：绑定后显示在线与版本、非敏感设置摘要；代理配置有问题、调用失败、超时都不会让面板报错', async () => {
+  const get = async (proxy) => {
+    const env = baseEnv({ PROXY: proxy });
+    return (await (await call(env, `/${UUID}/api/proxy-status`, { cookie: await login(env) })).json()).data;
+  };
+  const up = await get({ status: async () => ({ ok: true, version: '9.9.9', problems: [], settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 } }) });
+  assert.deepEqual(up, { bound: true, up: true, ok: true, version: '9.9.9', problems: [], settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 }, panelVersion: VERSION_FOR_TEST });
+  const bad = await get({ status: async () => ({ ok: false, version: '3.1.0', problems: ['请设置环境变量 UUID（节点用户 ID）。'] }) });
+  assert.equal(bad.up, true); assert.equal(bad.ok, false); assert.deepEqual(bad.problems, ['请设置环境变量 UUID（节点用户 ID）。']);
+  const down = await get({ status: async () => { throw new Error('The RPC receiver does not implement the method "status".'); } });
+  assert.equal(down.bound, true); assert.equal(down.up, false); assert.match(down.error, /does not implement/);
+  const junk = await get({ status: async () => 'not an object' });
+  assert.equal(junk.up, false); assert.match(junk.error, /返回内容不正确/);
+  // 超时：状态调用一直不返回（把 4 秒的超时缩短到 5ms 来测）
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...a) => realSetTimeout(fn, ms === 4000 ? 5 : ms, ...a);
+  try {
+    const hung = await get({ status: () => new Promise(() => {}) });
+    assert.equal(hung.up, false); assert.match(hung.error, /调用超时/);
+  } finally { globalThis.setTimeout = realSetTimeout; }
+});
+
+test('面板页面有「代理状态」行与检测按钮；版本号两个脚本一致', async () => {
+  const env = baseEnv();
+  const html = await (await call(env, `/${UUID}`, { cookie: await login(env) })).text();
+  for (const id of ['stProxy', 'stProxyHint']) assert.ok(html.includes(`id="${id}"`), id);
+  assert.ok(html.includes('onclick="checkProxy()"') && html.includes('function checkProxy('));
+  const v = (f) => readFileSync(new URL(f, import.meta.url), 'utf8').match(/^\/\*!Hopline-\w+ v([\d.]+)\*\//)[1];
+  assert.equal(v('../Hopline-panel.js'), VERSION_FOR_TEST);
+  assert.equal(v('../Hopline-proxy.js'), VERSION_FOR_TEST);
 });
 
 test('KV 中的配置损坏（不是合法 JSON）：显示提示并禁止保存，但允许重置修复', async () => {

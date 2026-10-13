@@ -154,6 +154,22 @@ function formatConfigErrors(errors) {
   return errors.map(e => (e.label ? e.label + '：' : '') + e.msg).join('；');
 }
 
+// 代理状态（服务绑定 PROXY → 代理 Worker 的 ProxyStatus 入口）：绑定缺失、调用失败或超时都不抛错，返回 { bound, up, ... } 给面板显示
+async function proxyStatus(env) {
+  const bound = env && env.PROXY;
+  if (!bound) return { bound: false };
+  try {
+    const r = await Promise.race([
+      bound.status(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('调用超时')), 4000)),
+    ]);
+    if (!r || typeof r !== 'object') throw new Error('返回内容不正确');
+    return { bound: true, up: true, ok: r.ok === true, version: String(r.version || ''), problems: Array.isArray(r.problems) ? r.problems.map(String) : [], settings: r.settings && typeof r.settings === 'object' ? r.settings : {}, panelVersion: VERSION };
+  } catch (e) {
+    return { bound: true, up: false, error: String((e && e.message) || e), panelVersion: VERSION };
+  }
+}
+
 // 生成订阅：/sub 与面板预览共用同一流程，保证预览与客户端实际拿到的一致
 async function serveSubscription(request, cfg, fmt) {
   const UA = request.headers.get('User-Agent') || '';
@@ -309,6 +325,9 @@ async function handleRequest(request, env, state) {
       }
       return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
     }
+
+    // 代理状态：通过服务绑定 PROXY（入口 ProxyStatus）读取代理的在线状态与版本；没绑定就只返回 bound:false，面板其它功能不受影响
+    if (apiName === 'proxy-status') return json({ ok: true, data: await proxyStatus(env) });
 
     if (apiName === 'logout') {
       if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);

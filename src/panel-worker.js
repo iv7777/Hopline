@@ -13,7 +13,10 @@
 //    NODE_PATH       代理节点路径的默认值（须与代理脚本的 PATH 相同）；面板里填写后以面板为准
 //    ENABLE_ECH      设为 true/1 开启 ECH 加密
 //    ALPN            自定义 ALPN 协商
+//  服务绑定（可选）：
+//    PROXY           指向代理 Worker、入口（entrypoint）为 ProxyStatus 的服务绑定；绑定后面板的「运行状态」显示代理是否在线与版本
 // ============================================================================
+// @include worker/version.js
 // @include worker/update.js
 // @include worker/constants.js
 // @include worker/cf-ranges.js
