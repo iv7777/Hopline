@@ -102,7 +102,7 @@ function json(obj, status, headers) {
 
 // 路径不对（根路径、未知路由）时返回一个普通的 Hello World 页面作为伪装：
 // 看起来像个占位站点，既不暴露路径 / UUID，也不返回 404 引人注意
-function helloPage() {
+function stubPage() {
   return new Response('<!doctype html><html><head><meta charset="utf-8"><title>Hello World</title></head><body><h1>Hello World !</h1></body></html>',
     { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }

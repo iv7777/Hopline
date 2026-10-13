@@ -217,8 +217,8 @@ function setConn(ok){
   $('connText').textContent = ok ? '运行中' : '无法连接';
 }
 /* ===== 代理设置：通过服务绑定 PROXY 在线修改代理的 7 项出站 / 地区反代设置（保存在代理自己的 KV，不属于面板配置） ===== */
-var PROXY_FIELDS = { 'proxyIP': 's-proxyIP', 'outboundProxy': 's-outbound', 'outboundMode': 's-outmode', 'relay.mode': 'rl-mode', 'relay.region': 'rl-region', 'relay.region2': 'rl-region2', 'relay.custom': 'rl-custom' };
-var PROXY_ENV_NAMES = { 'proxyIP': 'PROXYIP', 'outboundProxy': 'OUTBOUND_PROXY', 'outboundMode': 'OUTBOUND_MODE', 'relay.mode': 'RELAY_MODE', 'relay.region': 'RELAY_REGION', 'relay.region2': 'RELAY_REGION2', 'relay.custom': 'RELAY_CUSTOM' };
+var PROXY_FIELDS = { 'edgeIP': 's-proxyIP', 'hopAddr': 's-outbound', 'hopMode': 's-outmode', 'alt.mode': 'rl-mode', 'alt.region': 'rl-region', 'alt.region2': 'rl-region2', 'alt.custom': 'rl-custom' };
+var PROXY_ENV_NAMES = { 'edgeIP': 'EDGEIP', 'hopAddr': 'HOP_ADDR', 'hopMode': 'HOP_MODE', 'alt.mode': 'ALT_MODE', 'alt.region': 'ALT_REGION', 'alt.region2': 'ALT_REGION2', 'alt.custom': 'ALT_CUSTOM' };
 var RELAY_ZH = { HK: '香港', US: '美国', SG: '新加坡', JP: '日本', KR: '韩国', DE: '德国', SE: '瑞典', NL: '荷兰', FI: '芬兰', GB: '英国' };
 function proxyNote(text, kind){
   var n = $('px-note');
@@ -255,10 +255,10 @@ function onRelayMode(){
 function fillProxy(d){
 
   clearProxyErrors();
-  [['rl-region', 'relay.region', '自动（按 Worker 机房）'], ['rl-region2', 'relay.region2', '自动（默认的另一地区）']].forEach(function(c){
+  [['rl-region', 'alt.region', '自动（按 Worker 机房）'], ['rl-region2', 'alt.region2', '自动（默认的另一地区）']].forEach(function(c){
     var el = $(c[0]);
     el.innerHTML = '';
-    var opts = c[1] === 'relay.region2' ? ['', 'none'].concat(d.regions || []) : [''].concat(d.regions || []);
+    var opts = c[1] === 'alt.region2' ? ['', 'none'].concat(d.regions || []) : [''].concat(d.regions || []);
     opts.forEach(function(o){
       var op = document.createElement('option');
       op.value = o;
@@ -288,7 +288,7 @@ function loadProxySettings(){
     }
     fillProxy(r.data);
     if (!r.data.storage){
-      proxyNote('代理没有绑定 KV（变量名 PROXY_KV），这些设置目前只读：显示的是代理环境变量里的值。给代理 Worker 绑定一个单独的 KV 命名空间后即可在这里修改。', 'err');
+      proxyNote('代理没有绑定 KV（变量名 NODE_KV），这些设置目前只读：显示的是代理环境变量里的值。给代理 Worker 绑定一个单独的 KV 命名空间后即可在这里修改。', 'err');
       return;
     }
     proxyNote(r.data.error === 'unavailable' ? '代理的 KV 暂时无法读取：下面显示的可能不是最新的设置，保存会被拒绝，稍后重新读取。' : (r.data.error === 'corrupt' ? '代理 KV 里保存的设置已损坏，已忽略；保存一次即可修复。' : '已连接代理，可以在线修改。'), r.data.error ? 'err' : '');
@@ -321,14 +321,14 @@ function resetProxySettings(){
   }).catch(function(){ toast('恢复失败：无法连接服务器', 'err'); });
 }
 
-/* ===== 代理状态：服务绑定 PROXY → 代理 Worker 的 ProxyStatus.status()（只读） ===== */
+/* ===== 代理状态：服务绑定 PROXY → 代理 Worker 的 NodeStatus.status()（只读） ===== */
 function proxySummary(s){
   s = s || {};
   var a = [];
-  a.push('出站代理：' + (s.outboundProxy || '无'));
-  if (s.outboundMode) a.push('出站方式：' + s.outboundMode);
-  a.push('反代 / 落地 IP：' + (s.proxyIP ? '已设置' : '无'));
-  a.push('地区反代：' + (s.relayMode || 'builtin') + (s.relayMode === 'custom' ? '（' + (s.relayCustom || 0) + ' 个）' : ''));
+  a.push('出站代理：' + (s.hopAddr || '无'));
+  if (s.hopMode) a.push('出站方式：' + s.hopMode);
+  a.push('反代 / 落地 IP：' + (s.edgeIP ? '已设置' : '无'));
+  a.push('地区反代：' + (s.altMode || 'builtin') + (s.altMode === 'custom' ? '（' + (s.altCustom || 0) + ' 个）' : ''));
   return a.join(' · ');
 }
 function checkProxy(){
@@ -339,17 +339,17 @@ function checkProxy(){
     if (!d){ v.textContent = '检测失败'; v.className = 'v bad'; return; }
     if (!d.bound){
       v.textContent = '未绑定（可选）';
-      h.textContent = '给面板 Worker 添加服务绑定：变量名 PROXY → 代理 Worker，入口 ProxyStatus（只读）或 ProxyControl（可在线修改代理设置），就能在这里看到代理是否在线与版本';
+      h.textContent = '给面板 Worker 添加服务绑定：变量名 PROXY → 代理 Worker，入口 NodeStatus（只读）或 NodeControl（可在线修改代理设置），就能在这里看到代理是否在线与版本';
       return;
     }
     if (!d.up){
       v.textContent = '无法连接'; v.className = 'v bad';
-      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus 或 ProxyControl，且代理已更新到 3.0.2 或更高版本';
+      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 NodeStatus 或 NodeControl，且代理已更新到 3.0.3 或更高版本';
       return;
     }
     v.textContent = '在线 · 代理 v' + (d.version || '?');
     v.className = 'v ' + (d.ok ? 'ok' : 'bad');
-    h.textContent = d.ok ? proxySummary(d.settings) + (d.control ? ' · 可在线修改（入口 ProxyControl' + (d.storage ? '，已绑定 KV' : '，代理未绑定 PROXY_KV') + '）' : ' · 只读入口（要在线修改请把入口改为 ProxyControl）') : '代理配置有问题：' + (d.problems || []).join(' ');
+    h.textContent = d.ok ? proxySummary(d.settings) + (d.control ? ' · 可在线修改（入口 NodeControl' + (d.storage ? '，已绑定 KV' : '，代理未绑定 NODE_KV') + '）' : ' · 只读入口（要在线修改请把入口改为 NodeControl）') : '代理配置有问题：' + (d.problems || []).join(' ');
   }).catch(function(){ v.textContent = '检测失败'; v.className = 'v bad'; });
 }
 function renderStatus(d){

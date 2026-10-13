@@ -76,7 +76,7 @@ test('GET /api/config 返回字段表默认值及派生信息；代理端点（�
   for (const k of ['optimizer', 'preferredDomains', 'preferredIPs']) assert.equal(k in d, false, `已移除的自定义订阅 / 随机优选配置 ${k}`);
   assert.equal(d.uuid, UUID);
   assert.deepEqual(d.endpointMissing, [], '代理端点三项都有值');
-  for (const k of ['proxyIP', 'outboundProxy', 'outboundMode', 'relay']) assert.equal(k in d, false, `出站 / 地区反代设置 ${k} 属于代理脚本，面板不再有`);
+  for (const k of ['edgeIP', 'hopAddr', 'hopMode', 'alt']) assert.equal(k in d, false, `出站 / 地区反代设置 ${k} 属于代理脚本，面板不再有`);
   assert.equal(d.path, UUID, '面板路径来自环境变量 PATH');
   assert.equal(d.panelPath, UUID);
   assert.equal(d.adminSet, true);
@@ -218,14 +218,14 @@ test('面板页面：代理端点三项在「面板设置」里，出站 / 落�
   const schema = JSON.parse(html.match(/var SCHEMA = (\[.*?\]) \|\| \[\];/s)[1]);
   const keys = schema.map(d => d.key);
   for (const k of ['host', 'uuid', 'nodePath']) assert.ok(keys.includes(k), k);
-  for (const k of ['proxyIP', 'outboundProxy', 'outboundMode', 'relay.mode', 'relay.region', 'relay.region2', 'relay.custom']) assert.ok(!keys.includes(k), `${k} 是代理的设置，不在面板的字段表里`);
+  for (const k of ['edgeIP', 'hopAddr', 'hopMode', 'alt.mode', 'alt.region', 'alt.region2', 'alt.custom']) assert.ok(!keys.includes(k), `${k} 是代理的设置，不在面板的字段表里`);
   // 页面里每个字段表登记的控件都存在（回填 / 收集依赖它）
   for (const d of schema) for (const id of [d.el, ...Object.values(d.els || {})].filter(Boolean)) assert.ok(html.includes(`id="${id}"`), `${d.key} → #${id}`);
 });
 
 test('构建产物：面板脚本不含任何代理代码（sockets、WebSocket、XHTTP、出站、VLESS 头解析），也不再从网络拉取面板页面或 Clash 模板', () => {
   const code = readFileSync(new URL('../Hopline-panel.js', import.meta.url), 'utf8');
-  for (const needle of ['cloudflare:sockets', 'WebSocketPair', 'handleWebSocketProxy', 'handleXhttpProxy', 'openOutbound', 'connectViaSocks5', 'parseVssProtoHeader', 'RELAY_DOMAINS', 'proxyip.hk.cmliussss.net', 'assetFromNetwork', 'sha256Hex', 'IS_OBFUSCATED', 'dist/panel.html', 'clash-template.yaml']) {
+  for (const needle of ['cloudflare:sockets', 'WebSocketPair', 'handleWsProto', 'handleXhtProto', 'openUpstream', 'connectViaS5', 'parseVssProtoHeader', 'ALT_DOMAINS', 'proxyip.hk', 'assetFromNetwork', 'sha256Hex', 'IS_OBFUSCATED', 'dist/panel.html', 'clash-template.yaml']) {
     assert.ok(!code.includes(needle), needle);
   }
   assert.match(code, /^\/\*!Hopline-panel v\d+\.\d+\.\d+\*\//);
@@ -341,9 +341,9 @@ test('环境变量：使用当前名称；旧版短变量名（U / D / S / K / E
   assert.equal(a.uuid, UUID2); assert.equal(a.host, 'Node.Example.com'); assert.equal(a.nodePath, 'np'); assert.equal(a.alpn, 'h2'); assert.equal(a.ech, true);
   assert.deepEqual(a.endpointMissing, []);
   assert.equal(a.envLocked.path, 'PATH');
-  // 旧名称被忽略：代理端点未填写（不再自动生成 UUID），ECH 保持默认；代理的出站设置（OUTBOUND_PROXY 等）面板不再读取
-  const b = await read({ ...base, PATH: 'p1', U: UUID2, OUTBOUND: 'socks5://2.2.2.2:2', OUTBOUND_PROXY: 'socks5://3.3.3.3:3', S: 'socks5://3.3.3.3:3', ECH: 'true' }, 'p1');
-  assert.equal(b.uuid, ''); assert.equal('outboundProxy' in b, false); assert.equal(b.ech, false);
+  // 旧名称被忽略：代理端点未填写（不再自动生成 UUID），ECH 保持默认；代理的出站设置（HOP_ADDR 等）面板不再读取
+  const b = await read({ ...base, PATH: 'p1', U: UUID2, OUTBOUND: 'socks5://2.2.2.2:2', HOP_ADDR: 'socks5://3.3.3.3:3', S: 'socks5://3.3.3.3:3', ECH: 'true' }, 'p1');
+  assert.equal(b.uuid, ''); assert.equal('hopAddr' in b, false); assert.equal(b.ech, false);
   assert.deepEqual(b.endpointMissing, ['代理域名', '代理 UUID', '代理节点路径']);
   // 旧名 D / admin 不再提供 PATH / ADMIN：面板仍未配置，无法登录
   const unconfigured = baseEnv({ PATH: undefined, ADMIN: undefined, D: 'oldpath', admin: 'pw', CONFIG_KV: kv() });
@@ -1114,8 +1114,8 @@ test('代理状态：绑定后显示在线与版本、非敏感设置摘要；�
     const env = baseEnv({ PROXY: proxy });
     return (await (await call(env, `/${UUID}/api/proxy-status`, { cookie: await login(env) })).json()).data;
   };
-  const up = await get({ status: async () => ({ ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 } }) });
-  assert.deepEqual(up, { bound: true, up: true, ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 } });
+  const up = await get({ status: async () => ({ ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { edgeIP: true, hopAddr: 'socks5', hopMode: '', altMode: 'builtin', altRegion: '', altRegion2: '', altCustom: 0 } }) });
+  assert.deepEqual(up, { bound: true, up: true, ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { edgeIP: true, hopAddr: 'socks5', hopMode: '', altMode: 'builtin', altRegion: '', altRegion2: '', altCustom: 0 } });
   const bad = await get({ status: async () => ({ ok: false, version: '3.0.1', problems: ['请设置环境变量 UUID（节点用户 ID）。'] }) });
   assert.equal(bad.up, true); assert.equal(bad.ok, false); assert.deepEqual(bad.problems, ['请设置环境变量 UUID（节点用户 ID）。']);
   const down = await get({ status: async () => { throw new Error('The RPC receiver does not implement the method "status".'); } });
@@ -1148,7 +1148,7 @@ test('代理设置 API：需登录；没有服务绑定时给出明确提示；�
   const cookie = await login(env);
   const g = await call(env, base, { cookie });
   assert.equal(g.status, 400);
-  assert.match((await g.json()).msg, /没有绑定服务绑定 PROXY.*ProxyControl/);
+  assert.match((await g.json()).msg, /没有绑定服务绑定 PROXY.*NodeControl/);
   assert.equal((await call(env, `/${UUID}/api/proxy-reset`, { method: 'POST', cookie })).status, 400);
   const bound = baseEnv({ PROXY: { setSettings: async () => ({ ok: true }) } });
   const c2 = await login(bound);
@@ -1158,33 +1158,33 @@ test('代理设置 API：需登录；没有服务绑定时给出明确提示；�
   assert.equal((await call(bound, `/${UUID}/api/proxy-reset`, { cookie: c2 })).status, 405, 'proxy-reset 只接受 POST');
 });
 
-test('代理设置 API：读取 / 保存 / 恢复都转给代理的 ProxyControl；代理的校验错误原样回给面板（400 + 字段级错误）；调用失败 / 超时 / 绑定了只读入口时给出提示', async () => {
+test('代理设置 API：读取 / 保存 / 恢复都转给代理的 NodeControl；代理的校验错误原样回给面板（400 + 字段级错误）；调用失败 / 超时 / 绑定了只读入口时给出提示', async () => {
   const calls = [];
-  const settings = { proxyIP: 'p.example', outboundProxy: '', outboundMode: '', 'relay.mode': 'builtin', 'relay.region': '', 'relay.region2': '', 'relay.custom': '' };
+  const settings = { edgeIP: 'p.example', hopAddr: '', hopMode: '', 'alt.mode': 'builtin', 'alt.region': '', 'alt.region2': '', 'alt.custom': '' };
   const proxy = {
     getSettings: async () => { calls.push(['get']); return { ok: true, storage: true, settings, env: settings, source: {}, regions: ['HK'], error: '' }; },
-    setSettings: async (b) => { calls.push(['set', b]); return b.outboundMode === 'bad' ? { ok: false, error: '出站方式：不支持的选项', errors: [{ field: 'outboundMode', msg: '出站方式：不支持的选项' }] } : { ok: true, storage: true, settings: { ...settings, ...b }, ignored: [] }; },
+    setSettings: async (b) => { calls.push(['set', b]); return b.hopMode === 'bad' ? { ok: false, error: '出站方式：不支持的选项', errors: [{ field: 'hopMode', msg: '出站方式：不支持的选项' }] } : { ok: true, storage: true, settings: { ...settings, ...b }, ignored: [] }; },
     resetSettings: async () => { calls.push(['reset']); return { ok: true, storage: true, settings }; },
   };
   const env = baseEnv({ PROXY: proxy });
   const cookie = await login(env);
   const api = (path, init = {}) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
   const g = await (await api('proxy-settings')).json();
-  assert.equal(g.ok, true); assert.equal(g.data.settings.proxyIP, 'p.example'); assert.deepEqual(g.data.regions, ['HK']);
-  const s = await (await api('proxy-settings', { method: 'POST', body: { outboundMode: 'only', 'relay.mode': 'off' } })).json();
-  assert.equal(s.ok, true); assert.equal(s.data.settings.outboundMode, 'only');
-  assert.deepEqual(calls[1], ['set', { outboundMode: 'only', 'relay.mode': 'off' }], '请求体原样转给代理');
-  const e = await api('proxy-settings', { method: 'POST', body: { outboundMode: 'bad' } });
+  assert.equal(g.ok, true); assert.equal(g.data.settings.edgeIP, 'p.example'); assert.deepEqual(g.data.regions, ['HK']);
+  const s = await (await api('proxy-settings', { method: 'POST', body: { hopMode: 'only', 'alt.mode': 'off' } })).json();
+  assert.equal(s.ok, true); assert.equal(s.data.settings.hopMode, 'only');
+  assert.deepEqual(calls[1], ['set', { hopMode: 'only', 'alt.mode': 'off' }], '请求体原样转给代理');
+  const e = await api('proxy-settings', { method: 'POST', body: { hopMode: 'bad' } });
   assert.equal(e.status, 400);
   const ej = await e.json();
-  assert.equal(ej.ok, false); assert.equal(ej.errors[0].field, 'outboundMode'); assert.match(ej.msg, /不支持的选项/);
+  assert.equal(ej.ok, false); assert.equal(ej.errors[0].field, 'hopMode'); assert.match(ej.msg, /不支持的选项/);
   assert.equal((await (await api('proxy-reset', { method: 'POST' })).json()).ok, true);
   assert.equal(calls.at(-1)[0], 'reset');
-  // 代理调用失败（如绑定的是只读入口 ProxyStatus，没有这些方法）
+  // 代理调用失败（如绑定的是只读入口 NodeStatus，没有这些方法）
   const ro = baseEnv({ PROXY: { status: async () => ({ ok: true }) } });
   const r = await call(ro, `/${UUID}/api/proxy-settings`, { cookie: await login(ro) });
   assert.equal(r.status, 502);
-  assert.match((await r.json()).msg, /无法调用代理.*入口是 ProxyControl/);
+  assert.match((await r.json()).msg, /无法调用代理.*入口是 NodeControl/);
   // 超时
   const realSetTimeout = globalThis.setTimeout;
   globalThis.setTimeout = (fn, ms, ...a) => realSetTimeout(fn, ms === 4000 ? 5 : ms, ...a);
@@ -1330,12 +1330,12 @@ test('保存校验：非法优选域名给出字段级错误；配置可往返�
   let r = await save({ prefDomains: 'https://bad.example.com' });
   assert.equal(r.status, 400);
   assert.equal((await r.json()).errors[0].field, 'prefDomains');
-  r = await save({ prefDomains: 'Z.Example.com\na.example.com', proxyIP: 'x.example.com', outboundProxy: 'socks5://1.2.3.4:1', outboundMode: 'only', relay: { mode: 'custom', custom: 'a.example.com' } });
+  r = await save({ prefDomains: 'Z.Example.com\na.example.com', edgeIP: 'x.example.com', hopAddr: 'socks5://1.2.3.4:1', hopMode: 'only', alt: { mode: 'custom', custom: 'a.example.com' } });
   assert.equal(r.status, 200);
   const j = await r.json();
   assert.equal(j.data.prefDomains, 'z.example.com\na.example.com');
-  assert.deepEqual(j.ignored.sort(), ['outboundMode', 'outboundProxy', 'proxyIP', 'relay'], '代理的出站设置不是面板配置项');
-  for (const k of ['proxyIP', 'outboundProxy', 'outboundMode', 'relay']) { assert.equal(k in j.data, false, k); assert.equal(k in stored(env), false, k); }
+  assert.deepEqual(j.ignored.sort(), ['alt', 'edgeIP', 'hopAddr', 'hopMode'], '代理的出站设置不是面板配置项');
+  for (const k of ['edgeIP', 'hopAddr', 'hopMode', 'alt']) { assert.equal(k in j.data, false, k); assert.equal(k in stored(env), false, k); }
   assert.equal(j.data.builtinPrefDomains.length, 14, '面板「载入内置列表」所需');
 });
 

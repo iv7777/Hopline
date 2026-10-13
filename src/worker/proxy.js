@@ -35,7 +35,7 @@ function closeReason(msg) {
   return out;
 }
 
-async function handleWebSocketProxy(request, cfg) {
+async function handleWsProto(request, cfg) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
   try { server.accept({ allowHalfOpen: true }); } catch (e) { server.accept(); }
@@ -72,12 +72,12 @@ async function handleWebSocketProxy(request, cfg) {
     // 头部解析成功立即回 VLESS 响应头（version=0 + addonsLen=0），早于首包判定与出站建连：
     // 部分客户端（mihomo 等）收到这 2 字节才发送首个数据包，晚发会与服务端互相等待
     if (!respSent && parsed.command !== 2) { respSent = true; send(new Uint8Array([0, 0])); }
-    // 首包判定出站方式（非 TLS 不走 SNI 型反代，见 sniffPayloadKind）；头部完整但暂无数据时短暂等待首包，
-    // 超时（SNIFF_WAIT_MS）仍无数据按 unknown 放行，不让连接悬挂
+    // 首包判定出站方式（非 TLS 不走 SNI 型反代，见 payloadKindOf）；头部完整但暂无数据时短暂等待首包，
+    // 超时（FIRST_WAIT_MS）仍无数据按 unknown 放行，不让连接悬挂
     const payload = pending.byteLength > parsed.headerLength ? pending.subarray(parsed.headerLength) : null;
-    const payloadKind = sniffPayloadKind(payload);
+    const payloadKind = payloadKindOf(payload);
     if (payloadKind === 'unknown' && !forced) {
-      if (!protoWait) protoWait = setTimeout(() => { protoWait = null; handleFirstChunk(null, true).catch(fail); }, SNIFF_WAIT_MS);
+      if (!protoWait) protoWait = setTimeout(() => { protoWait = null; handleFirstChunk(null, true).catch(fail); }, FIRST_WAIT_MS);
       return;
     }
     if (protoWait) { clearTimeout(protoWait); protoWait = null; }
@@ -95,7 +95,7 @@ async function handleWebSocketProxy(request, cfg) {
       closeWs(1000);
       return;
     }
-    const conn = await openOutbound(parsed, cfg, request.cf && request.cf.colo, payloadKind);
+    const conn = await openUpstream(parsed, cfg, request.cf && request.cf.colo, payloadKind);
     // 建连期间客户端已断开：立即释放刚建好的出站连接，否则它会一直挂到目标端关闭
     if (closed) { try { conn.close(); } catch (e) { /* 忽略 */ } return; }
     socket = conn;
@@ -139,7 +139,7 @@ async function handleWebSocketProxy(request, cfg) {
 }
 
 // xhttp 代理（stream-one 模式：请求体即 VLESS 流）
-async function handleXhttpProxy(request, cfg) {
+async function handleXhtProto(request, cfg) {
   const bodyReader = request.body.getReader();
   // 首个数据块可能短于 VLESS 头部（分块到达）：累积到能完整解析为止（上限 64KB，与 WS 路径一致）
   let buf = new Uint8Array(0), parsed = null;
@@ -153,9 +153,9 @@ async function handleXhttpProxy(request, cfg) {
       if (buf.byteLength > 65536) throw new Error('握手头超过 64KB');
     }
   }
-  if (parsed.command !== 1) throw new Error('XHTTP 仅支持 TCP 命令');
+  if (parsed.command !== 1) throw new Error('XHT 仅支持 TCP 命令');
   const firstPayload = buf.subarray(parsed.headerLength);
-  const conn = await openOutbound(parsed, cfg, request.cf && request.cf.colo, sniffPayloadKind(firstPayload));
+  const conn = await openUpstream(parsed, cfg, request.cf && request.cf.colo, payloadKindOf(firstPayload));
   // 数据面全部交给运行时原生管道（pipeTo），不经过 JS 逐块搬运：
   // 免费版每个请求只有 10ms CPU，XHTTP 每条代理连接就是一个长请求；若每个数据块都在 JS 里 read → enqueue / write，
   // 看视频时几 MB 数据就超出 CPU 上限（日志 Worker exceeded CPU time limit），连接被限流变得极慢。

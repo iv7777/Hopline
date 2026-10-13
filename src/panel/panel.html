@@ -219,12 +219,12 @@
           <button class="btn primary" id="px-save" onclick="saveProxySettings()">保存到代理</button>
           <button class="btn danger" id="px-reset" onclick="resetProxySettings()">恢复为环境变量</button>
         </div>
-        <p class="hint" style="margin-top:10px">这里的设置只保存在代理自己的 KV（变量名 PROXY_KV）里，面板不保存；保存后代理约 1 分钟内生效（KV 同步与缓存）。优先级：这里的设置 &gt; 代理的环境变量 &gt; 默认值；与环境变量相同的值不会存入 KV。UUID 与节点路径（PATH）只能在代理的环境变量里改，这里改不了。「恢复为环境变量」会清除这里保存的全部覆盖项。</p>
+        <p class="hint" style="margin-top:10px">这里的设置只保存在代理自己的 KV（变量名 NODE_KV）里，面板不保存；保存后代理约 1 分钟内生效（KV 同步与缓存）。优先级：这里的设置 &gt; 代理的环境变量 &gt; 默认值；与环境变量相同的值不会存入 KV。UUID 与节点路径（PATH）只能在代理的环境变量里改，这里改不了。「恢复为环境变量」会清除这里保存的全部覆盖项。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>落地与出站</h3>
-        <div class="field"><label>反代 / 落地 IP（填写后作为固定出口优先使用；留空则直连失败后由地区反代兜底（见下方「内置地区反代」），格式 host 或 host:port）</label><input type="text" id="s-proxyIP" placeholder="留空则直连失败后走地区反代" autocomplete="off"><div class="hint src" data-src="proxyIP"></div></div>
-        <div class="field"><label>出站代理（可选）</label><input type="text" id="s-outbound" placeholder="socks5://user:pass@1.2.3.4:1080 或 ss://chacha20-ietf-poly1305:密码@1.2.3.4:8388" autocomplete="off"><div class="hint src" data-src="outboundProxy"></div></div>
+        <div class="field"><label>反代 / 落地 IP（填写后作为固定出口优先使用；留空则直连失败后由地区反代兜底（见下方「内置地区反代」），格式 host 或 host:port）</label><input type="text" id="s-proxyIP" placeholder="留空则直连失败后走地区反代" autocomplete="off"><div class="hint src" data-src="edgeIP"></div></div>
+        <div class="field"><label>出站代理（可选）</label><input type="text" id="s-outbound" placeholder="socks5://user:pass@1.2.3.4:1080 或 ss://chacha20-ietf-poly1305:密码@1.2.3.4:8388" autocomplete="off"><div class="hint src" data-src="hopAddr"></div></div>
         <p class="hint">支持 socks5://（可带 user:pass@）、http(s)://、ss:// 或 host:port（默认按 socks5，端口 1080）。SS 加密支持 aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305。未填写出站代理时，三种出站方式都按直连处理。</p>
         <div class="field" style="margin-bottom:0"><label>出站方式</label>
           <select id="s-outmode">
@@ -232,7 +232,7 @@
             <option value="no">直连 / 地区反代优先，都不通再走代理（no）</option>
             <option value="only">仅走代理，失败后只用地区反代、不直连（only）</option>
           </select>
-          <div class="hint src" data-src="outboundMode"></div>
+          <div class="hint src" data-src="hopMode"></div>
         </div>
       </div>
       <div class="card">
@@ -244,19 +244,19 @@
             <option value="custom">仅使用我的反代列表</option>
             <option value="off">关闭（只直连 / 出站代理）</option>
           </select>
-          <div class="hint src" data-src="relay.mode"></div>
+          <div class="hint src" data-src="alt.mode"></div>
         </div>
         <div id="rl-builtin-box">
           <div class="inrow">
-            <div class="field" style="flex:1;margin-bottom:0"><label>首选地区（取 2 个 IP）</label><select id="rl-region"></select><div class="hint src" data-src="relay.region"></div></div>
-            <div class="field" style="flex:1;margin-bottom:0"><label>次选地区（取 1 个 IP）</label><select id="rl-region2"></select><div class="hint src" data-src="relay.region2"></div></div>
+            <div class="field" style="flex:1;margin-bottom:0"><label>首选地区（取 2 个 IP）</label><select id="rl-region"></select><div class="hint src" data-src="alt.region"></div></div>
+            <div class="field" style="flex:1;margin-bottom:0"><label>次选地区（取 1 个 IP）</label><select id="rl-region2"></select><div class="hint src" data-src="alt.region2"></div></div>
           </div>
           <div class="hint">首选留空 = 按 Worker 所在机房自动选择；次选留空 = 默认的另一地区（首选为 HK 时用 US，否则用 HK），选「不使用」则只用首选地区。</div>
         </div>
         <div class="field" id="rl-custom-box" style="margin-bottom:0">
           <label>自定义反代列表（每行一个 host 或 host:port，最多 3 个，IPv6 需加方括号）</label>
           <textarea id="rl-custom" rows="3" placeholder="proxyip.example.com&#10;203.0.113.10:443" autocomplete="off"></textarea>
-          <div class="hint src" data-src="relay.custom"></div>
+          <div class="hint src" data-src="alt.custom"></div>
           <div class="hint">域名按 TXT / A 记录解析（与「反代 / 落地 IP」相同，缓存 5 分钟）；多个条目并发竞速。「反代 / 落地 IP」仍然优先于这里。</div>
         </div>
       </div>

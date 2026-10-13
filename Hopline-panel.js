@@ -1,4 +1,4 @@
-/*!Hopline-panel v3.0.3*/
+/*!Hopline-panel v3.0.4*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -15,11 +15,11 @@
 //    ENABLE_ECH      设为 true/1 开启 ECH 加密
 //    ALPN            自定义 ALPN 协商
 //  服务绑定（可选）：
-//    PROXY           指向代理 Worker 的服务绑定：入口 ProxyStatus = 只读（「运行状态」显示代理是否在线与版本）；
-//                    入口 ProxyControl = 另可在面板「代理设置」里在线修改代理的出站 / 地区反代设置（代理还需绑定 PROXY_KV）
+//    PROXY           指向代理 Worker 的服务绑定：入口 NodeStatus = 只读（「运行状态」显示代理是否在线与版本）；
+//                    入口 NodeControl = 另可在面板「代理设置」里在线修改代理的出站 / 地区反代设置（代理还需绑定 NODE_KV）
 // ============================================================================
 // 面板脚本（Hopline-panel.js）的版本号：用于检测更新与面板里显示。与代理脚本各自编号、各自升版本
-const VERSION = '3.0.3';
+const VERSION = '3.0.4';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
 // 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
@@ -561,7 +561,7 @@ function json(obj, status, headers) {
 
 // 路径不对（根路径、未知路由）时返回一个普通的 Hello World 页面作为伪装：
 // 看起来像个占位站点，既不暴露路径 / UUID，也不返回 404 引人注意
-function helloPage() {
+function stubPage() {
   return new Response('<!doctype html><html><head><meta charset="utf-8"><title>Hello World</title></head><body><h1>Hello World !</h1></body></html>',
     { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
@@ -2781,12 +2781,12 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
           <button class="btn primary" id="px-save" onclick="saveProxySettings()">保存到代理</button>
           <button class="btn danger" id="px-reset" onclick="resetProxySettings()">恢复为环境变量</button>
         </div>
-        <p class="hint" style="margin-top:10px">这里的设置只保存在代理自己的 KV（变量名 PROXY_KV）里，面板不保存；保存后代理约 1 分钟内生效（KV 同步与缓存）。优先级：这里的设置 &gt; 代理的环境变量 &gt; 默认值；与环境变量相同的值不会存入 KV。UUID 与节点路径（PATH）只能在代理的环境变量里改，这里改不了。「恢复为环境变量」会清除这里保存的全部覆盖项。</p>
+        <p class="hint" style="margin-top:10px">这里的设置只保存在代理自己的 KV（变量名 NODE_KV）里，面板不保存；保存后代理约 1 分钟内生效（KV 同步与缓存）。优先级：这里的设置 &gt; 代理的环境变量 &gt; 默认值；与环境变量相同的值不会存入 KV。UUID 与节点路径（PATH）只能在代理的环境变量里改，这里改不了。「恢复为环境变量」会清除这里保存的全部覆盖项。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>落地与出站</h3>
-        <div class="field"><label>反代 / 落地 IP（填写后作为固定出口优先使用；留空则直连失败后由地区反代兜底（见下方「内置地区反代」），格式 host 或 host:port）</label><input type="text" id="s-proxyIP" placeholder="留空则直连失败后走地区反代" autocomplete="off"><div class="hint src" data-src="proxyIP"></div></div>
-        <div class="field"><label>出站代理（可选）</label><input type="text" id="s-outbound" placeholder="socks5://user:pass@1.2.3.4:1080 或 ss://chacha20-ietf-poly1305:密码@1.2.3.4:8388" autocomplete="off"><div class="hint src" data-src="outboundProxy"></div></div>
+        <div class="field"><label>反代 / 落地 IP（填写后作为固定出口优先使用；留空则直连失败后由地区反代兜底（见下方「内置地区反代」），格式 host 或 host:port）</label><input type="text" id="s-proxyIP" placeholder="留空则直连失败后走地区反代" autocomplete="off"><div class="hint src" data-src="edgeIP"></div></div>
+        <div class="field"><label>出站代理（可选）</label><input type="text" id="s-outbound" placeholder="socks5://user:pass@1.2.3.4:1080 或 ss://chacha20-ietf-poly1305:密码@1.2.3.4:8388" autocomplete="off"><div class="hint src" data-src="hopAddr"></div></div>
         <p class="hint">支持 socks5://（可带 user:pass@）、http(s)://、ss:// 或 host:port（默认按 socks5，端口 1080）。SS 加密支持 aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305。未填写出站代理时，三种出站方式都按直连处理。</p>
         <div class="field" style="margin-bottom:0"><label>出站方式</label>
           <select id="s-outmode">
@@ -2794,7 +2794,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
             <option value="no">直连 / 地区反代优先，都不通再走代理（no）</option>
             <option value="only">仅走代理，失败后只用地区反代、不直连（only）</option>
           </select>
-          <div class="hint src" data-src="outboundMode"></div>
+          <div class="hint src" data-src="hopMode"></div>
         </div>
       </div>
       <div class="card">
@@ -2806,19 +2806,19 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
             <option value="custom">仅使用我的反代列表</option>
             <option value="off">关闭（只直连 / 出站代理）</option>
           </select>
-          <div class="hint src" data-src="relay.mode"></div>
+          <div class="hint src" data-src="alt.mode"></div>
         </div>
         <div id="rl-builtin-box">
           <div class="inrow">
-            <div class="field" style="flex:1;margin-bottom:0"><label>首选地区（取 2 个 IP）</label><select id="rl-region"></select><div class="hint src" data-src="relay.region"></div></div>
-            <div class="field" style="flex:1;margin-bottom:0"><label>次选地区（取 1 个 IP）</label><select id="rl-region2"></select><div class="hint src" data-src="relay.region2"></div></div>
+            <div class="field" style="flex:1;margin-bottom:0"><label>首选地区（取 2 个 IP）</label><select id="rl-region"></select><div class="hint src" data-src="alt.region"></div></div>
+            <div class="field" style="flex:1;margin-bottom:0"><label>次选地区（取 1 个 IP）</label><select id="rl-region2"></select><div class="hint src" data-src="alt.region2"></div></div>
           </div>
           <div class="hint">首选留空 = 按 Worker 所在机房自动选择；次选留空 = 默认的另一地区（首选为 HK 时用 US，否则用 HK），选「不使用」则只用首选地区。</div>
         </div>
         <div class="field" id="rl-custom-box" style="margin-bottom:0">
           <label>自定义反代列表（每行一个 host 或 host:port，最多 3 个，IPv6 需加方括号）</label>
           <textarea id="rl-custom" rows="3" placeholder="proxyip.example.com&#10;203.0.113.10:443" autocomplete="off"></textarea>
-          <div class="hint src" data-src="relay.custom"></div>
+          <div class="hint src" data-src="alt.custom"></div>
           <div class="hint">域名按 TXT / A 记录解析（与「反代 / 落地 IP」相同，缓存 5 分钟）；多个条目并发竞速。「反代 / 落地 IP」仍然优先于这里。</div>
         </div>
       </div>
@@ -3132,8 +3132,8 @@ function setConn(ok){
   $('connText').textContent = ok ? '运行中' : '无法连接';
 }
 
-var PROXY_FIELDS = { 'proxyIP': 's-proxyIP', 'outboundProxy': 's-outbound', 'outboundMode': 's-outmode', 'relay.mode': 'rl-mode', 'relay.region': 'rl-region', 'relay.region2': 'rl-region2', 'relay.custom': 'rl-custom' };
-var PROXY_ENV_NAMES = { 'proxyIP': 'PROXYIP', 'outboundProxy': 'OUTBOUND_PROXY', 'outboundMode': 'OUTBOUND_MODE', 'relay.mode': 'RELAY_MODE', 'relay.region': 'RELAY_REGION', 'relay.region2': 'RELAY_REGION2', 'relay.custom': 'RELAY_CUSTOM' };
+var PROXY_FIELDS = { 'edgeIP': 's-proxyIP', 'hopAddr': 's-outbound', 'hopMode': 's-outmode', 'alt.mode': 'rl-mode', 'alt.region': 'rl-region', 'alt.region2': 'rl-region2', 'alt.custom': 'rl-custom' };
+var PROXY_ENV_NAMES = { 'edgeIP': 'EDGEIP', 'hopAddr': 'HOP_ADDR', 'hopMode': 'HOP_MODE', 'alt.mode': 'ALT_MODE', 'alt.region': 'ALT_REGION', 'alt.region2': 'ALT_REGION2', 'alt.custom': 'ALT_CUSTOM' };
 var RELAY_ZH = { HK: '香港', US: '美国', SG: '新加坡', JP: '日本', KR: '韩国', DE: '德国', SE: '瑞典', NL: '荷兰', FI: '芬兰', GB: '英国' };
 function proxyNote(text, kind){
   var n = $('px-note');
@@ -3170,10 +3170,10 @@ function onRelayMode(){
 function fillProxy(d){
 
   clearProxyErrors();
-  [['rl-region', 'relay.region', '自动（按 Worker 机房）'], ['rl-region2', 'relay.region2', '自动（默认的另一地区）']].forEach(function(c){
+  [['rl-region', 'alt.region', '自动（按 Worker 机房）'], ['rl-region2', 'alt.region2', '自动（默认的另一地区）']].forEach(function(c){
     var el = $(c[0]);
     el.innerHTML = '';
-    var opts = c[1] === 'relay.region2' ? ['', 'none'].concat(d.regions || []) : [''].concat(d.regions || []);
+    var opts = c[1] === 'alt.region2' ? ['', 'none'].concat(d.regions || []) : [''].concat(d.regions || []);
     opts.forEach(function(o){
       var op = document.createElement('option');
       op.value = o;
@@ -3203,7 +3203,7 @@ function loadProxySettings(){
     }
     fillProxy(r.data);
     if (!r.data.storage){
-      proxyNote('代理没有绑定 KV（变量名 PROXY_KV），这些设置目前只读：显示的是代理环境变量里的值。给代理 Worker 绑定一个单独的 KV 命名空间后即可在这里修改。', 'err');
+      proxyNote('代理没有绑定 KV（变量名 NODE_KV），这些设置目前只读：显示的是代理环境变量里的值。给代理 Worker 绑定一个单独的 KV 命名空间后即可在这里修改。', 'err');
       return;
     }
     proxyNote(r.data.error === 'unavailable' ? '代理的 KV 暂时无法读取：下面显示的可能不是最新的设置，保存会被拒绝，稍后重新读取。' : (r.data.error === 'corrupt' ? '代理 KV 里保存的设置已损坏，已忽略；保存一次即可修复。' : '已连接代理，可以在线修改。'), r.data.error ? 'err' : '');
@@ -3240,10 +3240,10 @@ function resetProxySettings(){
 function proxySummary(s){
   s = s || {};
   var a = [];
-  a.push('出站代理：' + (s.outboundProxy || '无'));
-  if (s.outboundMode) a.push('出站方式：' + s.outboundMode);
-  a.push('反代 / 落地 IP：' + (s.proxyIP ? '已设置' : '无'));
-  a.push('地区反代：' + (s.relayMode || 'builtin') + (s.relayMode === 'custom' ? '（' + (s.relayCustom || 0) + ' 个）' : ''));
+  a.push('出站代理：' + (s.hopAddr || '无'));
+  if (s.hopMode) a.push('出站方式：' + s.hopMode);
+  a.push('反代 / 落地 IP：' + (s.edgeIP ? '已设置' : '无'));
+  a.push('地区反代：' + (s.altMode || 'builtin') + (s.altMode === 'custom' ? '（' + (s.altCustom || 0) + ' 个）' : ''));
   return a.join(' · ');
 }
 function checkProxy(){
@@ -3254,17 +3254,17 @@ function checkProxy(){
     if (!d){ v.textContent = '检测失败'; v.className = 'v bad'; return; }
     if (!d.bound){
       v.textContent = '未绑定（可选）';
-      h.textContent = '给面板 Worker 添加服务绑定：变量名 PROXY → 代理 Worker，入口 ProxyStatus（只读）或 ProxyControl（可在线修改代理设置），就能在这里看到代理是否在线与版本';
+      h.textContent = '给面板 Worker 添加服务绑定：变量名 PROXY → 代理 Worker，入口 NodeStatus（只读）或 NodeControl（可在线修改代理设置），就能在这里看到代理是否在线与版本';
       return;
     }
     if (!d.up){
       v.textContent = '无法连接'; v.className = 'v bad';
-      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus 或 ProxyControl，且代理已更新到 3.0.2 或更高版本';
+      h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 NodeStatus 或 NodeControl，且代理已更新到 3.0.3 或更高版本';
       return;
     }
     v.textContent = '在线 · 代理 v' + (d.version || '?');
     v.className = 'v ' + (d.ok ? 'ok' : 'bad');
-    h.textContent = d.ok ? proxySummary(d.settings) + (d.control ? ' · 可在线修改（入口 ProxyControl' + (d.storage ? '，已绑定 KV' : '，代理未绑定 PROXY_KV') + '）' : ' · 只读入口（要在线修改请把入口改为 ProxyControl）') : '代理配置有问题：' + (d.problems || []).join(' ');
+    h.textContent = d.ok ? proxySummary(d.settings) + (d.control ? ' · 可在线修改（入口 NodeControl' + (d.storage ? '，已绑定 KV' : '，代理未绑定 NODE_KV') + '）' : ' · 只读入口（要在线修改请把入口改为 NodeControl）') : '代理配置有问题：' + (d.problems || []).join(' ');
   }).catch(function(){ v.textContent = '检测失败'; v.className = 'v bad'; });
 }
 function renderStatus(d){
@@ -4070,7 +4070,7 @@ function formatConfigErrors(errors) {
   return errors.map(e => (e.label ? e.label + '：' : '') + e.msg).join('；');
 }
 
-// 调用代理的 RPC（服务绑定 PROXY → 代理 Worker 的 ProxyStatus / ProxyControl 入口）：带超时，失败时抛 Error，由调用方转成面板能显示的结果
+// 调用代理的 RPC（服务绑定 PROXY → 代理 Worker 的 NodeStatus / NodeControl 入口）：带超时，失败时抛 Error，由调用方转成面板能显示的结果
 const PROXY_CALL_TIMEOUT = 4000;
 async function callProxy(env, method, ...args) {
   if (!(env && env.PROXY)) throw Object.assign(new Error('没有绑定服务绑定 PROXY'), { unbound: true });
@@ -4091,7 +4091,7 @@ async function proxyStatus(env) {
     return { bound: true, up: false, error: String((e && e.message) || e) };
   }
 }
-// 在线修改代理设置：把面板的请求转给代理的 ProxyControl 入口；绑定的是只读入口 ProxyStatus 时代理会报「does not implement」
+// 在线修改代理设置：把面板的请求转给代理的 NodeControl 入口；绑定的是只读入口 NodeStatus 时代理会报「does not implement」
 async function proxySettingsCall(env, method, ...args) {
   try {
     const r = await callProxy(env, method, ...args);
@@ -4099,8 +4099,8 @@ async function proxySettingsCall(env, method, ...args) {
     return json({ ok: true, data: r });
   } catch (e) {
     const msg = String((e && e.message) || e);
-    if (e && e.unbound) return json({ ok: false, msg: '没有绑定服务绑定 PROXY：请在面板 Worker 添加变量名 PROXY、入口 ProxyControl 的服务绑定' }, 400);
-    return json({ ok: false, msg: '无法调用代理：' + msg + '。请确认服务绑定 PROXY 的入口是 ProxyControl，且代理已更新到 3.0.2 或更高版本' }, 502);
+    if (e && e.unbound) return json({ ok: false, msg: '没有绑定服务绑定 PROXY：请在面板 Worker 添加变量名 PROXY、入口 NodeControl 的服务绑定' }, 400);
+    return json({ ok: false, msg: '无法调用代理：' + msg + '。请确认服务绑定 PROXY 的入口是 NodeControl，且代理已更新到 3.0.3 或更高版本' }, 502);
   }
 }
 
@@ -4187,7 +4187,7 @@ async function handleRequest(request, env, state) {
 
   // 根路径不跳转到面板入口（否则会把面板路径 / UUID 告诉任何访问者），返回伪装页
   if (segs[0] === '') {
-    return helloPage();
+    return stubPage();
   }
 
   // ---------- 订阅 ----------
@@ -4260,7 +4260,7 @@ async function handleRequest(request, env, state) {
       return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
     }
 
-    // 代理状态：通过服务绑定 PROXY（入口 ProxyStatus）读取代理的在线状态与版本；没绑定就只返回 bound:false，面板其它功能不受影响
+    // 代理状态：通过服务绑定 PROXY（入口 NodeStatus）读取代理的在线状态与版本；没绑定就只返回 bound:false，面板其它功能不受影响
     if (apiName === 'proxy-status') return json({ ok: true, data: await proxyStatus(env) });
     // 在线修改代理设置（7 项出站 / 地区反代设置）：GET 读取、POST 保存（只提交出现的项，整批校验）、proxy-reset 恢复为环境变量 + 默认值
     if (apiName === 'proxy-settings') {
@@ -4353,7 +4353,7 @@ async function handleRequest(request, env, state) {
   }
 
   // 未匹配任何有效路由（路径不对）：返回伪装页，不暴露部署存在
-  return helloPage();
+  return stubPage();
 }
 
 // 安全响应头：只加在 HTML 页面与 JSON 接口上（订阅、WebSocket、XHTTP 流不动）。

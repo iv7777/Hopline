@@ -36,7 +36,7 @@ function read(path) {
 // JavaScript：逐字符扫描，正确跳过字符串与正则字面量，避免误删其中的 // 与 /*
 const REGEX_KW = new Set(['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete',
   'void', 'throw', 'else', 'do', 'yield', 'case', 'await']);
-function stripJsComments(code) {
+export function stripJsComments(code) {
   const n = code.length;
   let out = '', i = 0, prevChar = '', prevWord = '', word = '';
   const markWord = (ch) => {

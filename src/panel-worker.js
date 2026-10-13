@@ -14,8 +14,8 @@
 //    ENABLE_ECH      设为 true/1 开启 ECH 加密
 //    ALPN            自定义 ALPN 协商
 //  服务绑定（可选）：
-//    PROXY           指向代理 Worker 的服务绑定：入口 ProxyStatus = 只读（「运行状态」显示代理是否在线与版本）；
-//                    入口 ProxyControl = 另可在面板「代理设置」里在线修改代理的出站 / 地区反代设置（代理还需绑定 PROXY_KV）
+//    PROXY           指向代理 Worker 的服务绑定：入口 NodeStatus = 只读（「运行状态」显示代理是否在线与版本）；
+//                    入口 NodeControl = 另可在面板「代理设置」里在线修改代理的出站 / 地区反代设置（代理还需绑定 NODE_KV）
 // ============================================================================
 // @include worker/version-panel.js
 // @include worker/update.js

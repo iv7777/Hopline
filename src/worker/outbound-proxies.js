@@ -10,7 +10,7 @@ function withTimeout(promise, ms, msg) {
 }
 
 // connect + opened 超时：CF 回环保护会静默丢弃对 CF 托管站点的 SYN（连接永远挂起），
-// 带超时快速失败，由 openOutbound 按序走下一出站方式（反代兜底），解决「延迟有、流量 0」
+// 带超时快速失败，由 openUpstream 按序走下一出站方式（反代兜底），解决「延迟有、流量 0」
 async function connectWithTimeout(hostname, port, ms) {
   const socket = connect({ hostname, port });
   try {
@@ -27,9 +27,9 @@ async function connectDirect(target, timeoutMs) {
 }
 
 // 通过 SOCKS5 代理建立到目标的连接
-async function connectViaSocks5(proxy, target) {
+async function connectViaS5(hop, target) {
   // 6s 超时快速失败：代理不可达时不能永久挂起
-  const socket = await connectWithTimeout(proxy.host, proxy.port, 6000);
+  const socket = await connectWithTimeout(hop.host, hop.port, 6000);
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   // 带缓存的读取器：多余字节保留，避免丢失后续 VLESS 数据流
@@ -45,19 +45,19 @@ async function connectViaSocks5(proxy, target) {
     return out;
   };
   // 握手：声明支持的方法（有凭据则同时声明无认证+用户名密码，服务器选择其一）
-  const methods = proxy.user ? [5, 2, 0, 2] : [5, 1, 0];
+  const methods = hop.user ? [5, 2, 0, 2] : [5, 1, 0];
   await writer.write(new Uint8Array(methods));
   const h1 = await readN(2);
-  if (h1[0] !== 5 || h1[1] === 0xff) throw new Error('SOCKS5 握手失败');
+  if (h1[0] !== 5 || h1[1] === 0xff) throw new Error('S5 握手失败');
   if (h1[1] === 2) { // 服务器选择用户名密码认证（RFC 1929）
-    if (!proxy.user) throw new Error('SOCKS5 服务器要求认证但未提供凭据');
-    const u = TE.encode(proxy.user), p = TE.encode(proxy.pass);
+    if (!hop.user) throw new Error('S5 服务器要求认证但未提供凭据');
+    const u = TE.encode(hop.user), p = TE.encode(hop.pass);
     const auth = new Uint8Array([1, u.length, ...u, p.length, ...p]);
     await writer.write(auth);
     const h2 = await readN(2);
-    if (h2[1] !== 0) throw new Error('SOCKS5 认证失败');
+    if (h2[1] !== 0) throw new Error('S5 认证失败');
   } else if (h1[1] !== 0) {
-    throw new Error('SOCKS5 不支持的认证方法 ' + h1[1]);
+    throw new Error('S5 不支持的认证方法 ' + h1[1]);
   }
   // CONNECT 请求
   const addrBytes = TE.encode(target.hostname);
@@ -73,7 +73,7 @@ async function connectViaSocks5(proxy, target) {
   }
   await writer.write(connReq);
   const rep = await readN(4);
-  if (rep[1] !== 0) throw new Error('SOCKS5 连接失败 码' + rep[1]);
+  if (rep[1] !== 0) throw new Error('S5 连接失败 码' + rep[1]);
   // 跳过 BND.ADDR + BND.PORT（必须完整消费否则残留字节污染后续 VLESS 数据流）
   if (rep[3] === 1) await readN(6);
   else if (rep[3] === 3) { const l = (await readN(1))[0]; await readN(l + 2); }
@@ -87,18 +87,18 @@ async function connectViaSocks5(proxy, target) {
 }
 
 // 通过 HTTP/HTTPS CONNECT 代理建立连接
-async function connectViaHttpProxy(proxy, target) {
+async function connectViaHtHop(hop, target) {
   // 6s 超时快速失败：代理不可达时不能永久挂起
-  const socket = await connectWithTimeout(proxy.host, proxy.port, 6000);
+  const socket = await connectWithTimeout(hop.host, hop.port, 6000);
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   let authHeader = '';
-  if (proxy.user) authHeader = 'Proxy-Authorization: Basic ' + b64FromBytes(TE.encode(`${proxy.user}:${proxy.pass}`)) + '\r\n';
+  if (hop.user) authHeader = 'Proxy-Authorization: Basic ' + b64FromBytes(TE.encode(`${hop.user}:${hop.pass}`)) + '\r\n';
   const authority = (target.hostname.indexOf(':') >= 0 ? '[' + target.hostname + ']' : target.hostname) + ':' + target.port;   // IPv6 须加方括号
   const connectReq = `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n${authHeader}\r\n`;
   await writer.write(TE.encode(connectReq));
   // 读取响应头直到空行；空行后同包多读的字节（目标端早期数据）一并保留
-  const { head, leftover } = await readUntilCRLFCRLF(reader);
+  const { head, leftover } = await readUntilHeaderEnd(reader);
   if (!/^HTTP\/\d\.\d\s+2\d\d/i.test(head)) throw new Error('HTTP 代理 CONNECT 失败: ' + head.split('\r\n')[0]);
   // 残留字节挂 socket._preamble（用法同 SOCKS5）
   if (leftover && leftover.byteLength > 0) socket._preamble = leftover;
@@ -114,7 +114,7 @@ async function connectViaHttpProxy(proxy, target) {
 //       sessionKey=HKDF-SHA1(masterKey, salt, "ss-subkey")，每 chunk 两个 AEAD 块
 //       （2B 大端长度 + 负载），nonce 为 12B 小端计数器逐块 +1；单块明文 ≤ 0x3FFF；salt 长度 = 密钥长度。
 // ---------------------------------------------------------------------------
-function ssCipherAlgo(method) {
+function aeadAlgo(method) {
   const m = String(method || '').toLowerCase().replace(/_/g, '-');
   if (m === 'aes-128-gcm' || m === 'aes-128gcm') return { name: 'AES-GCM', keyLen: 16 };
   if (m === 'aes-256-gcm' || m === 'aes-256gcm') return { name: 'AES-GCM', keyLen: 32 };
@@ -252,7 +252,7 @@ function chacha20Poly1305Seal(key32, nonce12, plaintext, aad) {
   return concatBytes(ct, tag);
 }
 function chacha20Poly1305Open(key32, nonce12, data, aad) {
-  if (data.length < 16) throw new Error('SS AEAD 数据过短');
+  if (data.length < 16) throw new Error('AEAD 数据过短');
   const ct = data.subarray(0, data.length - 16);
   const got = data.subarray(data.length - 16);
   const aadB = aad || new Uint8Array(0);
@@ -273,7 +273,7 @@ function chacha20Poly1305Open(key32, nonce12, data, aad) {
 }
 // 每个方向一个 AEAD 实例，nonce 是 12 字节小端计数器：每次 seal / open（即每个长度块、每个数据块各一次）后加 1。
 // （此前 nonce 从未真正递增，所有块都用同一个 nonce，既违反协议也无法与任何 SS 服务器互通）
-function ssNonceCounter() {
+function aeadNonceCounter() {
   const nonce = new Uint8Array(12);
   return () => {
     const cur = nonce.slice();
@@ -281,15 +281,15 @@ function ssNonceCounter() {
     return cur;
   };
 }
-async function newSsAead(algoName, keyBytes) {
-  const next = ssNonceCounter();
+async function newAead(algoName, keyBytes) {
+  const next = aeadNonceCounter();
   if (algoName === 'CHACHA20-POLY1305') {
     // 纯 JS：CF Workers 的 crypto.subtle 不支持该算法
     return {
       seal(data) { return chacha20Poly1305Seal(keyBytes, next(), data); },
       open(data) {
         const plain = chacha20Poly1305Open(keyBytes, next(), data);
-        if (!plain) throw new Error('SS AEAD 解密失败（密码/加密方式与服务器不匹配）');
+        if (!plain) throw new Error('AEAD 解密失败（密码/加密方式与服务器不匹配）');
         return plain;
       }
     };
@@ -300,13 +300,13 @@ async function newSsAead(algoName, keyBytes) {
     async seal(data) { return new Uint8Array(await crypto.subtle.encrypt({ name: algoName, iv: next() }, ck, data)); },
     async open(data) {
       try { return new Uint8Array(await crypto.subtle.decrypt({ name: algoName, iv: next() }, ck, data)); }
-      catch (e) { throw new Error('SS AEAD 解密失败（密码/加密方式与服务器不匹配）'); }
+      catch (e) { throw new Error('AEAD 解密失败（密码/加密方式与服务器不匹配）'); }
     }
   };
 }
 // 主密钥：传统 AEAD 方式用 OpenSSL EVP_BytesToKey(MD5, 无盐, 1 轮) 由密码派生，长度等于密钥长度
 // （此前误用 SHA-256(密码)，派生出的密钥与服务器不一致）
-function ssMasterKey(password, keyLen) {
+function aeadMasterKey(password, keyLen) {
   const pw = TE.encode(password);
   let key = new Uint8Array(0), prev = new Uint8Array(0);
   while (key.length < keyLen) {
@@ -316,61 +316,61 @@ function ssMasterKey(password, keyLen) {
   return key.slice(0, keyLen);
 }
 // 目标地址头：ATYP(1=IPv4 / 3=域名 / 4=IPv6) + 地址 + 端口(2 字节大端)，作为客户端数据流的开头
-function ssAddressHeader(hostname, port) {
+function aeadTargetHeader(hostname, port) {
   let head;
   if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname)) head = new Uint8Array([1, ...hostname.split('.').map(Number)]);
   else if (hostname.indexOf(':') >= 0 && isValidIp(hostname)) head = new Uint8Array([4, ...ipv6ToBytes(hostname)]);
   else {
     const name = TE.encode(hostname);
-    if (name.length > 255) throw new Error('SS 目标域名过长');
+    if (name.length > 255) throw new Error('AEAD 目标域名过长');
     head = new Uint8Array([3, name.length, ...name]);
   }
   return concatBytes(head, new Uint8Array([(port >> 8) & 255, port & 255]));
 }
-const SS_MAX_PAYLOAD = 0x3fff;   // AEAD 单块明文上限 16383 字节（长度字段高两位必须为 0）
+const AEAD_MAX_CHUNK = 0x3fff;   // AEAD 单块明文上限 16383 字节（长度字段高两位必须为 0）
 
-async function ssSealChunk(aead, data) {
+async function aeadSealChunk(aead, data) {
   const len = new Uint8Array([(data.length >> 8) & 255, data.length & 255]);
   return concatBytes(await aead.seal(len), await aead.seal(data));
 }
 
 
 // 通过 SS 出站代理建立到目标的加密隧道；返回兼容 socket 语义的包装（readable 已解密 / writable 自动加密）
-async function connectViaShadowsocks(proxy, target) {
-  const algo = ssCipherAlgo(proxy.method);
-  if (!algo) throw new Error('不支持的 SS 加密方式: ' + (proxy.method || '（未指定）'));
-  if (!proxy.password) throw new Error('SS 出站缺少密码');
-  const raw = await connectWithTimeout(proxy.host, proxy.port, 6000);
+async function connectViaAead(hop, target) {
+  const algo = aeadAlgo(hop.method);
+  if (!algo) throw new Error('不支持的 AEAD 加密方式: ' + (hop.method || '（未指定）'));
+  if (!hop.password) throw new Error('AEAD 缺少密码');
+  const raw = await connectWithTimeout(hop.host, hop.port, 6000);
   const rawWriter = raw.writable.getWriter();
   const rawReader = raw.readable.getReader();
   let pending = new Uint8Array(0);
   const readN = async (n) => {
     while (pending.length < n) {
       const { done, value } = await rawReader.read();
-      if (done) throw new Error('SS 连接被关闭');
+      if (done) throw new Error('AEAD 连接被关闭');
       pending = concatBytes(pending, value);
     }
     const out = pending.slice(0, n);
     pending = pending.subarray(n);
     return out;
   };
-  const masterKey = ssMasterKey(proxy.password, algo.keyLen);
+  const masterKey = aeadMasterKey(hop.password, algo.keyLen);
   // 客户端方向：随机 salt（长度 = 密钥长度：AES-128 为 16，AES-256 / ChaCha20 为 32）→ 会话子密钥；
   // 数据流以目标地址头开始（首个数据块即携带目标地址），之后才是转发的数据
   const clientSalt = crypto.getRandomValues(new Uint8Array(algo.keyLen));
-  const clientAead = await newSsAead(algo.name, hkdfSha1(masterKey, clientSalt, algo.keyLen));
-  await rawWriter.write(concatBytes(clientSalt, await ssSealChunk(clientAead, ssAddressHeader(target.hostname, target.port))));
+  const clientAead = await newAead(algo.name, hkdfSha1(masterKey, clientSalt, algo.keyLen));
+  await rawWriter.write(concatBytes(clientSalt, await aeadSealChunk(clientAead, aeadTargetHeader(target.hostname, target.port))));
 
   // 读方向：先收服务端 salt → 派生服务端子密钥 → 逐块解密（长度块 2+16 字节，数据块 len+16 字节；空块跳过）
   const readable = new ReadableStream({
     async start(controller) {
       try {
         const serverSalt = await readN(algo.keyLen);
-        const serverAead = await newSsAead(algo.name, hkdfSha1(masterKey, serverSalt, algo.keyLen));
+        const serverAead = await newAead(algo.name, hkdfSha1(masterKey, serverSalt, algo.keyLen));
         while (true) {
           const lb = await serverAead.open(await readN(18));
           const len = (lb[0] << 8) | lb[1];
-          if (len > SS_MAX_PAYLOAD) throw new Error('SS 分片长度非法 ' + len);
+          if (len > AEAD_MAX_CHUNK) throw new Error('AEAD 分片长度非法 ' + len);
           const pb = await serverAead.open(await readN(len + 16));
           if (len > 0) controller.enqueue(pb);
         }
@@ -384,8 +384,8 @@ async function connectViaShadowsocks(proxy, target) {
   const writable = new WritableStream({
     async write(chunk) {
       const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-      for (let off = 0; off < data.length; off += SS_MAX_PAYLOAD) {
-        await rawWriter.write(await ssSealChunk(clientAead, data.subarray(off, Math.min(data.length, off + SS_MAX_PAYLOAD))));
+      for (let off = 0; off < data.length; off += AEAD_MAX_CHUNK) {
+        await rawWriter.write(await aeadSealChunk(clientAead, data.subarray(off, Math.min(data.length, off + AEAD_MAX_CHUNK))));
       }
     },
     close() { try { rawWriter.close(); } catch (e) { /* 忽略 */ } },
@@ -400,7 +400,7 @@ async function connectViaShadowsocks(proxy, target) {
 }
 
 
-async function readUntilCRLFCRLF(reader) {
+async function readUntilHeaderEnd(reader) {
   let buf = new Uint8Array(0);
   while (buf.length < 65536) {
     const { done, value } = await reader.read();
@@ -437,12 +437,12 @@ function b64FromBytes(bytes) {
 }
 
 // 出站代理地址解析：socks5:// / http(s):// / ss:// 或 host:port，可带 user:pass@
-function parseProxyAddress(addr) {
+function parseHopAddress(addr) {
   if (!addr) return null;
   let type = 'socks5', rest = String(addr).trim();
   const m = rest.match(/^(socks5|http|https|ss):\/\/(.+)$/i);
   if (m) { type = m[1].toLowerCase(); rest = m[2]; }
-  if (type === 'ss') return parseSsProxy(rest);
+  if (type === 'ss') return parseAeadHop(rest);
   let user = '', pass = '';
   if (rest.includes('@')) {
     // 以最后一个 @ 分隔凭据与主机：密码中未编码的 @ 不会把主机名截断
@@ -463,7 +463,7 @@ function parseProxyAddress(addr) {
 
 // SS 出站解析：SIP002（ss://method:password@host:port#name 或 ss://BASE64(method:password)@host:port#name）
 // 及旧格式 ss://BASE64(method:password@host:port)（整段无 @）。密码支持 percent-encoding。
-function parseSsProxy(rest) {
+function parseAeadHop(rest) {
   let hostPort = rest, userinfo = '';
   const hashIdx = rest.indexOf('#');
   if (hashIdx >= 0) hostPort = rest.slice(0, hashIdx);

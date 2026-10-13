@@ -202,13 +202,13 @@ test('内置地区反代域名只查 A 记录（这些域名没有 TXT），自�
   fakeNet({ '198.51.100.31': { delay: 5 }, '198.51.100.32': { delay: 5 }, 'tx.example': { delay: 'fail' } });
   const dns = [];
   const stub = dohStub({ 'cloudflare-dns.com': { answers: {
-    'proxyip.jp.cmliussss.net|A': ['198.51.100.31'], 'proxyip.sg.cmliussss.net|A': ['198.51.100.32'], 'my-relay.example.net|A': ['198.51.100.31'] } } }, dns);
-  await withFetch(stub, () => connectVia(baseEnv({ RELAY_MODE: 'builtin', RELAY_REGION: 'JP', RELAY_REGION2: 'SG' }), 'tx.example'));
+    'proxyip.jp.cmliussss.net|A': ['198.51.100.31'], 'proxyip.sg.cmliussss.net|A': ['198.51.100.32'], 'my-alt.example.net|A': ['198.51.100.31'] } } }, dns);
+  await withFetch(stub, () => connectVia(baseEnv({ ALT_MODE: 'builtin', ALT_REGION: 'JP', ALT_REGION2: 'SG' }), 'tx.example'));
   await until(() => dns.filter(d => /cmliussss/.test(d.name)).length >= 2);
   assert.deepEqual(dns.filter(d => /cmliussss/.test(d.name)).map(d => d.type), ['A', 'A']);
-  await withFetch(stub, () => connectVia(baseEnv({ RELAY_MODE: 'custom', RELAY_CUSTOM: 'my-relay.example.net' }), 'tx.example'));
-  await until(() => dns.filter(d => d.name === 'my-relay.example.net').length >= 2);
-  assert.deepEqual(dns.filter(d => d.name === 'my-relay.example.net').map(d => d.type).sort(), ['A', 'TXT']);
+  await withFetch(stub, () => connectVia(baseEnv({ ALT_MODE: 'custom', ALT_CUSTOM: 'my-alt.example.net' }), 'tx.example'));
+  await until(() => dns.filter(d => d.name === 'my-alt.example.net').length >= 2);
+  assert.deepEqual(dns.filter(d => d.name === 'my-alt.example.net').map(d => d.type).sort(), ['A', 'TXT']);
 });
 
 test('出站竞速：直连在优先窗口内成功时使用直连，已建立的反代连接被关闭', async () => {
@@ -324,11 +324,11 @@ const ipv6Bytes = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]; 
 
 const vlessReqV6 = (port) => new Uint8Array([0, ...uuidBytes, 0, 1, port >> 8, port & 255, 3, ...ipv6Bytes, ...TLS_HELLO]);
 
-test('出站代理：密码含未编码 @ 时主机名解析正确；SOCKS5 对 IPv6 目标使用 ATYP=4；HTTP CONNECT 给 IPv6 加方括号', async () => {
+test('出站代理：密码含未编码 @ 时主机名解析正确；S5 对 IPv6 目标使用 ATYP=4；HTTP CONNECT 给 IPv6 加方括号', async () => {
   const feed = async (sock, bytes) => { await until(() => sock.push); sock.push(new Uint8Array(bytes)); };
   // SOCKS5：socks5://us:p@ss@10.0.0.1:1080
   let log = fakeNet({ '10.0.0.1': { delay: 5 } });
-  let env = baseEnv({ OUTBOUND_PROXY: 'socks5://us:p@ss@10.0.0.1:1080', OUTBOUND_MODE: 'only' });
+  let env = baseEnv({ HOP_ADDR: 'socks5://us:p@ss@10.0.0.1:1080', HOP_MODE: 'only' });
   let ws = await openWs(env);
   ws.emit('message', { data: vlessReqV6(443).buffer });   // 握手需要下面喂数据才会完成：不能 await
   await until(() => log.length && log[0].written.length);
@@ -345,7 +345,7 @@ test('出站代理：密码含未编码 @ 时主机名解析正确；SOCKS5 对 
   assert.deepEqual(req.slice(20), [1, 187]);
   // HTTP CONNECT
   log = fakeNet({ '10.0.0.2': { delay: 5 } });
-  env = baseEnv({ OUTBOUND_PROXY: 'http://10.0.0.2:8080', OUTBOUND_MODE: 'only' });
+  env = baseEnv({ HOP_ADDR: 'http://10.0.0.2:8080', HOP_MODE: 'only' });
   ws = await openWs(env);
   ws.emit('message', { data: vlessReqV6(443).buffer });
   await until(() => log.length && log[0].written.length);
@@ -432,7 +432,7 @@ const connectVia = async (env, host) => {
 test('反代 / 落地域名解析：每种记录只发 1 个 DoH 请求（Cloudflare 优先）；结果缓存复用，但不跨请求共享进行中的解析', async () => {
   const log = fakeNet({ '198.51.100.5': { delay: 5 } });
   const dns = [];
-  const env = baseEnv({ PROXYIP: 'dedupe.example.com' });
+  const env = baseEnv({ EDGEIP: 'dedupe.example.com' });
   await withFetch(dohStub({ 'cloudflare-dns.com': { delay: 40, answers: { 'dedupe.example.com|A': ['198.51.100.5'] } } }, dns), async () => {
     const sockets = [];
     for (let i = 0; i < 4; i++) sockets.push(await openWs(env));
@@ -454,14 +454,14 @@ test('反代域名解析：首选 DoH 失败时才换下一个端点；全部失
   fakeNet({ '198.51.100.6': { delay: 5 }, 'neg.example.com': { delay: 5 } });
   // 首选端点 500 → 第二个端点接手，第三个不被访问
   let dns = [];
-  let env = baseEnv({ PROXYIP: 'fallback.example.com' });
+  let env = baseEnv({ EDGEIP: 'fallback.example.com' });
   await withFetch(dohStub({ 'dns.alidns.com': { answers: { 'fallback.example.com|A': ['198.51.100.6'] } } }, dns), () => connectVia(env, 't.example'));
   let hosts = dns.filter(d => d.name === 'fallback.example.com').map(d => d.host);
   assert.deepEqual([...new Set(hosts)].sort(), ['cloudflare-dns.com', 'dns.alidns.com']);
   assert.ok(!hosts.includes('doh.pub'));
   // 全部失败：第一次尝试所有端点，第二次连接直接用缓存的「无结果」
   dns = [];
-  env = baseEnv({ PROXYIP: 'neg.example.com' });
+  env = baseEnv({ EDGEIP: 'neg.example.com' });
   await withFetch(dohStub({}, dns), () => connectVia(env, 't.example'));
   const first = dns.filter(d => d.name === 'neg.example.com').length;
   assert.ok(first >= 6, `第一次查询了所有端点（${first}）`);
@@ -500,7 +500,7 @@ import { assemble } from '../build.mjs';
 const internals = (() => {
   const src = assemble('proxy')
     .replace(/^import .*$/gm, '').replace('export default {', 'const __default = {').replace(/^export class /gm, 'class ');
-  return new Function('connect', 'WorkerEntrypoint', src + '\n;return { md5Bytes, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVssProtoHeader, isValidIp, parseProxyAddress, relayPlan, RELAY_DOMAINS, proxyConfig, pumpReadable };')(() => { throw new Error('no sockets'); }, class { constructor(ctx, env) { this.ctx = ctx; this.env = env; } });
+  return new Function('connect', 'WorkerEntrypoint', src + '\n;return { md5Bytes, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVssProtoHeader, isValidIp, parseHopAddress, altPlan, ALT_DOMAINS, nodeConfig, pumpReadable };')(() => { throw new Error('no sockets'); }, class { constructor(ctx, env) { this.ctx = ctx; this.env = env; } });
 })();
 
 const hex = (u8) => Buffer.from(u8).toString('hex');
@@ -653,7 +653,7 @@ for (const method of Object.keys(ssMethods)) {
     ];
     for (const [host, expectHeader] of targets) {
       const log = fakeNet({ '10.0.0.9': { delay: 5 } });
-      const env = baseEnv({ OUTBOUND_PROXY: `ss://${method}:${encodeURIComponent(password)}@10.0.0.9:8388`, OUTBOUND_MODE: 'only' });
+      const env = baseEnv({ HOP_ADDR: `ss://${method}:${encodeURIComponent(password)}@10.0.0.9:8388`, HOP_MODE: 'only' });
       const ws = await openWs(env);
       const big = new Uint8Array(40000).map((_, i) => i & 255); big.set(TLS_HELLO);   // 超过单块上限：必须拆块
       await ws.emit('message', { data: vlessReq(host, 443, [...big]).buffer });
@@ -679,7 +679,7 @@ test('Shadowsocks 出站：IPv4 / IPv6 目标使用对应的地址类型；密�
   const method = 'aes-256-gcm', password = 'secret';
   const run = async (req, header) => {
     const log = fakeNet({ '10.0.0.9': { delay: 5 } });
-    const env = baseEnv({ OUTBOUND_PROXY: `ss://${method}:${password}@10.0.0.9:8388`, OUTBOUND_MODE: 'only' });
+    const env = baseEnv({ HOP_ADDR: `ss://${method}:${password}@10.0.0.9:8388`, HOP_MODE: 'only' });
     const ws = await openWs(env);
     await ws.emit('message', { data: req.buffer });
     await until(() => log.length && ssRefDecodeClient(method, password, log[0].written).plain.length >= header.length);
@@ -698,8 +698,8 @@ const cfDoh = (map, log = []) => async (url) => {   // 简易 DoH：map[域名] 
 };
 
 test('地区反代计划：默认按机房自动选地区；可固定首选 / 次选；none 只用首选；custom 取前 3 个；off 为空', () => {
-  const plan = (relay, colo) => internals.relayPlan({ relay }, colo).map(p => `${p.host}:${p.port}x${p.take}`);
-  const R = internals.RELAY_DOMAINS;
+  const plan = (relay, colo) => internals.altPlan({ alt: relay }, colo).map(p => `${p.host}:${p.port}x${p.take}`);
+  const R = internals.ALT_DOMAINS;
   assert.deepEqual(plan(undefined, 'NRT'), [`${R.JP}:443x2`, `${R.HK}:443x1`], '默认：机房对应地区 + 默认的另一地区');
   assert.deepEqual(plan({ mode: 'builtin' }, 'HKG'), [`${R.HK}:443x2`, `${R.US}:443x1`], '首选为 HK 时次选用 US');
   assert.deepEqual(plan({ mode: 'builtin', region: 'DE', region2: 'NL' }, 'NRT'), [`${R.DE}:443x2`, `${R.NL}:443x1`]);
@@ -715,7 +715,7 @@ test('地区反代模式：off 时不解析也不连接任何地区反代；cust
   // off：目标直连失败后不尝试任何反代，连接被关闭
   let log = fakeNet({});
   let dns = [];
-  let env = baseEnv({ RELAY_MODE: 'off' });
+  let env = baseEnv({ ALT_MODE: 'off' });
   await withFetch(cfDoh({}, dns), async () => {
     const ws = await openWs(env);
     await ws.emit('message', { data: vlessReq('off-test.example', 443, TLS_HELLO).buffer });
@@ -726,8 +726,8 @@ test('地区反代模式：off 时不解析也不连接任何地区反代；cust
   // custom：直连挂起（目标在 Cloudflare 上）→ 自定义反代接管，内置反代不被碰
   log = fakeNet({ 'cf-custom.example': { delay: 'hang' }, '203.0.113.31': { delay: 10 }, '203.0.113.30': { delay: 40 } });
   dns = [];
-  env = baseEnv({ RELAY_MODE: 'custom', RELAY_CUSTOM: 'my-relay.example.com\n203.0.113.30:8443' });
-  await withFetch(cfDoh({ 'my-relay.example.com': ['203.0.113.31'] }, dns), async () => {
+  env = baseEnv({ ALT_MODE: 'custom', ALT_CUSTOM: 'my-alt.example.com\n203.0.113.30:8443' });
+  await withFetch(cfDoh({ 'my-alt.example.com': ['203.0.113.31'] }, dns), async () => {
     const ws = await openWs(env);
     await ws.emit('message', { data: vlessReq('cf-custom.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));
@@ -740,7 +740,7 @@ test('地区反代模式：off 时不解析也不连接任何地区反代；cust
   // 固定地区：首选 SE、次选不使用 → 只解析 SE
   log = fakeNet({ 'cf-se.example': { delay: 'hang' }, '203.0.113.50': { delay: 10 } });
   dns = [];
-  env = baseEnv({ RELAY_MODE: 'builtin', RELAY_REGION: 'SE', RELAY_REGION2: 'none' });
+  env = baseEnv({ ALT_MODE: 'builtin', ALT_REGION: 'SE', ALT_REGION2: 'none' });
   await withFetch(cfDoh({ 'proxyip.se.cmliussss.net': ['203.0.113.50'] }, dns), async () => {
     const ws = await openWs(env);
     await ws.emit('message', { data: vlessReq('cf-se.example', 443, TLS_HELLO).buffer });
@@ -829,31 +829,31 @@ test('WS：同一帧内一次性到达的大量数据帧（建连完成前）按
 import { readFileSync } from 'node:fs';
 
 test('环境变量：PATH 首尾斜杠自动去掉；其余设置缺省时与原先面板里的默认值一致', () => {
-  const cfg = internals.proxyConfig({ UUID: UUID.toUpperCase(), PATH: '/mynode/' });
+  const cfg = internals.nodeConfig({ UUID: UUID.toUpperCase(), PATH: '/mynode/' });
   assert.equal(cfg.uuid, UUID, 'UUID 转小写');
   assert.equal(cfg.path, 'mynode');
   assert.deepEqual(cfg._problems, []);
-  assert.equal(cfg.proxyIP, '');
-  assert.equal(cfg.outboundProxy, '');
-  assert.equal(cfg.outboundMode, '');
-  assert.deepEqual(cfg.relay, { mode: 'builtin', region: '', region2: '', custom: '' });
+  assert.equal(cfg.edgeIP, '');
+  assert.equal(cfg.hopAddr, '');
+  assert.equal(cfg.hopMode, '');
+  assert.deepEqual(cfg.alt, { mode: 'builtin', region: '', region2: '', custom: '' });
 });
 
 test('环境变量：出站 / 地区反代设置按原先的取值校验，无效值回落默认；自定义反代最多 3 个、支持换行与逗号分隔', () => {
-  const c = (extra) => internals.proxyConfig({ UUID, PATH: 'p', ...extra });
-  assert.equal(c({ PROXYIP: ' proxy.example.com:8443 ' }).proxyIP, 'proxy.example.com:8443');
-  assert.equal(c({ OUTBOUND_PROXY: 'socks5://u:p@1.2.3.4:1080' }).outboundProxy, 'socks5://u:p@1.2.3.4:1080');
-  assert.equal(c({ OUTBOUND_MODE: 'only' }).outboundMode, 'only');
-  assert.equal(c({ OUTBOUND_MODE: 'NO' }).outboundMode, 'no');
-  assert.equal(c({ OUTBOUND_MODE: 'bogus' }).outboundMode, '');
-  assert.equal(c({ RELAY_MODE: 'off' }).relay.mode, 'off');
-  assert.equal(c({ RELAY_MODE: 'custom' }).relay.mode, 'custom');
-  assert.equal(c({ RELAY_MODE: 'nonsense' }).relay.mode, 'builtin');
-  assert.equal(c({ RELAY_REGION: 'jp', RELAY_REGION2: 'NONE' }).relay.region, 'JP', '地区名不区分大小写');
-  assert.equal(c({ RELAY_REGION: 'jp', RELAY_REGION2: 'NONE' }).relay.region2, 'none');
-  assert.equal(c({ RELAY_REGION: 'digitalocean' }).relay.region, 'DigitalOcean');
-  assert.equal(c({ RELAY_REGION: 'Atlantis' }).relay.region, '');
-  assert.equal(c({ RELAY_CUSTOM: 'a.example.com, b.example.com:8443\nc.example.com;d.example.com' }).relay.custom, 'a.example.com\nb.example.com:8443\nc.example.com');
+  const c = (extra) => internals.nodeConfig({ UUID, PATH: 'p', ...extra });
+  assert.equal(c({ EDGEIP: ' proxy.example.com:8443 ' }).edgeIP, 'proxy.example.com:8443');
+  assert.equal(c({ HOP_ADDR: 'socks5://u:p@1.2.3.4:1080' }).hopAddr, 'socks5://u:p@1.2.3.4:1080');
+  assert.equal(c({ HOP_MODE: 'only' }).hopMode, 'only');
+  assert.equal(c({ HOP_MODE: 'NO' }).hopMode, 'no');
+  assert.equal(c({ HOP_MODE: 'bogus' }).hopMode, '');
+  assert.equal(c({ ALT_MODE: 'off' }).alt.mode, 'off');
+  assert.equal(c({ ALT_MODE: 'custom' }).alt.mode, 'custom');
+  assert.equal(c({ ALT_MODE: 'nonsense' }).alt.mode, 'builtin');
+  assert.equal(c({ ALT_REGION: 'jp', ALT_REGION2: 'NONE' }).alt.region, 'JP', '地区名不区分大小写');
+  assert.equal(c({ ALT_REGION: 'jp', ALT_REGION2: 'NONE' }).alt.region2, 'none');
+  assert.equal(c({ ALT_REGION: 'digitalocean' }).alt.region, 'DigitalOcean');
+  assert.equal(c({ ALT_REGION: 'Atlantis' }).alt.region, '');
+  assert.equal(c({ ALT_CUSTOM: 'a.example.com, b.example.com:8443\nc.example.com;d.example.com' }).alt.custom, 'a.example.com\nb.example.com:8443\nc.example.com');
 });
 
 test('必填环境变量：UUID / PATH 缺失或非法时所有请求返回 503 设置说明', async () => {
@@ -902,24 +902,24 @@ test('构建产物：代理脚本不含面板 / 登录 / 订阅 / 管理接口 /
   }
 });
 
-// ---------------- 只读状态入口 ProxyStatus（服务绑定） ----------------
+// ---------------- 只读状态入口 NodeStatus（服务绑定） ----------------
 import { PROXY_VERSION } from './helpers-version.mjs';
 
-test('ProxyStatus.status()：在线与否、版本、配置问题与非敏感的设置摘要；不返回 UUID / 路径 / 反代地址 / 出站代理的主机与密码', async () => {
-  assert.equal(typeof proxyModule.ProxyStatus, 'function');
-  const env = baseEnv({ PATH: 'secret-node-path', PROXYIP: 'relay.private.example:8443', OUTBOUND_PROXY: 'socks5://alice:hunter2@10.9.8.7:1080', OUTBOUND_MODE: 'only', RELAY_MODE: 'custom', RELAY_CUSTOM: 'a.example\nb.example' });
-  const st = await new proxyModule.ProxyStatus({}, env).status();
+test('NodeStatus.status()：在线与否、版本、配置问题与非敏感的设置摘要；不返回 UUID / 路径 / 反代地址 / 出站代理的主机与密码', async () => {
+  assert.equal(typeof proxyModule.NodeStatus, 'function');
+  const env = baseEnv({ PATH: 'secret-node-path', EDGEIP: 'alt.private.example:8443', HOP_ADDR: 'socks5://alice:hunter2@10.9.8.7:1080', HOP_MODE: 'only', ALT_MODE: 'custom', ALT_CUSTOM: 'a.example\nb.example' });
+  const st = await new proxyModule.NodeStatus({}, env).status();
   assert.equal(st.ok, true);
   assert.equal(st.version, PROXY_VERSION);
   assert.deepEqual(st.problems, []);
-  assert.deepEqual(st.settings, { proxyIP: true, outboundProxy: 'socks5', outboundMode: 'only', relayMode: 'custom', relayRegion: '', relayRegion2: '', relayCustom: 2 });
+  assert.deepEqual(st.settings, { edgeIP: true, hopAddr: 'socks5', hopMode: 'only', altMode: 'custom', altRegion: '', altRegion2: '', altCustom: 2 });
   const text = JSON.stringify(st);
-  for (const secret of [UUID, 'secret-node-path', 'relay.private.example', 'alice', 'hunter2', '10.9.8.7', 'a.example']) assert.ok(!text.includes(secret), secret);
+  for (const secret of [UUID, 'secret-node-path', 'alt.private.example', 'alice', 'hunter2', '10.9.8.7', 'a.example']) assert.ok(!text.includes(secret), secret);
   // 默认设置
-  const d = await new proxyModule.ProxyStatus({}, baseEnv()).status();
-  assert.deepEqual(d.settings, { proxyIP: false, outboundProxy: '', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 });
+  const d = await new proxyModule.NodeStatus({}, baseEnv()).status();
+  assert.deepEqual(d.settings, { edgeIP: false, hopAddr: '', hopMode: '', altMode: 'builtin', altRegion: '', altRegion2: '', altCustom: 0 });
   // 配置有问题时仍在线，但 ok 为 false 并列出原因
-  const bad = await new proxyModule.ProxyStatus({}, {}).status();
+  const bad = await new proxyModule.NodeStatus({}, {}).status();
   assert.equal(bad.ok, false);
   assert.equal(bad.version, PROXY_VERSION);
   assert.equal(bad.problems.length, 2);
@@ -927,7 +927,7 @@ test('ProxyStatus.status()：在线与否、版本、配置问题与非敏感的
 
 test('状态只能通过服务绑定读取：没有任何 HTTP 路由能拿到版本或状态，公开响应里没有版本号', async () => {
   const env = baseEnv({ PATH: 'mynode' });
-  for (const path of ['/', '/status', '/version', '/ProxyStatus', '/mynode', '/mynode/status', '/mynode/version', '/api/status']) {
+  for (const path of ['/', '/status', '/version', '/NodeStatus', '/mynode', '/mynode/status', '/mynode/version', '/api/status']) {
     for (const init of [{}, { method: 'POST', body: 'x' }, { headers: { 'User-Agent': 'Mozilla/5.0' } }]) {
       if (path === '/mynode' && init.method === 'POST') continue;   // 节点路径上的 POST 是 XHTTP 入口，不是伪装页
       const res = await worker.fetch(new Request('https://node.example.com' + path, init), env, {});
@@ -937,22 +937,22 @@ test('状态只能通过服务绑定读取：没有任何 HTTP 路由能拿到�
       assert.ok(!body.includes(PROXY_VERSION), path);
     }
   }
-  assert.deepEqual(Object.keys(proxyModule).sort(), ['ProxyControl', 'ProxyStatus', 'default'], '模块只导出默认入口与两个 RPC 入口');
+  assert.deepEqual(Object.keys(proxyModule).sort(), ['NodeControl', 'NodeStatus', 'default'], '模块只导出默认入口与两个 RPC 入口');
 });
 
-test('混淆版代理脚本保留入口名 ProxyStatus / ProxyControl（服务绑定按名字找入口），在线设置同样可用', async () => {
+test('混淆版代理脚本保留入口名 NodeStatus / NodeControl（服务绑定按名字找入口），在线设置同样可用', async () => {
   const obf = await import('../obf_Hopline-proxy.js?obf-test');
-  assert.deepEqual(Object.keys(obf).sort(), ['ProxyControl', 'ProxyStatus', 'default']);
+  assert.deepEqual(Object.keys(obf).sort(), ['NodeControl', 'NodeStatus', 'default']);
   const kv = memKv();
-  const st = await new obf.ProxyControl({}, baseEnv({ PROXY_KV: kv })).status();
+  const st = await new obf.NodeControl({}, baseEnv({ NODE_KV: kv })).status();
   assert.equal(st.ok, true);
   assert.equal(st.version, PROXY_VERSION);
   assert.equal(st.control, true);
-  assert.equal((await new obf.ProxyControl({}, baseEnv({ PROXY_KV: kv })).setSettings({ outboundMode: 'no' })).ok, true);
-  assert.deepEqual(JSON.parse(kv.m.get('settings')), { outboundMode: 'no' });
+  assert.equal((await new obf.NodeControl({}, baseEnv({ NODE_KV: kv })).setSettings({ hopMode: 'no' })).ok, true);
+  assert.deepEqual(JSON.parse(kv.m.get('settings')), { hopMode: 'no' });
 });
 
-// ---------------- 在线修改设置：ProxyControl + 代理自己的 KV（PROXY_KV） ----------------
+// ---------------- 在线修改设置：NodeControl + 代理自己的 KV（NODE_KV） ----------------
 function memKv(init = {}) {
   const m = new Map(Object.entries(init).map(([k, v]) => [k, typeof v === 'string' ? v : JSON.stringify(v)]));
   const kv = { m, gets: 0, puts: 0, down: false,
@@ -961,57 +961,57 @@ function memKv(init = {}) {
     async delete(k) { m.delete(k); } };
   return kv;
 }
-const control = (env) => new proxyModule.ProxyControl({}, env);
+const control = (env) => new proxyModule.NodeControl({}, env);
 const storedOf = (kv) => JSON.parse(kv.m.get('settings'));
 
-test('ProxyControl 没有 KV 时：getSettings 只读（storage:false，显示环境变量的值），setSettings / resetSettings 明确拒绝', async () => {
-  const env = baseEnv({ PROXYIP: 'env-relay.example:8443', RELAY_MODE: 'off' });
+test('NodeControl 没有 KV 时：getSettings 只读（storage:false，显示环境变量的值），setSettings / resetSettings 明确拒绝', async () => {
+  const env = baseEnv({ EDGEIP: 'env-alt.example:8443', ALT_MODE: 'off' });
   const g = await control(env).getSettings();
   assert.equal(g.ok, true); assert.equal(g.storage, false);
-  assert.equal(g.settings.proxyIP, 'env-relay.example:8443'); assert.equal(g.settings['relay.mode'], 'off');
-  assert.deepEqual(g.source, { proxyIP: 'env', outboundProxy: 'default', outboundMode: 'default', 'relay.mode': 'env', 'relay.region': 'default', 'relay.region2': 'default', 'relay.custom': 'default' });
+  assert.equal(g.settings.edgeIP, 'env-alt.example:8443'); assert.equal(g.settings['alt.mode'], 'off');
+  assert.deepEqual(g.source, { edgeIP: 'env', hopAddr: 'default', hopMode: 'default', 'alt.mode': 'env', 'alt.region': 'default', 'alt.region2': 'default', 'alt.custom': 'default' });
   assert.ok(g.regions.includes('HK') && g.regions.includes('Multacom'));
-  const s = await control(env).setSettings({ proxyIP: 'x.example' });
-  assert.equal(s.ok, false); assert.match(s.error, /PROXY_KV/);
+  const s = await control(env).setSettings({ edgeIP: 'x.example' });
+  assert.equal(s.ok, false); assert.match(s.error, /NODE_KV/);
   assert.equal((await control(env).resetSettings()).ok, false);
 });
 
-test('ProxyControl.setSettings：校验后保存到 KV，生效值 = KV > 环境变量 > 默认；与环境变量相同的值不落盘；只读入口 ProxyStatus 没有这些方法', async () => {
+test('NodeControl.setSettings：校验后保存到 KV，生效值 = KV > 环境变量 > 默认；与环境变量相同的值不落盘；只读入口 NodeStatus 没有这些方法', async () => {
   const kv = memKv();
-  const env = baseEnv({ PROXY_KV: kv, PROXYIP: 'env-relay.example', OUTBOUND_PROXY: 'socks5://u:p@1.2.3.4:1080' });
+  const env = baseEnv({ NODE_KV: kv, EDGEIP: 'env-alt.example', HOP_ADDR: 'socks5://u:p@1.2.3.4:1080' });
   const r = await control(env).setSettings({
-    proxyIP: ' mine.example:8443 ', outboundProxy: 'socks5://u:p@1.2.3.4:1080', outboundMode: 'only',
-    'relay.mode': 'custom', 'relay.custom': 'A.Example.com, [2001:db8::1]:8443\nb.example.com:443', bogus: 'x',
+    edgeIP: ' mine.example:8443 ', hopAddr: 'socks5://u:p@1.2.3.4:1080', hopMode: 'only',
+    'alt.mode': 'custom', 'alt.custom': 'A.Example.com, [2001:db8::1]:8443\nb.example.com:443', bogus: 'x',
   });
   assert.equal(r.ok, true, JSON.stringify(r));
   assert.deepEqual(r.ignored, ['bogus']);
-  assert.deepEqual(storedOf(kv), { proxyIP: 'mine.example:8443', outboundMode: 'only', 'relay.mode': 'custom', 'relay.custom': 'a.example.com\n[2001:db8::1]:8443\nb.example.com' }, '与环境变量相同的出站代理没有落盘');
-  assert.equal(r.settings.outboundProxy, 'socks5://u:p@1.2.3.4:1080');
+  assert.deepEqual(storedOf(kv), { edgeIP: 'mine.example:8443', hopMode: 'only', 'alt.mode': 'custom', 'alt.custom': 'a.example.com\n[2001:db8::1]:8443\nb.example.com' }, '与环境变量相同的出站代理没有落盘');
+  assert.equal(r.settings.hopAddr, 'socks5://u:p@1.2.3.4:1080');
   assert.equal(r.storage, true);
-  assert.equal(r.source.proxyIP, 'kv'); assert.equal(r.source.outboundProxy, 'env'); assert.equal(r.source['relay.region'], 'default');
+  assert.equal(r.source.edgeIP, 'kv'); assert.equal(r.source.hopAddr, 'env'); assert.equal(r.source['alt.region'], 'default');
   // 之后环境变量变化立即生效（KV 里没有它的快照）
-  const later = baseEnv({ PROXY_KV: kv, PROXYIP: 'env-relay.example', OUTBOUND_PROXY: 'socks5://u:p@9.9.9.9:1080' });
-  assert.equal((await control(later).getSettings()).settings.outboundProxy, 'socks5://u:p@9.9.9.9:1080');
+  const later = baseEnv({ NODE_KV: kv, EDGEIP: 'env-alt.example', HOP_ADDR: 'socks5://u:p@9.9.9.9:1080' });
+  assert.equal((await control(later).getSettings()).settings.hopAddr, 'socks5://u:p@9.9.9.9:1080');
   // 改回与环境变量相同：该项从 KV 里移除
-  const back = await control(env).setSettings({ proxyIP: 'env-relay.example' });
+  const back = await control(env).setSettings({ edgeIP: 'env-alt.example' });
   assert.equal(back.ok, true);
-  assert.equal('proxyIP' in storedOf(kv), false);
-  assert.equal(back.source.proxyIP, 'env');
+  assert.equal('edgeIP' in storedOf(kv), false);
+  assert.equal(back.source.edgeIP, 'env');
   // 只读入口没有写方法，也没有 getSettings
-  const ro = new proxyModule.ProxyStatus({}, env);
+  const ro = new proxyModule.NodeStatus({}, env);
   for (const m of ['getSettings', 'setSettings', 'resetSettings']) assert.equal(ro[m], undefined, m);
 });
 
-test('ProxyControl.setSettings 校验：每项给出字段级错误，整批都不保存；自定义模式必须有反代列表；UUID / PATH 改不了', async () => {
+test('NodeControl.setSettings 校验：每项给出字段级错误，整批都不保存；自定义模式必须有反代列表；UUID / PATH 改不了', async () => {
   const kv = memKv();
-  const env = baseEnv({ PROXY_KV: kv });
+  const env = baseEnv({ NODE_KV: kv });
   const bad = [
-    [{ proxyIP: 'bad host' }, 'proxyIP'], [{ proxyIP: 'a/b' }, 'proxyIP'], [{ proxyIP: 'x.example:99999' }, 'proxyIP'],
-    [{ outboundProxy: 'ss://rc4:pw@1.2.3.4:8388' }, 'outboundProxy'], [{ outboundProxy: 'ss://aes-256-gcm@1.2.3.4:8388' }, 'outboundProxy'],
-    [{ outboundProxy: 'socks5://has space@1.2.3.4:1' }, 'outboundProxy'], [{ outboundMode: 'sideways' }, 'outboundMode'],
-    [{ 'relay.mode': 'sideways' }, 'relay.mode'], [{ 'relay.region': 'Atlantis' }, 'relay.region'], [{ 'relay.region2': 'Atlantis' }, 'relay.region2'],
-    [{ 'relay.custom': 'a.example.com\nb.example.com\nc.example.com\nd.example.com' }, 'relay.custom'], [{ 'relay.custom': 'bad host' }, 'relay.custom'],
-    [{ 'relay.custom': 'x.example.com:70000' }, 'relay.custom'], [{ 'relay.mode': 'custom' }, 'relay.custom'], [{ proxyIP: 123 }, 'proxyIP'],
+    [{ edgeIP: 'bad host' }, 'edgeIP'], [{ edgeIP: 'a/b' }, 'edgeIP'], [{ edgeIP: 'x.example:99999' }, 'edgeIP'],
+    [{ hopAddr: 'ss://rc4:pw@1.2.3.4:8388' }, 'hopAddr'], [{ hopAddr: 'ss://aes-256-gcm@1.2.3.4:8388' }, 'hopAddr'],
+    [{ hopAddr: 'socks5://has space@1.2.3.4:1' }, 'hopAddr'], [{ hopMode: 'sideways' }, 'hopMode'],
+    [{ 'alt.mode': 'sideways' }, 'alt.mode'], [{ 'alt.region': 'Atlantis' }, 'alt.region'], [{ 'alt.region2': 'Atlantis' }, 'alt.region2'],
+    [{ 'alt.custom': 'a.example.com\nb.example.com\nc.example.com\nd.example.com' }, 'alt.custom'], [{ 'alt.custom': 'bad host' }, 'alt.custom'],
+    [{ 'alt.custom': 'x.example.com:70000' }, 'alt.custom'], [{ 'alt.mode': 'custom' }, 'alt.custom'], [{ edgeIP: 123 }, 'edgeIP'],
   ];
   for (const [patch, field] of bad) {
     const r = await control(env).setSettings(patch);
@@ -1019,59 +1019,59 @@ test('ProxyControl.setSettings 校验：每项给出字段级错误，整批都�
     assert.ok(r.errors.some(e => e.field === field), JSON.stringify(patch) + ' → ' + JSON.stringify(r.errors));
   }
   // 一批里有一项出错：其它合法项也不保存
-  const mixed = await control(env).setSettings({ outboundMode: 'no', proxyIP: 'bad host' });
+  const mixed = await control(env).setSettings({ hopMode: 'no', edgeIP: 'bad host' });
   assert.equal(mixed.ok, false);
   assert.equal(kv.puts, 0, '校验失败不写 KV');
   assert.equal((await control(env).setSettings(null)).ok, false);
   // UUID / PATH 不是可修改的设置：被报告为忽略，不会写入
-  const id = await control(env).setSettings({ UUID: 'x', PATH: 'y', uuid: 'z', path: 'w', outboundMode: 'no' });
+  const id = await control(env).setSettings({ UUID: 'x', PATH: 'y', uuid: 'z', path: 'w', hopMode: 'no' });
   assert.equal(id.ok, true);
   assert.deepEqual(id.ignored.sort(), ['PATH', 'UUID', 'path', 'uuid']);
-  assert.deepEqual(storedOf(kv), { outboundMode: 'no' });
+  assert.deepEqual(storedOf(kv), { hopMode: 'no' });
   assert.ok(!kv.m.get('settings').includes(UUID));
 });
 
-test('ProxyControl：KV 损坏时忽略并允许保存来修复；KV 读取失败时拒绝保存、不覆盖已有设置；resetSettings 清除覆盖项', async () => {
+test('NodeControl：KV 损坏时忽略并允许保存来修复；KV 读取失败时拒绝保存、不覆盖已有设置；resetSettings 清除覆盖项', async () => {
   const kv = memKv({ settings: '{not json' });
-  const env = baseEnv({ PROXY_KV: kv, RELAY_MODE: 'off' });
+  const env = baseEnv({ NODE_KV: kv, ALT_MODE: 'off' });
   const g = await control(env).getSettings();
-  assert.equal(g.error, 'corrupt'); assert.equal(g.settings['relay.mode'], 'off', '损坏的设置被忽略，用环境变量');
-  assert.equal((await control(env).setSettings({ outboundMode: 'no' })).ok, true, '损坏时允许保存（修复）');
-  assert.deepEqual(storedOf(kv), { outboundMode: 'no' });
+  assert.equal(g.error, 'corrupt'); assert.equal(g.settings['alt.mode'], 'off', '损坏的设置被忽略，用环境变量');
+  assert.equal((await control(env).setSettings({ hopMode: 'no' })).ok, true, '损坏时允许保存（修复）');
+  assert.deepEqual(storedOf(kv), { hopMode: 'no' });
   // 无效项在读取时被丢弃，其它项保留
-  const kv2 = memKv({ settings: { outboundMode: 'sideways', proxyIP: 'ok.example', bogus: 1 } });
-  const g2 = await control(baseEnv({ PROXY_KV: kv2 })).getSettings();
-  assert.equal(g2.settings.proxyIP, 'ok.example'); assert.equal(g2.settings.outboundMode, '');
+  const kv2 = memKv({ settings: { hopMode: 'sideways', edgeIP: 'ok.example', bogus: 1 } });
+  const g2 = await control(baseEnv({ NODE_KV: kv2 })).getSettings();
+  assert.equal(g2.settings.edgeIP, 'ok.example'); assert.equal(g2.settings.hopMode, '');
   // 读取失败：拒绝保存
-  const kv3 = memKv({ settings: { proxyIP: 'keep.example' } });
+  const kv3 = memKv({ settings: { edgeIP: 'keep.example' } });
   kv3.down = true;
-  const env3 = baseEnv({ PROXY_KV: kv3 });
-  const refused = await control(env3).setSettings({ proxyIP: 'new.example' });
+  const env3 = baseEnv({ NODE_KV: kv3 });
+  const refused = await control(env3).setSettings({ edgeIP: 'new.example' });
   assert.equal(refused.ok, false); assert.match(refused.error, /KV 暂时无法读取/);
   assert.equal(kv3.puts, 0);
   kv3.down = false;
   // reset
-  const kv4 = memKv({ settings: { proxyIP: 'x.example' } });
-  const env4 = baseEnv({ PROXY_KV: kv4, PROXYIP: 'env.example' });
+  const kv4 = memKv({ settings: { edgeIP: 'x.example' } });
+  const env4 = baseEnv({ NODE_KV: kv4, EDGEIP: 'env.example' });
   const rs = await control(env4).resetSettings();
-  assert.equal(rs.ok, true); assert.equal(rs.settings.proxyIP, 'env.example'); assert.equal(kv4.m.has('settings'), false);
-  assert.equal((await control(env4).getSettings()).settings.proxyIP, 'env.example');
+  assert.equal(rs.ok, true); assert.equal(rs.settings.edgeIP, 'env.example'); assert.equal(kv4.m.has('settings'), false);
+  assert.equal((await control(env4).getSettings()).settings.edgeIP, 'env.example');
 });
 
 test('status()：control 标志、是否有 KV、摘要反映 KV 里的在线设置；仍不返回任何密钥', async () => {
-  const kv = memKv({ settings: { 'relay.mode': 'off', outboundProxy: 'http://carol:s3cret@10.1.1.1:8080', outboundMode: 'only' } });
-  const env = baseEnv({ PROXY_KV: kv });
+  const kv = memKv({ settings: { 'alt.mode': 'off', hopAddr: 'http://carol:s3cret@10.1.1.1:8080', hopMode: 'only' } });
+  const env = baseEnv({ NODE_KV: kv });
   const full = await control(env).status();
   assert.equal(full.control, true); assert.equal(full.storage, true);
-  assert.deepEqual(full.settings, { proxyIP: false, outboundProxy: 'http', outboundMode: 'only', relayMode: 'off', relayRegion: '', relayRegion2: '', relayCustom: 0 });
+  assert.deepEqual(full.settings, { edgeIP: false, hopAddr: 'http', hopMode: 'only', altMode: 'off', altRegion: '', altRegion2: '', altCustom: 0 });
   assert.ok(!JSON.stringify(full).includes('s3cret') && !JSON.stringify(full).includes('10.1.1.1'));
-  const ro = await new proxyModule.ProxyStatus({}, baseEnv()).status();
+  const ro = await new proxyModule.NodeStatus({}, baseEnv()).status();
   assert.equal(ro.control, false); assert.equal(ro.storage, false);
 });
 
 test('在线设置真正生效：节点路径上的连接按 KV 里的设置出站；KV 读取有缓存、伪装页请求不读 KV；KV 故障时沿用上次的设置', async () => {
-  const kv = memKv({ settings: { 'relay.mode': 'off' } });
-  const env = baseEnv({ PROXY_KV: kv });
+  const kv = memKv({ settings: { 'alt.mode': 'off' } });
+  const env = baseEnv({ NODE_KV: kv });
   const realNow = Date.now;
   let t = realNow();
   Date.now = () => t;
@@ -1089,13 +1089,13 @@ test('在线设置真正生效：节点路径上的连接按 KV 里的设置出�
         assert.equal(ws.closed.code, 1011);
       }
     });
-    assert.equal(dns.filter(d => d.name.startsWith('proxyip.')).length, 0, 'KV 里的 relay.mode=off 生效：没有解析内置反代');
+    assert.equal(dns.filter(d => d.name.startsWith('proxyip.')).length, 0, 'KV 里的 alt.mode=off 生效：没有解析内置反代');
     assert.equal(kv.gets, 1, '3 个连接只读了一次 KV（isolate 内存缓存）');
     // 改成自定义反代，缓存过期后新设置生效
-    kv.m.set('settings', JSON.stringify({ 'relay.mode': 'custom', 'relay.custom': 'kv-relay.example.com' }));
+    kv.m.set('settings', JSON.stringify({ 'alt.mode': 'custom', 'alt.custom': 'kv-alt.example.com' }));
     t += 25 * 1000;
     log = fakeNet({ 'kv-cf.example': { delay: 'hang' }, '203.0.113.77': { delay: 10 } });
-    await withFetch(cfDoh({ 'kv-relay.example.com': ['203.0.113.77'] }, []), async () => {
+    await withFetch(cfDoh({ 'kv-alt.example.com': ['203.0.113.77'] }, []), async () => {
       const ws = await openWs(env);
       await ws.emit('message', { data: vlessReq('kv-cf.example', 443, TLS_HELLO).buffer });
       await until(() => log.some(s => s.written.length));
@@ -1106,22 +1106,22 @@ test('在线设置真正生效：节点路径上的连接按 KV 里的设置出�
     kv.down = true;
     t += 25 * 1000;
     log = fakeNet({ 'kv-cf.example': { delay: 'hang' }, '203.0.113.77': { delay: 10 } });
-    await withFetch(cfDoh({ 'kv-relay.example.com': ['203.0.113.77'] }, []), async () => {
+    await withFetch(cfDoh({ 'kv-alt.example.com': ['203.0.113.77'] }, []), async () => {
       const ws = await openWs(env);
       await ws.emit('message', { data: vlessReq('kv-cf.example', 443, TLS_HELLO).buffer });
       await until(() => log.some(s => s.written.length));
     });
     assert.equal(log.find(s => s.written.length).hostname, '203.0.113.77', 'KV 读取失败时沿用上次的设置');
   } finally { Date.now = realNow; }
-  // 通过 ProxyControl 保存后，同一 isolate 立即生效（不等缓存过期）
+  // 通过 NodeControl 保存后，同一 isolate 立即生效（不等缓存过期）
   const kv2 = memKv();
-  const env2 = baseEnv({ PROXY_KV: kv2 });
+  const env2 = baseEnv({ NODE_KV: kv2 });
   fakeNet({});
   const dns2 = [];
   await withFetch(cfDoh({}, dns2), async () => {
     const before = await openWs(env2);
     await before.emit('message', { data: vlessReq('save-live.example', 443, TLS_HELLO).buffer });
-    await control(env2).setSettings({ 'relay.mode': 'off' });
+    await control(env2).setSettings({ 'alt.mode': 'off' });
     dns2.length = 0;
     const after = await openWs(env2);
     await after.emit('message', { data: vlessReq('save-live.example', 443, TLS_HELLO).buffer });

@@ -154,7 +154,7 @@ function formatConfigErrors(errors) {
   return errors.map(e => (e.label ? e.label + '：' : '') + e.msg).join('；');
 }
 
-// 调用代理的 RPC（服务绑定 PROXY → 代理 Worker 的 ProxyStatus / ProxyControl 入口）：带超时，失败时抛 Error，由调用方转成面板能显示的结果
+// 调用代理的 RPC（服务绑定 PROXY → 代理 Worker 的 NodeStatus / NodeControl 入口）：带超时，失败时抛 Error，由调用方转成面板能显示的结果
 const PROXY_CALL_TIMEOUT = 4000;
 async function callProxy(env, method, ...args) {
   if (!(env && env.PROXY)) throw Object.assign(new Error('没有绑定服务绑定 PROXY'), { unbound: true });
@@ -175,7 +175,7 @@ async function proxyStatus(env) {
     return { bound: true, up: false, error: String((e && e.message) || e) };
   }
 }
-// 在线修改代理设置：把面板的请求转给代理的 ProxyControl 入口；绑定的是只读入口 ProxyStatus 时代理会报「does not implement」
+// 在线修改代理设置：把面板的请求转给代理的 NodeControl 入口；绑定的是只读入口 NodeStatus 时代理会报「does not implement」
 async function proxySettingsCall(env, method, ...args) {
   try {
     const r = await callProxy(env, method, ...args);
@@ -183,8 +183,8 @@ async function proxySettingsCall(env, method, ...args) {
     return json({ ok: true, data: r });
   } catch (e) {
     const msg = String((e && e.message) || e);
-    if (e && e.unbound) return json({ ok: false, msg: '没有绑定服务绑定 PROXY：请在面板 Worker 添加变量名 PROXY、入口 ProxyControl 的服务绑定' }, 400);
-    return json({ ok: false, msg: '无法调用代理：' + msg + '。请确认服务绑定 PROXY 的入口是 ProxyControl，且代理已更新到 3.0.2 或更高版本' }, 502);
+    if (e && e.unbound) return json({ ok: false, msg: '没有绑定服务绑定 PROXY：请在面板 Worker 添加变量名 PROXY、入口 NodeControl 的服务绑定' }, 400);
+    return json({ ok: false, msg: '无法调用代理：' + msg + '。请确认服务绑定 PROXY 的入口是 NodeControl，且代理已更新到 3.0.3 或更高版本' }, 502);
   }
 }
 
@@ -271,7 +271,7 @@ async function handleRequest(request, env, state) {
 
   // 根路径不跳转到面板入口（否则会把面板路径 / UUID 告诉任何访问者），返回伪装页
   if (segs[0] === '') {
-    return helloPage();
+    return stubPage();
   }
 
   // ---------- 订阅 ----------
@@ -344,7 +344,7 @@ async function handleRequest(request, env, state) {
       return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
     }
 
-    // 代理状态：通过服务绑定 PROXY（入口 ProxyStatus）读取代理的在线状态与版本；没绑定就只返回 bound:false，面板其它功能不受影响
+    // 代理状态：通过服务绑定 PROXY（入口 NodeStatus）读取代理的在线状态与版本；没绑定就只返回 bound:false，面板其它功能不受影响
     if (apiName === 'proxy-status') return json({ ok: true, data: await proxyStatus(env) });
     // 在线修改代理设置（7 项出站 / 地区反代设置）：GET 读取、POST 保存（只提交出现的项，整批校验）、proxy-reset 恢复为环境变量 + 默认值
     if (apiName === 'proxy-settings') {
@@ -437,7 +437,7 @@ async function handleRequest(request, env, state) {
   }
 
   // 未匹配任何有效路由（路径不对）：返回伪装页，不暴露部署存在
-  return helloPage();
+  return stubPage();
 }
 
 // 安全响应头：只加在 HTML 页面与 JSON 接口上（订阅、WebSocket、XHTTP 流不动）。

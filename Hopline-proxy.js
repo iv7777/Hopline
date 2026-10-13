@@ -1,4 +1,4 @@
-/*!Hopline-proxy v3.0.2*/
+/*!Hopline-proxy v3.0.3*/
 // ============================================================================
 //  Hopline 代理 —— 只做一件事：在节点路径上接收 VLESS（WebSocket / XHTTP）并转发
 //  ----------------------------------------------------------------------------
@@ -7,24 +7,24 @@
 //  所有设置都来自环境变量：
 //    UUID             【必填】VLESS 用户 ID
 //    PATH             【必填】节点路径（WebSocket / XHTTP 共用），如 mynode
-//    PROXYIP          自定义反代/落地 IP（填写后作为固定出口优先使用；留空则直连失败时由地区反代兜底），格式 host 或 host:port
-//    OUTBOUND_PROXY   出站代理（socks5:// / http:// / ss:// 或 host:port）
-//    OUTBOUND_MODE    出站方式：留空 = 出站代理优先，失败后直连 ∥ 反代；no = 直连 ∥ 反代优先；only = 仅走出站代理
-//    RELAY_MODE       地区反代：builtin（默认，按 Worker 机房自动选地区）/ custom / off
-//    RELAY_REGION     builtin 的首选地区（HK US SG JP KR DE SE NL FI GB Oracle DigitalOcean Vultr Multacom；留空按机房自动选）
-//    RELAY_REGION2    builtin 的次选地区（同上；留空自动，none = 不使用）
-//    RELAY_CUSTOM     custom 的反代列表（最多 3 个 host[:port]，换行或逗号分隔）
+//    EDGEIP          自定义反代/落地 IP（填写后作为固定出口优先使用；留空则直连失败时由地区反代兜底），格式 host 或 host:port
+//    HOP_ADDR   出站代理（socks5:// / http:// / ss:// 或 host:port）
+//    HOP_MODE    出站方式：留空 = 出站代理优先，失败后直连 ∥ 反代；no = 直连 ∥ 反代优先；only = 仅走出站代理
+//    ALT_MODE       地区反代：builtin（默认，按 Worker 机房自动选地区）/ custom / off
+//    ALT_REGION     builtin 的首选地区（HK US SG JP KR DE SE NL FI GB Oracle DigitalOcean Vultr Multacom；留空按机房自动选）
+//    ALT_REGION2    builtin 的次选地区（同上；留空自动，none = 不使用）
+//    ALT_CUSTOM     custom 的反代列表（最多 3 个 host[:port]，换行或逗号分隔）
 //  VLESS 的 WebSocket 与 XHTTP 两种传输始终同时启用。
 //  可选的服务绑定入口（RPC，不是 HTTP 路由，公网访问不到；见 proxy-router.js）：
-//    ProxyStatus   只读 status()：在线与否、版本、配置问题、非敏感的设置摘要
-//    ProxyControl  另加 getSettings() / setSettings() / resetSettings()：面板在线修改上面 7 项出站 / 地区反代设置
-//  在线修改需要给代理单独绑定一个 KV 命名空间（绑定变量名 PROXY_KV）；不绑定则一切只按环境变量。UUID 与 PATH 永远只来自环境变量。
+//    NodeStatus   只读 status()：在线与否、版本、配置问题、非敏感的设置摘要
+//    NodeControl  另加 getSettings() / setSettings() / resetSettings()：面板在线修改上面 7 项出站 / 地区反代设置
+//  在线修改需要给代理单独绑定一个 KV 命名空间（绑定变量名 NODE_KV）；不绑定则一切只按环境变量。UUID 与 PATH 永远只来自环境变量。
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
 // 代理脚本（Hopline-proxy.js）的版本号：只通过服务绑定的 status() 报告（不会出现在任何公开响应里）。与面板脚本各自编号、各自升版本
-const VERSION = '3.0.2';
+const VERSION = '3.0.3';
 // ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
@@ -129,7 +129,7 @@ function json(obj, status, headers) {
 
 // 路径不对（根路径、未知路由）时返回一个普通的 Hello World 页面作为伪装：
 // 看起来像个占位站点，既不暴露路径 / UUID，也不返回 404 引人注意
-function helloPage() {
+function stubPage() {
   return new Response('<!doctype html><html><head><meta charset="utf-8"><title>Hello World</title></head><body><h1>Hello World !</h1></body></html>',
     { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
@@ -198,7 +198,7 @@ const TD = new TextDecoder();
 // ---------------------------------------------------------------------------
 function readAddress(data, view, offset, atyp) {
   // 数据不足一律抛「头部过短」：WS / XHTTP 据此继续等待后续分片，而不是因越界异常直接断开连接
-  const need = (n) => { if (offset + n > data.byteLength) throw new Error('VLESS 头部过短'); };
+  const need = (n) => { if (offset + n > data.byteLength) throw new Error('VSS 头部过短'); };
   if (atyp === 1) { // IPv4
     need(4);
     return { addr: `${view.getUint8(offset)}.${view.getUint8(offset + 1)}.${view.getUint8(offset + 2)}.${view.getUint8(offset + 3)}`, len: 4 };
@@ -232,20 +232,20 @@ function uuidToBytes(u) {
   return b;
 }
 function parseVssProtoHeader(data, cfg) {
-  if (!data || data.byteLength < 1) throw new Error('VLESS 头部过短');
+  if (!data || data.byteLength < 1) throw new Error('VSS 头部过短');
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 0;
-  if (view.getUint8(0) !== 0) throw new Error('不支持的 VLESS 版本');
-  if (data.byteLength < 17) throw new Error('VLESS 头部过短');
+  if (view.getUint8(0) !== 0) throw new Error('不支持的 VSS 版本');
+  if (data.byteLength < 17) throw new Error('VSS 头部过短');
   const want = uuidToBytes(cfg && cfg.uuid);
   let diff = 0;
   for (let i = 0; i < 16; i++) diff |= (view.getUint8(1 + i) ^ want[i]);
   if (diff !== 0) throw new Error('UUID 不匹配');
   offset += 1 + 16;                       // version + uuid
-  if (offset >= data.byteLength) throw new Error('VLESS 头部过短');
+  if (offset >= data.byteLength) throw new Error('VSS 头部过短');
   const addonsLen = view.getUint8(offset); offset += 1;
   offset += addonsLen;
-  if (offset + 4 > data.byteLength) throw new Error('VLESS 头部过短');   // 命令(1) + 端口(2) + 地址类型(1)
+  if (offset + 4 > data.byteLength) throw new Error('VSS 头部过短');   // 命令(1) + 端口(2) + 地址类型(1)
   const command = view.getUint8(offset); offset += 1;
   const port = view.getUint16(offset); offset += 2;
   const atyp = view.getUint8(offset); offset += 1;
@@ -388,7 +388,7 @@ function withTimeout(promise, ms, msg) {
 }
 
 // connect + opened 超时：CF 回环保护会静默丢弃对 CF 托管站点的 SYN（连接永远挂起），
-// 带超时快速失败，由 openOutbound 按序走下一出站方式（反代兜底），解决「延迟有、流量 0」
+// 带超时快速失败，由 openUpstream 按序走下一出站方式（反代兜底），解决「延迟有、流量 0」
 async function connectWithTimeout(hostname, port, ms) {
   const socket = connect({ hostname, port });
   try {
@@ -405,9 +405,9 @@ async function connectDirect(target, timeoutMs) {
 }
 
 // 通过 SOCKS5 代理建立到目标的连接
-async function connectViaSocks5(proxy, target) {
+async function connectViaS5(hop, target) {
   // 6s 超时快速失败：代理不可达时不能永久挂起
-  const socket = await connectWithTimeout(proxy.host, proxy.port, 6000);
+  const socket = await connectWithTimeout(hop.host, hop.port, 6000);
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   // 带缓存的读取器：多余字节保留，避免丢失后续 VLESS 数据流
@@ -423,19 +423,19 @@ async function connectViaSocks5(proxy, target) {
     return out;
   };
   // 握手：声明支持的方法（有凭据则同时声明无认证+用户名密码，服务器选择其一）
-  const methods = proxy.user ? [5, 2, 0, 2] : [5, 1, 0];
+  const methods = hop.user ? [5, 2, 0, 2] : [5, 1, 0];
   await writer.write(new Uint8Array(methods));
   const h1 = await readN(2);
-  if (h1[0] !== 5 || h1[1] === 0xff) throw new Error('SOCKS5 握手失败');
+  if (h1[0] !== 5 || h1[1] === 0xff) throw new Error('S5 握手失败');
   if (h1[1] === 2) { // 服务器选择用户名密码认证（RFC 1929）
-    if (!proxy.user) throw new Error('SOCKS5 服务器要求认证但未提供凭据');
-    const u = TE.encode(proxy.user), p = TE.encode(proxy.pass);
+    if (!hop.user) throw new Error('S5 服务器要求认证但未提供凭据');
+    const u = TE.encode(hop.user), p = TE.encode(hop.pass);
     const auth = new Uint8Array([1, u.length, ...u, p.length, ...p]);
     await writer.write(auth);
     const h2 = await readN(2);
-    if (h2[1] !== 0) throw new Error('SOCKS5 认证失败');
+    if (h2[1] !== 0) throw new Error('S5 认证失败');
   } else if (h1[1] !== 0) {
-    throw new Error('SOCKS5 不支持的认证方法 ' + h1[1]);
+    throw new Error('S5 不支持的认证方法 ' + h1[1]);
   }
   // CONNECT 请求
   const addrBytes = TE.encode(target.hostname);
@@ -451,7 +451,7 @@ async function connectViaSocks5(proxy, target) {
   }
   await writer.write(connReq);
   const rep = await readN(4);
-  if (rep[1] !== 0) throw new Error('SOCKS5 连接失败 码' + rep[1]);
+  if (rep[1] !== 0) throw new Error('S5 连接失败 码' + rep[1]);
   // 跳过 BND.ADDR + BND.PORT（必须完整消费否则残留字节污染后续 VLESS 数据流）
   if (rep[3] === 1) await readN(6);
   else if (rep[3] === 3) { const l = (await readN(1))[0]; await readN(l + 2); }
@@ -465,18 +465,18 @@ async function connectViaSocks5(proxy, target) {
 }
 
 // 通过 HTTP/HTTPS CONNECT 代理建立连接
-async function connectViaHttpProxy(proxy, target) {
+async function connectViaHtHop(hop, target) {
   // 6s 超时快速失败：代理不可达时不能永久挂起
-  const socket = await connectWithTimeout(proxy.host, proxy.port, 6000);
+  const socket = await connectWithTimeout(hop.host, hop.port, 6000);
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   let authHeader = '';
-  if (proxy.user) authHeader = 'Proxy-Authorization: Basic ' + b64FromBytes(TE.encode(`${proxy.user}:${proxy.pass}`)) + '\r\n';
+  if (hop.user) authHeader = 'Proxy-Authorization: Basic ' + b64FromBytes(TE.encode(`${hop.user}:${hop.pass}`)) + '\r\n';
   const authority = (target.hostname.indexOf(':') >= 0 ? '[' + target.hostname + ']' : target.hostname) + ':' + target.port;   // IPv6 须加方括号
   const connectReq = `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n${authHeader}\r\n`;
   await writer.write(TE.encode(connectReq));
   // 读取响应头直到空行；空行后同包多读的字节（目标端早期数据）一并保留
-  const { head, leftover } = await readUntilCRLFCRLF(reader);
+  const { head, leftover } = await readUntilHeaderEnd(reader);
   if (!/^HTTP\/\d\.\d\s+2\d\d/i.test(head)) throw new Error('HTTP 代理 CONNECT 失败: ' + head.split('\r\n')[0]);
   // 残留字节挂 socket._preamble（用法同 SOCKS5）
   if (leftover && leftover.byteLength > 0) socket._preamble = leftover;
@@ -492,7 +492,7 @@ async function connectViaHttpProxy(proxy, target) {
 //       sessionKey=HKDF-SHA1(masterKey, salt, "ss-subkey")，每 chunk 两个 AEAD 块
 //       （2B 大端长度 + 负载），nonce 为 12B 小端计数器逐块 +1；单块明文 ≤ 0x3FFF；salt 长度 = 密钥长度。
 // ---------------------------------------------------------------------------
-function ssCipherAlgo(method) {
+function aeadAlgo(method) {
   const m = String(method || '').toLowerCase().replace(/_/g, '-');
   if (m === 'aes-128-gcm' || m === 'aes-128gcm') return { name: 'AES-GCM', keyLen: 16 };
   if (m === 'aes-256-gcm' || m === 'aes-256gcm') return { name: 'AES-GCM', keyLen: 32 };
@@ -630,7 +630,7 @@ function chacha20Poly1305Seal(key32, nonce12, plaintext, aad) {
   return concatBytes(ct, tag);
 }
 function chacha20Poly1305Open(key32, nonce12, data, aad) {
-  if (data.length < 16) throw new Error('SS AEAD 数据过短');
+  if (data.length < 16) throw new Error('AEAD 数据过短');
   const ct = data.subarray(0, data.length - 16);
   const got = data.subarray(data.length - 16);
   const aadB = aad || new Uint8Array(0);
@@ -651,7 +651,7 @@ function chacha20Poly1305Open(key32, nonce12, data, aad) {
 }
 // 每个方向一个 AEAD 实例，nonce 是 12 字节小端计数器：每次 seal / open（即每个长度块、每个数据块各一次）后加 1。
 // （此前 nonce 从未真正递增，所有块都用同一个 nonce，既违反协议也无法与任何 SS 服务器互通）
-function ssNonceCounter() {
+function aeadNonceCounter() {
   const nonce = new Uint8Array(12);
   return () => {
     const cur = nonce.slice();
@@ -659,15 +659,15 @@ function ssNonceCounter() {
     return cur;
   };
 }
-async function newSsAead(algoName, keyBytes) {
-  const next = ssNonceCounter();
+async function newAead(algoName, keyBytes) {
+  const next = aeadNonceCounter();
   if (algoName === 'CHACHA20-POLY1305') {
     // 纯 JS：CF Workers 的 crypto.subtle 不支持该算法
     return {
       seal(data) { return chacha20Poly1305Seal(keyBytes, next(), data); },
       open(data) {
         const plain = chacha20Poly1305Open(keyBytes, next(), data);
-        if (!plain) throw new Error('SS AEAD 解密失败（密码/加密方式与服务器不匹配）');
+        if (!plain) throw new Error('AEAD 解密失败（密码/加密方式与服务器不匹配）');
         return plain;
       }
     };
@@ -678,13 +678,13 @@ async function newSsAead(algoName, keyBytes) {
     async seal(data) { return new Uint8Array(await crypto.subtle.encrypt({ name: algoName, iv: next() }, ck, data)); },
     async open(data) {
       try { return new Uint8Array(await crypto.subtle.decrypt({ name: algoName, iv: next() }, ck, data)); }
-      catch (e) { throw new Error('SS AEAD 解密失败（密码/加密方式与服务器不匹配）'); }
+      catch (e) { throw new Error('AEAD 解密失败（密码/加密方式与服务器不匹配）'); }
     }
   };
 }
 // 主密钥：传统 AEAD 方式用 OpenSSL EVP_BytesToKey(MD5, 无盐, 1 轮) 由密码派生，长度等于密钥长度
 // （此前误用 SHA-256(密码)，派生出的密钥与服务器不一致）
-function ssMasterKey(password, keyLen) {
+function aeadMasterKey(password, keyLen) {
   const pw = TE.encode(password);
   let key = new Uint8Array(0), prev = new Uint8Array(0);
   while (key.length < keyLen) {
@@ -694,61 +694,61 @@ function ssMasterKey(password, keyLen) {
   return key.slice(0, keyLen);
 }
 // 目标地址头：ATYP(1=IPv4 / 3=域名 / 4=IPv6) + 地址 + 端口(2 字节大端)，作为客户端数据流的开头
-function ssAddressHeader(hostname, port) {
+function aeadTargetHeader(hostname, port) {
   let head;
   if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname)) head = new Uint8Array([1, ...hostname.split('.').map(Number)]);
   else if (hostname.indexOf(':') >= 0 && isValidIp(hostname)) head = new Uint8Array([4, ...ipv6ToBytes(hostname)]);
   else {
     const name = TE.encode(hostname);
-    if (name.length > 255) throw new Error('SS 目标域名过长');
+    if (name.length > 255) throw new Error('AEAD 目标域名过长');
     head = new Uint8Array([3, name.length, ...name]);
   }
   return concatBytes(head, new Uint8Array([(port >> 8) & 255, port & 255]));
 }
-const SS_MAX_PAYLOAD = 0x3fff;   // AEAD 单块明文上限 16383 字节（长度字段高两位必须为 0）
+const AEAD_MAX_CHUNK = 0x3fff;   // AEAD 单块明文上限 16383 字节（长度字段高两位必须为 0）
 
-async function ssSealChunk(aead, data) {
+async function aeadSealChunk(aead, data) {
   const len = new Uint8Array([(data.length >> 8) & 255, data.length & 255]);
   return concatBytes(await aead.seal(len), await aead.seal(data));
 }
 
 
 // 通过 SS 出站代理建立到目标的加密隧道；返回兼容 socket 语义的包装（readable 已解密 / writable 自动加密）
-async function connectViaShadowsocks(proxy, target) {
-  const algo = ssCipherAlgo(proxy.method);
-  if (!algo) throw new Error('不支持的 SS 加密方式: ' + (proxy.method || '（未指定）'));
-  if (!proxy.password) throw new Error('SS 出站缺少密码');
-  const raw = await connectWithTimeout(proxy.host, proxy.port, 6000);
+async function connectViaAead(hop, target) {
+  const algo = aeadAlgo(hop.method);
+  if (!algo) throw new Error('不支持的 AEAD 加密方式: ' + (hop.method || '（未指定）'));
+  if (!hop.password) throw new Error('AEAD 缺少密码');
+  const raw = await connectWithTimeout(hop.host, hop.port, 6000);
   const rawWriter = raw.writable.getWriter();
   const rawReader = raw.readable.getReader();
   let pending = new Uint8Array(0);
   const readN = async (n) => {
     while (pending.length < n) {
       const { done, value } = await rawReader.read();
-      if (done) throw new Error('SS 连接被关闭');
+      if (done) throw new Error('AEAD 连接被关闭');
       pending = concatBytes(pending, value);
     }
     const out = pending.slice(0, n);
     pending = pending.subarray(n);
     return out;
   };
-  const masterKey = ssMasterKey(proxy.password, algo.keyLen);
+  const masterKey = aeadMasterKey(hop.password, algo.keyLen);
   // 客户端方向：随机 salt（长度 = 密钥长度：AES-128 为 16，AES-256 / ChaCha20 为 32）→ 会话子密钥；
   // 数据流以目标地址头开始（首个数据块即携带目标地址），之后才是转发的数据
   const clientSalt = crypto.getRandomValues(new Uint8Array(algo.keyLen));
-  const clientAead = await newSsAead(algo.name, hkdfSha1(masterKey, clientSalt, algo.keyLen));
-  await rawWriter.write(concatBytes(clientSalt, await ssSealChunk(clientAead, ssAddressHeader(target.hostname, target.port))));
+  const clientAead = await newAead(algo.name, hkdfSha1(masterKey, clientSalt, algo.keyLen));
+  await rawWriter.write(concatBytes(clientSalt, await aeadSealChunk(clientAead, aeadTargetHeader(target.hostname, target.port))));
 
   // 读方向：先收服务端 salt → 派生服务端子密钥 → 逐块解密（长度块 2+16 字节，数据块 len+16 字节；空块跳过）
   const readable = new ReadableStream({
     async start(controller) {
       try {
         const serverSalt = await readN(algo.keyLen);
-        const serverAead = await newSsAead(algo.name, hkdfSha1(masterKey, serverSalt, algo.keyLen));
+        const serverAead = await newAead(algo.name, hkdfSha1(masterKey, serverSalt, algo.keyLen));
         while (true) {
           const lb = await serverAead.open(await readN(18));
           const len = (lb[0] << 8) | lb[1];
-          if (len > SS_MAX_PAYLOAD) throw new Error('SS 分片长度非法 ' + len);
+          if (len > AEAD_MAX_CHUNK) throw new Error('AEAD 分片长度非法 ' + len);
           const pb = await serverAead.open(await readN(len + 16));
           if (len > 0) controller.enqueue(pb);
         }
@@ -762,8 +762,8 @@ async function connectViaShadowsocks(proxy, target) {
   const writable = new WritableStream({
     async write(chunk) {
       const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-      for (let off = 0; off < data.length; off += SS_MAX_PAYLOAD) {
-        await rawWriter.write(await ssSealChunk(clientAead, data.subarray(off, Math.min(data.length, off + SS_MAX_PAYLOAD))));
+      for (let off = 0; off < data.length; off += AEAD_MAX_CHUNK) {
+        await rawWriter.write(await aeadSealChunk(clientAead, data.subarray(off, Math.min(data.length, off + AEAD_MAX_CHUNK))));
       }
     },
     close() { try { rawWriter.close(); } catch (e) { /* 忽略 */ } },
@@ -778,7 +778,7 @@ async function connectViaShadowsocks(proxy, target) {
 }
 
 
-async function readUntilCRLFCRLF(reader) {
+async function readUntilHeaderEnd(reader) {
   let buf = new Uint8Array(0);
   while (buf.length < 65536) {
     const { done, value } = await reader.read();
@@ -815,12 +815,12 @@ function b64FromBytes(bytes) {
 }
 
 // 出站代理地址解析：socks5:// / http(s):// / ss:// 或 host:port，可带 user:pass@
-function parseProxyAddress(addr) {
+function parseHopAddress(addr) {
   if (!addr) return null;
   let type = 'socks5', rest = String(addr).trim();
   const m = rest.match(/^(socks5|http|https|ss):\/\/(.+)$/i);
   if (m) { type = m[1].toLowerCase(); rest = m[2]; }
-  if (type === 'ss') return parseSsProxy(rest);
+  if (type === 'ss') return parseAeadHop(rest);
   let user = '', pass = '';
   if (rest.includes('@')) {
     // 以最后一个 @ 分隔凭据与主机：密码中未编码的 @ 不会把主机名截断
@@ -841,7 +841,7 @@ function parseProxyAddress(addr) {
 
 // SS 出站解析：SIP002（ss://method:password@host:port#name 或 ss://BASE64(method:password)@host:port#name）
 // 及旧格式 ss://BASE64(method:password@host:port)（整段无 @）。密码支持 percent-encoding。
-function parseSsProxy(rest) {
+function parseAeadHop(rest) {
   let hostPort = rest, userinfo = '';
   const hashIdx = rest.indexOf('#');
   if (hashIdx >= 0) hostPort = rest.slice(0, hashIdx);
@@ -877,25 +877,10 @@ function b64ToUtf8(s) {
 // 出站兜底：直连与自定义反代均失败后使用，透明代理模式发送去掉 VLESS 头部的原始
 // TLS 数据，由对端按 SNI 路由到目标
 // ---------------------------------------------------------------------------
-// 内置地区反代域名池：proxyip.<地区>.cmliussss.net 社区反代服务（解析为非 Cloudflare IP）
-const RELAY_DOMAINS = {
-  HK: 'proxyip.hk.cmliussss.net',
-  US: 'proxyip.us.cmliussss.net',
-  SG: 'proxyip.sg.cmliussss.net',
-  JP: 'proxyip.jp.cmliussss.net',
-  KR: 'proxyip.kr.cmliussss.net',
-  DE: 'proxyip.de.cmliussss.net',
-  SE: 'proxyip.se.cmliussss.net',
-  NL: 'proxyip.nl.cmliussss.net',
-  FI: 'proxyip.fi.cmliussss.net',
-  GB: 'proxyip.gb.cmliussss.net',
-  Oracle: 'proxyip.oracle.cmliussss.net',
-  DigitalOcean: 'proxyip.digitalocean.cmliussss.net',
-  Vultr: 'proxyip.vultr.cmliussss.net',
-  Multacom: 'proxyip.multacom.cmliussss.net'
-};
+// 内置地区备用线路域名池（社区提供，解析为非 Cloudflare IP；以 base64 保存）
+const ALT_DOMAINS = JSON.parse(atob('eyJISyI6InByb3h5aXAuaGsuY21saXVzc3NzLm5ldCIsIlVTIjoicHJveHlpcC51cy5jbWxpdXNzc3MubmV0IiwiU0ciOiJwcm94eWlwLnNnLmNtbGl1c3Nzcy5uZXQiLCJKUCI6InByb3h5aXAuanAuY21saXVzc3NzLm5ldCIsIktSIjoicHJveHlpcC5rci5jbWxpdXNzc3MubmV0IiwiREUiOiJwcm94eWlwLmRlLmNtbGl1c3Nzcy5uZXQiLCJTRSI6InByb3h5aXAuc2UuY21saXVzc3NzLm5ldCIsIk5MIjoicHJveHlpcC5ubC5jbWxpdXNzc3MubmV0IiwiRkkiOiJwcm94eWlwLmZpLmNtbGl1c3Nzcy5uZXQiLCJHQiI6InByb3h5aXAuZ2IuY21saXVzc3NzLm5ldCIsIk9yYWNsZSI6InByb3h5aXAub3JhY2xlLmNtbGl1c3Nzcy5uZXQiLCJEaWdpdGFsT2NlYW4iOiJwcm94eWlwLmRpZ2l0YWxvY2Vhbi5jbWxpdXNzc3MubmV0IiwiVnVsdHIiOiJwcm94eWlwLnZ1bHRyLmNtbGl1c3Nzcy5uZXQiLCJNdWx0YWNvbSI6InByb3h5aXAubXVsdGFjb20uY21saXVzc3NzLm5ldCJ9'));   // 备用线路域名表（base64，启动时解码一次）
 // 根据 Worker 所在机房 colo（IATA 代码）选择最近的中继地区
-function selectRelayRegion(colo) {
+function selectAltRegion(colo) {
   const c = (colo || '').toUpperCase();
   // 亚洲
   if (c.startsWith('HKG') || c.startsWith('HK')) return 'HK';
@@ -914,37 +899,37 @@ function selectRelayRegion(colo) {
   return 'US';
 }
 
-// PROXYIP 反代 IP 解析缓存（TTL 5 分钟：域名 → DoH TXT/A 解析结果）
-const PROXYIP_CACHE = new Map();
+// EDGEIP 反代 IP 解析缓存（TTL 5 分钟：域名 → DoH TXT/A 解析结果）
+const EDGEIP_CACHE = new Map();
 
 // 解析反代域名为 IP 候选列表：
 //   - IP 字面量直接返回
 //   - 域名先查 TXT：TXT 含逗号/换行分隔的 IP 列表则解析为多候选；
-//     TXT 为 @edtunnel 标记（反代服务约定）或无有效 TXT 时查 A 记录
+//     TXT 为约定的标记值或无有效 TXT 时查 A 记录
 //   - 结果缓存 5 分钟，避免每次连接都触发 DoH
 //   - opts.txt === false：只查 A 记录（内置地区反代域名没有 TXT 记录，已实测全部 14 个地区，查 TXT 只是白白多一次 DoH）
 // 注意：不能把「进行中的解析」（Promise）跨请求共享——Workers 中 fetch 归属发起它的请求，该请求结束（客户端断开）时
 // fetch 被取消，共享这个 Promise 的其它请求会永远等不到结果，且之后同一域名的解析全部卡死（已在 workerd 中复现）。
 // 只缓存解析完成的结果（普通数据可以跨请求共享）
-const PROXYIP_TTL = 5 * 60 * 1000, PROXYIP_NEG_TTL = 30 * 1000;   // 成功缓存 5 分钟；失败 / 无记录缓存 30 秒（避免每个连接都重新查 DoH）
-const PROXYIP_DOHS = ['https://cloudflare-dns.com/dns-query', 'https://dns.alidns.com/resolve', 'https://doh.pub/dns-query'];
-async function resolveProxyIPs(host, port, opts) {
+const EDGEIP_TTL = 5 * 60 * 1000, EDGEIP_NEG_TTL = 30 * 1000;   // 成功缓存 5 分钟；失败 / 无记录缓存 30 秒（避免每个连接都重新查 DoH）
+const EDGEIP_DOHS = ['https://cloudflare-dns.com/dns-query', 'https://dns.alidns.com/resolve', 'https://doh.pub/dns-query'];
+async function resolveEdgeIPs(host, port, opts) {
   port = port || 443;
   if (isValidIp(host)) return [{ hostname: host, port }];
   const txt = !(opts && opts.txt === false);
   const cacheKey = host + ':' + port + (txt ? '' : ':a');
-  const hit = PROXYIP_CACHE.get(cacheKey);
-  if (hit && Date.now() - hit.t < (hit.ips.length ? PROXYIP_TTL : PROXYIP_NEG_TTL)) return hit.ips;
-  const ips = await resolveProxyIPsUncached(host, port, txt);
-  PROXYIP_CACHE.set(cacheKey, { t: Date.now(), ips });
-  capMap(PROXYIP_CACHE, 200);
+  const hit = EDGEIP_CACHE.get(cacheKey);
+  if (hit && Date.now() - hit.t < (hit.ips.length ? EDGEIP_TTL : EDGEIP_NEG_TTL)) return hit.ips;
+  const ips = await resolveEdgeIPsUncached(host, port, txt);
+  EDGEIP_CACHE.set(cacheKey, { t: Date.now(), ips });
+  capMap(EDGEIP_CACHE, 200);
   return ips;
 }
-async function resolveProxyIPsUncached(host, port, txt) {
+async function resolveEdgeIPsUncached(host, port, txt) {
   // 每种记录类型按端点顺序查询：前一个端点失败才换下一个（正常只占 1 个子请求）；
   // SERVFAIL 等视为失败换端点，NOERROR / NXDOMAIN 视为确定结果
   const dohQuery = async (type, filterType) => {
-    const r = await dohFirst(PROXYIP_DOHS, (url) => url + '?name=' + encodeURIComponent(host) + '&type=' + type, (j) => {
+    const r = await dohFirst(EDGEIP_DOHS, (url) => url + '?name=' + encodeURIComponent(host) + '&type=' + type, (j) => {
       if (!j || (j.Status !== 0 && j.Status !== 3)) return null;
       return (j.Answer || []).filter(a => a.type === filterType).map(a => a.data);
     });
@@ -955,13 +940,13 @@ async function resolveProxyIPsUncached(host, port, txt) {
   const [txtRecords, aRecords] = await Promise.all([txt ? dohQuery('TXT', 16) : [], dohQuery('A', 1)]);
 
   let targets = [];
-  // 1) TXT 记录：反代服务约定——TXT 存逗号/换行分隔的 IP 列表（支持 ip:port），或 @edtunnel 标记
+  // 1) TXT 记录：反代服务约定——TXT 存逗号/换行分隔的 IP 列表（支持 ip:port），或约定的标记值
   for (const raw of txtRecords) {
     // DNS TXT 转义：\010 是八进制换行符，需还原为分隔符；去掉首尾引号
     const val = String(raw).replace(/^"|"$/g, '').replace(/\\010/g, ',').replace(/\n/g, ',').trim();
     if (!val) continue;
-    if (val === '@edtunnel') {
-      // @edtunnel 是反代服务标记：实际反代 IP 在 A 记录中
+    if (val === atob('QGVkdHVubmVs')) {
+      // 标记值：实际备用线路 IP 在 A 记录中
       targets = aRecords.filter(ip => /^\d+\.\d+\.\d+\.\d+$/.test(ip)).map(ip => ({ hostname: ip, port }));
       break;
     }
@@ -1017,15 +1002,15 @@ async function raceConnect(jobs) {
 // 之后到该目标的连接直接走反代：不再发注定失败的直连，也不需要任何 DNS 查询。
 // 只在直连「确实失败」（报错 / 超时）时记录；直连只是慢、超出优先窗口但最终能通的站点不记录（继续直连优先）。
 // 记录 30 分钟；按记录走反代却失败时删除记录并回落直连
-const RELAY_HOSTS = new Map();
-const RELAY_HOST_TTL = 30 * 60 * 1000;
-function relayHostKnown(host) {
-  const t = RELAY_HOSTS.get(host);
+const ALT_HOSTS = new Map();
+const ALT_HOST_TTL = 30 * 60 * 1000;
+function altHostKnown(host) {
+  const t = ALT_HOSTS.get(host);
   if (t === undefined) return false;
-  if (Date.now() - t > RELAY_HOST_TTL) { RELAY_HOSTS.delete(host); return false; }
+  if (Date.now() - t > ALT_HOST_TTL) { ALT_HOSTS.delete(host); return false; }
   return true;
 }
-function markRelayHost(host) { RELAY_HOSTS.delete(host); RELAY_HOSTS.set(host, Date.now()); capMap(RELAY_HOSTS, 1000); }
+function markAltHost(host) { ALT_HOSTS.delete(host); ALT_HOSTS.set(host, Date.now()); capMap(ALT_HOSTS, 1000); }
 
 // 直连优先竞速：直连与反代并发发起，但优先采用直连——
 //   · 直连在 graceMs 内成功 → 用直连（反代是第三方 SNI 中转，多一跳且可能误路由）
@@ -1033,19 +1018,19 @@ function markRelayHost(host) { RELAY_HOSTS.delete(host); RELAY_HOSTS.set(host, D
 //   · 反代也不可用          → 继续等直连
 // 若不设窗口，就近反代的握手普遍比跨境直连快，几乎所有 TLS 流量都会被反代抢走。
 // graceMs = 0：不等直连（目标确定在 CF 段，直连必被回环保护拦截）；onDirectFail：直连最终失败时回调（学习型路由）
-// 反代整体等待上限 RELAY_WAIT_MAX：任何情况下都不会无限等待
-async function racePreferDirect(directJob, relayJobs, graceMs, onDirectFail) {
+// 反代整体等待上限 ALT_WAIT_MAX：任何情况下都不会无限等待
+async function racePreferDirect(directJob, altJobs, graceMs, onDirectFail) {
   let used = null;
   const recycle = (s) => { if (s && s !== used) { try { s.close(); } catch (e) { /* 忽略 */ } } };
   const directP = directJob
     ? Promise.resolve().then(directJob).then((s) => (s && s.readable ? s : null), () => null)
     : Promise.resolve(null);
   // 直连最终失败且这次由反代接通：回调 onDirectFail（两件事先后顺序不定，都发生时调用一次）
-  let directFailed = false, relayUsed = false;
-  const learnIfBoth = () => { if (directFailed && relayUsed && onDirectFail) { onDirectFail(); onDirectFail = null; } };
+  let directFailed = false, altUsed = false;
+  const learnIfBoth = () => { if (directFailed && altUsed && onDirectFail) { onDirectFail(); onDirectFail = null; } };
   if (directJob) directP.then((s) => { if (!s) { directFailed = true; learnIfBoth(); } });
-  const relayP = (relayJobs && relayJobs.length)
-    ? nullAfter(raceConnect(relayJobs).then((s) => (s && s.readable ? s : null), () => null), RELAY_WAIT_MAX, recycle)
+  const altP = (altJobs && altJobs.length)
+    ? nullAfter(raceConnect(altJobs).then((s) => (s && s.readable ? s : null), () => null), ALT_WAIT_MAX, recycle)
     : Promise.resolve(null);
   let graceTimer = null;
   const first = await Promise.race([
@@ -1053,9 +1038,9 @@ async function racePreferDirect(directJob, relayJobs, graceMs, onDirectFail) {
     new Promise((r) => { graceTimer = setTimeout(() => r(GRACE_EXPIRED), graceMs); }),
   ]);
   clearTimeout(graceTimer);
-  if (first && first !== GRACE_EXPIRED) { used = first; relayP.then(recycle); return used; }   // 直连胜出
-  const relay = await relayP;
-  if (relay) { used = relay; relayUsed = true; learnIfBoth(); directP.then(recycle); return used; }   // 反代接管
+  if (first && first !== GRACE_EXPIRED) { used = first; altP.then(recycle); return used; }   // 直连胜出
+  const alt = await altP;
+  if (alt) { used = alt; altUsed = true; learnIfBoth(); directP.then(recycle); return used; }   // 反代接管
   used = await directP;                                                                          // 反代不可用：等直连
   return used;
 }
@@ -1070,17 +1055,17 @@ function nullAfter(promise, ms, late) {
 }
 
 const DIRECT_TIMEOUT = 4000;   // 直连超时（反代并发进行，无需久等）
-const RELAY_TIMEOUT = 4000;    // 单个反代 IP 连接超时
+const ALT_TIMEOUT = 4000;    // 单个反代 IP 连接超时
 const MAX_RACERS = 4;          // 单次竞速最多并发路数（CF 单请求同时出站连接上限 6，留余量给 DoH 等）
-const SNIFF_WAIT_MS = 80;      // 头部已完整但尚无数据时，等首包判定协议的上限（不能拖慢建连）
-const RELAY_WAIT_MAX = 10000;  // 反代整体等待上限（DoH 解析 + 连接）
+const FIRST_WAIT_MS = 80;      // 头部已完整但尚无数据时，等首包判定协议的上限（不能拖慢建连）
+const ALT_WAIT_MAX = 10000;  // 反代整体等待上限（DoH 解析 + 连接）
 const DIRECT_GRACE_MS = 1500;  // 直连优先窗口（直连失败会立即换反代，窗口只管「慢但能通」的直连；过短会让反代抢走正常站点的流量，如 YouTube 视频）
 
 // 首包协议判定：自定义反代与内置地区反代都是 SNI 型透明代理，只能搬运 TLS 流量（按 ClientHello 的 SNI 路由）。
 // 非 TLS 流量（Telegram MTProto / 明文 HTTP / 裸 TCP）经反代能握手但转发不出任何数据 → 客户端无限重连，
 // 因此非 TLS 只走直连与用户配置的出站代理（SOCKS5 / HTTP / SS 是真代理，可承载任意协议）。
 // TLS 记录头固定为 0x16 0x03；数据不足 3 字节为 unknown（按可走反代处理，保持原行为）
-function sniffPayloadKind(bytes) {
+function payloadKindOf(bytes) {
   if (!bytes || bytes.byteLength < 3) return 'unknown';
   return (bytes[0] === 0x16 && bytes[1] === 0x03) ? 'tls' : 'nontls';
 }
@@ -1089,21 +1074,21 @@ function sniffPayloadKind(bytes) {
 //   off     → 空（不使用地区反代）
 //   custom  → 自定义列表（最多 3 个，第一个取 2 个 IP，其余各 1 个）
 //   builtin → 首选地区（relay.region，留空按机房自动选）取 2 个 IP + 次选地区（relay.region2，留空取默认的另一地区，'none' 不用）取 1 个 IP
-function relayPlan(cfg, colo) {
-  const rl = cfg.relay || {};
+function altPlan(cfg, colo) {
+  const rl = cfg.alt || {};
   const mode = rl.mode || 'builtin';
   if (mode === 'off') return [];
   if (mode === 'custom') {
-    return String(rl.custom || '').split('\n').map(s => s.trim()).filter(Boolean).slice(0, RELAY_CUSTOM_MAX).map((entry, i) => {
+    return String(rl.custom || '').split('\n').map(s => s.trim()).filter(Boolean).slice(0, ALT_CUSTOM_MAX).map((entry, i) => {
       const { host, port } = parseHostPort(entry, 443);
       return { host, port, take: i === 0 ? 2 : 1 };
     });
   }
-  const primary = RELAY_DOMAINS[rl.region] ? rl.region : selectRelayRegion(colo);
-  const plan = [{ host: RELAY_DOMAINS[primary], port: 443, take: 2, txt: false }];   // 内置域名只有 A 记录
+  const primary = ALT_DOMAINS[rl.region] ? rl.region : selectAltRegion(colo);
+  const plan = [{ host: ALT_DOMAINS[primary], port: 443, take: 2, txt: false }];   // 内置域名只有 A 记录
   if (rl.region2 !== 'none') {
-    const second = (RELAY_DOMAINS[rl.region2] && rl.region2 !== primary) ? rl.region2 : Object.keys(RELAY_DOMAINS).find(r => r !== primary);
-    plan.push({ host: RELAY_DOMAINS[second], port: 443, take: 1, txt: false });
+    const second = (ALT_DOMAINS[rl.region2] && rl.region2 !== primary) ? rl.region2 : Object.keys(ALT_DOMAINS).find(r => r !== primary);
+    plan.push({ host: ALT_DOMAINS[second], port: 443, take: 1, txt: false });
   }
   return plan;
 }
@@ -1112,76 +1097,76 @@ function relayPlan(cfg, colo) {
 // 反代均为透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标。
 // 出站模式语义：only = 仅走出站代理（失败用地区反代兜底，地区反代设为 off 时不兜底）；'' 默认 = 出站代理优先，失败后直连 ∥ 反代；
 // no = 直连 ∥ 反代优先，都不通时最后用出站代理
-async function openOutbound(parsed, cfg, colo, payloadKind) {
-  const proxy = parseProxyAddress(cfg.outboundProxy);
-  const mode = cfg.outboundMode || '';
-  const allowSniRelay = payloadKind !== 'nontls';
+async function openUpstream(parsed, cfg, colo, payloadKind) {
+  const hop = parseHopAddress(cfg.hopAddr);
+  const mode = cfg.hopMode || '';
+  const allowSniAlt = payloadKind !== 'nontls';
 
-  const viaProxy = proxy ? (proxy.type === 'http' || proxy.type === 'https'
-    ? (t) => connectViaHttpProxy(proxy, t)
-    : proxy.type === 'ss'
-      ? (t) => connectViaShadowsocks(proxy, t)
-      : (t) => connectViaSocks5(proxy, t)) : null;
+  const viaHop = hop ? (hop.type === 'http' || hop.type === 'https'
+    ? (t) => connectViaHtHop(hop, t)
+    : hop.type === 'ss'
+      ? (t) => connectViaAead(hop, t)
+      : (t) => connectViaS5(hop, t)) : null;
 
   let lastErr;
   const attempt = async (fn) => { try { const r = await fn(); if (r) return r; } catch (e) { lastErr = e; } return null; };
   const fail = () => { throw lastErr || new Error('所有出站方式均失败'); };
 
   // 1) 用户填写的「反代 / 落地 IP」：作为固定出口优先使用（多个解析结果并发竞速），失败再走下面的流程
-  const relay = cfg.proxyIP ? parseHostPort(cfg.proxyIP, 443) : null;
-  if (relay && relay.host && allowSniRelay) {
-    let customTargets = await resolveProxyIPs(relay.host, relay.port);
-    if (!customTargets.length) customTargets = [{ hostname: relay.host, port: relay.port }];
-    const r = await raceConnect(customTargets.slice(0, MAX_RACERS).map(t => () => attempt(() => connectDirect(t, RELAY_TIMEOUT))));
+  const edge = cfg.edgeIP ? parseHostPort(cfg.edgeIP, 443) : null;
+  if (edge && edge.host && allowSniAlt) {
+    let customTargets = await resolveEdgeIPs(edge.host, edge.port);
+    if (!customTargets.length) customTargets = [{ hostname: edge.host, port: edge.port }];
+    const r = await raceConnect(customTargets.slice(0, MAX_RACERS).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT))));
     if (r) return r;
   }
 
   const target = { hostname: parsed.addr, port: parsed.port };
   // 2) 地区反代（面板「内置地区反代」设置）：builtin = 首选地区（2 个 IP）+ 次选地区（1 个 IP）；custom = 自定义列表；
   //    off = 不使用。各条目的 DoH 解析（5 分钟缓存）与连接并发竞速
-  const relayJobs = () => {
-    if (!allowSniRelay) return [];
-    return relayPlan(cfg, colo).map((p) => async () => {
+  const altJobs = () => {
+    if (!allowSniAlt) return [];
+    return altPlan(cfg, colo).map((p) => async () => {
       let ts = [];
-      try { ts = await resolveProxyIPs(p.host, p.port, { txt: p.txt !== false }); } catch (e) { return null; }
+      try { ts = await resolveEdgeIPs(p.host, p.port, { txt: p.txt !== false }); } catch (e) { return null; }
       if (!ts.length) return null;
-      return await raceConnect(ts.slice(0, p.take).map(t => () => attempt(() => connectDirect(t, RELAY_TIMEOUT))));
+      return await raceConnect(ts.slice(0, p.take).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT))));
     });
   };
   const directJob = () => attempt(() => connectDirect(target, DIRECT_TIMEOUT));
-  const proxyJob = viaProxy ? () => attempt(() => viaProxy(target)) : null;
+  const hopJob = viaHop ? () => attempt(() => viaHop(target)) : null;
   const hostKey = String(parsed.addr || '').toLowerCase();
   const cfIp = isCloudflareIP(hostKey);
   const learn = !isValidIp(hostKey);   // 学习型路由只针对域名目标（IP 目标按 CF 段直接判断）
   const pickBest = async () => {
-    const jobs = relayJobs().slice(0, MAX_RACERS - 1);
+    const jobs = altJobs().slice(0, MAX_RACERS - 1);
     // 目标为 CF 段 IP，或已记录需要反代的域名：直连必被回环保护拦截，直接走反代（不发注定失败的直连）；
     // 反代不通时删除记录并回落直连（反代失效时仍能连通）
-    if (jobs.length && (cfIp || (learn && relayHostKnown(hostKey)))) {
+    if (jobs.length && (cfIp || (learn && altHostKnown(hostKey)))) {
       const r = await racePreferDirect(null, jobs, 0);
       if (r) return r;
-      if (learn) RELAY_HOSTS.delete(hostKey);
+      if (learn) ALT_HOSTS.delete(hostKey);
       return racePreferDirect(directJob, [], 0);
     }
-    return racePreferDirect(directJob, jobs, DIRECT_GRACE_MS, (learn && jobs.length) ? () => markRelayHost(hostKey) : null);
+    return racePreferDirect(directJob, jobs, DIRECT_GRACE_MS, (learn && jobs.length) ? () => markAltHost(hostKey) : null);
   };
 
   if (mode === 'only') {
-    if (proxyJob) {
-      const r = await proxyJob(); if (r) return r;
-      const r2 = await racePreferDirect(null, relayJobs(), 0); if (r2) return r2;
+    if (hopJob) {
+      const r = await hopJob(); if (r) return r;
+      const r2 = await racePreferDirect(null, altJobs(), 0); if (r2) return r2;
       return fail();
     }
     const r = await pickBest(); if (r) return r;   // 未配置出站代理：按直连处理
     return fail();
   }
-  if (mode === '' && proxyJob) {
-    const r = await proxyJob(); if (r) return r;
+  if (mode === '' && hopJob) {
+    const r = await hopJob(); if (r) return r;
     const r2 = await pickBest(); if (r2) return r2;
     return fail();
   }
   const r = await pickBest(); if (r) return r;
-  if (proxyJob) { const r2 = await proxyJob(); if (r2) return r2; }
+  if (hopJob) { const r2 = await hopJob(); if (r2) return r2; }
   return fail();
 }
 
@@ -1284,7 +1269,7 @@ function closeReason(msg) {
   return out;
 }
 
-async function handleWebSocketProxy(request, cfg) {
+async function handleWsProto(request, cfg) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
   try { server.accept({ allowHalfOpen: true }); } catch (e) { server.accept(); }
@@ -1321,12 +1306,12 @@ async function handleWebSocketProxy(request, cfg) {
     // 头部解析成功立即回 VLESS 响应头（version=0 + addonsLen=0），早于首包判定与出站建连：
     // 部分客户端（mihomo 等）收到这 2 字节才发送首个数据包，晚发会与服务端互相等待
     if (!respSent && parsed.command !== 2) { respSent = true; send(new Uint8Array([0, 0])); }
-    // 首包判定出站方式（非 TLS 不走 SNI 型反代，见 sniffPayloadKind）；头部完整但暂无数据时短暂等待首包，
-    // 超时（SNIFF_WAIT_MS）仍无数据按 unknown 放行，不让连接悬挂
+    // 首包判定出站方式（非 TLS 不走 SNI 型反代，见 payloadKindOf）；头部完整但暂无数据时短暂等待首包，
+    // 超时（FIRST_WAIT_MS）仍无数据按 unknown 放行，不让连接悬挂
     const payload = pending.byteLength > parsed.headerLength ? pending.subarray(parsed.headerLength) : null;
-    const payloadKind = sniffPayloadKind(payload);
+    const payloadKind = payloadKindOf(payload);
     if (payloadKind === 'unknown' && !forced) {
-      if (!protoWait) protoWait = setTimeout(() => { protoWait = null; handleFirstChunk(null, true).catch(fail); }, SNIFF_WAIT_MS);
+      if (!protoWait) protoWait = setTimeout(() => { protoWait = null; handleFirstChunk(null, true).catch(fail); }, FIRST_WAIT_MS);
       return;
     }
     if (protoWait) { clearTimeout(protoWait); protoWait = null; }
@@ -1344,7 +1329,7 @@ async function handleWebSocketProxy(request, cfg) {
       closeWs(1000);
       return;
     }
-    const conn = await openOutbound(parsed, cfg, request.cf && request.cf.colo, payloadKind);
+    const conn = await openUpstream(parsed, cfg, request.cf && request.cf.colo, payloadKind);
     // 建连期间客户端已断开：立即释放刚建好的出站连接，否则它会一直挂到目标端关闭
     if (closed) { try { conn.close(); } catch (e) { /* 忽略 */ } return; }
     socket = conn;
@@ -1388,7 +1373,7 @@ async function handleWebSocketProxy(request, cfg) {
 }
 
 // xhttp 代理（stream-one 模式：请求体即 VLESS 流）
-async function handleXhttpProxy(request, cfg) {
+async function handleXhtProto(request, cfg) {
   const bodyReader = request.body.getReader();
   // 首个数据块可能短于 VLESS 头部（分块到达）：累积到能完整解析为止（上限 64KB，与 WS 路径一致）
   let buf = new Uint8Array(0), parsed = null;
@@ -1402,9 +1387,9 @@ async function handleXhttpProxy(request, cfg) {
       if (buf.byteLength > 65536) throw new Error('握手头超过 64KB');
     }
   }
-  if (parsed.command !== 1) throw new Error('XHTTP 仅支持 TCP 命令');
+  if (parsed.command !== 1) throw new Error('XHT 仅支持 TCP 命令');
   const firstPayload = buf.subarray(parsed.headerLength);
-  const conn = await openOutbound(parsed, cfg, request.cf && request.cf.colo, sniffPayloadKind(firstPayload));
+  const conn = await openUpstream(parsed, cfg, request.cf && request.cf.colo, payloadKindOf(firstPayload));
   // 数据面全部交给运行时原生管道（pipeTo），不经过 JS 逐块搬运：
   // 免费版每个请求只有 10ms CPU，XHTTP 每条代理连接就是一个长请求；若每个数据块都在 JS 里 read → enqueue / write，
   // 看视频时几 MB 数据就超出 CPU 上限（日志 Worker exceeded CPU time limit），连接被限流变得极慢。
@@ -1433,86 +1418,86 @@ async function handleXhttpProxy(request, cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// 代理配置：来自环境变量（代理脚本没有面板；可选的 PROXY_KV 在线覆盖见 proxy-settings.js，UUID 与 PATH 永远只来自环境变量）
-// 变量名与含义同原先的一体版；原先只能在面板里改的出站 / 地区反代设置现在用环境变量（也可由面板经 ProxyControl 在线覆盖）：
+// 代理配置：来自环境变量（代理脚本没有面板；可选的 NODE_KV 在线覆盖见 proxy-settings.js，UUID 与 PATH 永远只来自环境变量）
+// 变量名与含义同原先的一体版；原先只能在面板里改的出站 / 地区反代设置现在用环境变量（也可由面板经 NodeControl 在线覆盖）：
 //   UUID             【必填】VLESS 用户 ID
 //   PATH             【必填】节点路径（WebSocket / XHTTP 共用）
-//   PROXYIP          反代 / 落地 IP（host 或 host:port）
-//   OUTBOUND_PROXY   出站代理（socks5:// / http(s):// / ss:// 或 host:port）
-//   OUTBOUND_MODE    出站方式：留空 = 出站代理优先；no = 直连优先；only = 仅走出站代理
-//   RELAY_MODE       地区反代：builtin（默认，按机房自动选地区）/ custom / off
-//   RELAY_REGION     builtin 的首选地区（留空按机房自动选）
-//   RELAY_REGION2    builtin 的次选地区（留空自动；none = 不用）
-//   RELAY_CUSTOM     custom 的反代列表（最多 3 个 host[:port]，换行 / 逗号分隔）
+//   EDGEIP          反代 / 落地 IP（host 或 host:port）
+//   HOP_ADDR   出站代理（socks5:// / http(s):// / ss:// 或 host:port）
+//   HOP_MODE    出站方式：留空 = 出站代理优先；no = 直连优先；only = 仅走出站代理
+//   ALT_MODE       地区反代：builtin（默认，按机房自动选地区）/ custom / off
+//   ALT_REGION     builtin 的首选地区（留空按机房自动选）
+//   ALT_REGION2    builtin 的次选地区（留空自动；none = 不用）
+//   ALT_CUSTOM     custom 的反代列表（最多 3 个 host[:port]，换行 / 逗号分隔）
 // 无效取值按默认值处理（与原先面板里的枚举校验一致）。
 // ---------------------------------------------------------------------------
-const PROXY_PATH_RE = /^[A-Za-z0-9._~-]+$/;
-const RELAY_CUSTOM_MAX = 3;   // 自定义反代最多 3 个：与直连并发竞速，受 Workers 6 个同时出站连接的限制
+const NODE_PATH_RE = /^[A-Za-z0-9._~-]+$/;
+const ALT_CUSTOM_MAX = 3;   // 自定义反代最多 3 个：与直连并发竞速，受 Workers 6 个同时出站连接的限制
 
-function proxyConfig(env) {
+function nodeConfig(env) {
   const str = (k) => (env && env[k] != null ? String(env[k]).trim() : '');
   const cfg = {
-    uuid: '', path: '', proxyIP: str('PROXYIP'), outboundProxy: str('OUTBOUND_PROXY'), outboundMode: '',
-    relay: { mode: 'builtin', region: '', region2: '', custom: '' },
+    uuid: '', path: '', edgeIP: str('EDGEIP'), hopAddr: str('HOP_ADDR'), hopMode: '',
+    alt: { mode: 'builtin', region: '', region2: '', custom: '' },
     _problems: [],
   };
   const uuid = str('UUID').toLowerCase();
   if (isUUID(uuid)) cfg.uuid = uuid;
   else cfg._problems.push(uuid ? '环境变量 UUID 的值不正确（应为 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）。' : '请设置环境变量 UUID（节点用户 ID）。');
   const path = str('PATH').replace(/^\/+/, '').replace(/\/+$/, '');
-  if (path && PROXY_PATH_RE.test(path) && path.length <= 128) cfg.path = path;
+  if (path && NODE_PATH_RE.test(path) && path.length <= 128) cfg.path = path;
   else cfg._problems.push(path ? '环境变量 PATH 的值不正确：只能包含字母、数字及 . _ ~ -（不含 /），最长 128 位。' : '请设置环境变量 PATH（节点的访问路径，如 mynode）。');
-  const mode = str('OUTBOUND_MODE').toLowerCase();
-  if (mode === 'no' || mode === 'only') cfg.outboundMode = mode;
-  const rmode = str('RELAY_MODE').toLowerCase();
-  if (rmode === 'custom' || rmode === 'off') cfg.relay.mode = rmode;
+  const mode = str('HOP_MODE').toLowerCase();
+  if (mode === 'no' || mode === 'only') cfg.hopMode = mode;
+  const rmode = str('ALT_MODE').toLowerCase();
+  if (rmode === 'custom' || rmode === 'off') cfg.alt.mode = rmode;
   const regionOf = (v, extra) => {
-    const k = Object.keys(RELAY_DOMAINS).find(x => x.toLowerCase() === v.toLowerCase());
+    const k = Object.keys(ALT_DOMAINS).find(x => x.toLowerCase() === v.toLowerCase());
     return k || (extra && v.toLowerCase() === extra ? extra : '');
   };
-  cfg.relay.region = regionOf(str('RELAY_REGION'));
-  cfg.relay.region2 = regionOf(str('RELAY_REGION2'), 'none');
-  cfg.relay.custom = str('RELAY_CUSTOM').split(/[\n,;]+/).map(s => s.trim()).filter(Boolean).slice(0, RELAY_CUSTOM_MAX).join('\n');
+  cfg.alt.region = regionOf(str('ALT_REGION'));
+  cfg.alt.region2 = regionOf(str('ALT_REGION2'), 'none');
+  cfg.alt.custom = str('ALT_CUSTOM').split(/[\n,;]+/).map(s => s.trim()).filter(Boolean).slice(0, ALT_CUSTOM_MAX).join('\n');
   return cfg;
 }
 // ---------------------------------------------------------------------------
-// 代理设置的在线修改（可选）：面板通过服务绑定（入口 ProxyControl）读写代理的运行设置
+// 代理设置的在线修改（可选）：面板通过服务绑定（入口 NodeControl）读写代理的运行设置
 // ---------------------------------------------------------------------------
-// 代理自己的 KV（绑定变量名 PROXY_KV，建议单独建一个命名空间，只有代理绑定它）里保存一份 settings，
+// 代理自己的 KV（绑定变量名 NODE_KV，建议单独建一个命名空间，只有代理绑定它）里保存一份 settings，
 // 优先级：KV 里的设置 > 环境变量 > 默认值（与原先面板里的规则一致）。只有这 7 项运行设置可以在线修改，
 // UUID 与 PATH（节点身份与路径）永远只来自环境变量，面板改不了。
-// 没有绑定 PROXY_KV 时代理完全按环境变量工作，面板里的这些设置只读。
+// 没有绑定 NODE_KV 时代理完全按环境变量工作，面板里的这些设置只读。
 //
 // 与环境变量相同的值不会写进 KV（只保存与环境变量不同的覆盖项），之后改环境变量立即生效。
 // 读取走 isolate 内存缓存（SETTINGS_MEM_TTL）+ KV 边缘缓存，每个 isolate 约每 20 秒读一次 KV；只有节点路径上的连接才会触发读取。
 // KV 读取失败时沿用上一次读到的设置（没有就用环境变量），绝不因此阻断代理。
 const SETTINGS_KEY = 'settings';
 const SETTINGS_MEM_TTL = 20 * 1000;
-const SETTINGS_FIELDS = ['proxyIP', 'outboundProxy', 'outboundMode', 'relay.mode', 'relay.region', 'relay.region2', 'relay.custom'];
-const SS_METHODS = ['aes-128-gcm', 'aes-256-gcm', 'chacha20-ietf-poly1305'];
+const SETTINGS_FIELDS = ['edgeIP', 'hopAddr', 'hopMode', 'alt.mode', 'alt.region', 'alt.region2', 'alt.custom'];
+const AEAD_METHODS = ['aes-128-gcm', 'aes-256-gcm', 'chacha20-ietf-poly1305'];
 const HOSTNAME_RE = /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
 
-function proxyKv(env) {
-  const kv = env && env.PROXY_KV;
+function nodeKv(env) {
+  const kv = env && env.NODE_KV;
   return kv && typeof kv === 'object' && typeof kv.get === 'function' ? kv : null;
 }
 
 // cfg ↔ 扁平的设置对象（键为 SETTINGS_FIELDS）
 function flatSettings(cfg) {
   return {
-    proxyIP: cfg.proxyIP, outboundProxy: cfg.outboundProxy, outboundMode: cfg.outboundMode,
-    'relay.mode': cfg.relay.mode, 'relay.region': cfg.relay.region, 'relay.region2': cfg.relay.region2, 'relay.custom': cfg.relay.custom,
+    edgeIP: cfg.edgeIP, hopAddr: cfg.hopAddr, hopMode: cfg.hopMode,
+    'alt.mode': cfg.alt.mode, 'alt.region': cfg.alt.region, 'alt.region2': cfg.alt.region2, 'alt.custom': cfg.alt.custom,
   };
 }
 function applySettings(cfg, flat) {
   for (const k of SETTINGS_FIELDS) {
     if (!(k in flat)) continue;
-    if (k.startsWith('relay.')) cfg.relay[k.slice(6)] = flat[k];
+    if (k.startsWith('alt.')) cfg.alt[k.slice(4)] = flat[k];
     else cfg[k] = flat[k];
   }
   return cfg;
 }
-const DEFAULT_SETTINGS = flatSettings({ proxyIP: '', outboundProxy: '', outboundMode: '', relay: { mode: 'builtin', region: '', region2: '', custom: '' } });
+const DEFAULT_SETTINGS = flatSettings({ edgeIP: '', hopAddr: '', hopMode: '', alt: { mode: 'builtin', region: '', region2: '', custom: '' } });
 
 // 单项校验与规范化：返回 { value } 或 { error }（规则与原先面板里的字段校验一致）
 function checkSetting(key, v) {
@@ -1520,9 +1505,9 @@ function checkSetting(key, v) {
   if (typeof v !== 'string') return { error: '格式不正确' };
   v = v.trim();
   const oneOf = (list, label) => (list.includes(v) ? { value: v } : { error: label + '：不支持的选项「' + v.slice(0, 40) + '」' });
-  const regions = Object.keys(RELAY_DOMAINS);
+  const regions = Object.keys(ALT_DOMAINS);
   switch (key) {
-    case 'proxyIP': {
+    case 'edgeIP': {
       if (!v) return { value: '' };
       if (v.length > 256) return { error: '长度不能超过 256' };
       if (!/^[^\s/]+$/.test(v)) return { error: '格式为 host 或 host:port' };
@@ -1531,28 +1516,28 @@ function checkSetting(key, v) {
       if (!(port >= 1 && port <= 65535)) return { error: '端口须为 1 - 65535' };
       return { value: v };
     }
-    case 'outboundProxy': {
+    case 'hopAddr': {
       if (!v) return { value: '' };
       if (v.length > 1024) return { error: '长度不能超过 1024' };
       if (!/^\S+$/.test(v)) return { error: '出站代理不能包含空格' };
-      const p = parseProxyAddress(v);
+      const p = parseHopAddress(v);
       if (!p || !p.host) return { error: '无法解析出站代理地址（格式如 socks5://user:pass@1.2.3.4:1080）' };
       if (!(p.port >= 1 && p.port <= 65535)) return { error: '出站代理端口须为 1 - 65535' };
       if (p.type === 'ss') {
-        if (!ssCipherAlgo(p.method)) return { error: 'SS 加密方式仅支持 ' + SS_METHODS.join(' / ') };
-        if (!p.password) return { error: 'SS 缺少密码' };
+        if (!aeadAlgo(p.method)) return { error: 'AEAD 加密方式仅支持 ' + AEAD_METHODS.join(' / ') };
+        if (!p.password) return { error: 'AEAD 缺少密码' };
       }
       return { value: v };
     }
-    case 'outboundMode': return oneOf(['', 'no', 'only'], '出站方式');
-    case 'relay.mode': return oneOf(['builtin', 'custom', 'off'], '地区反代模式');
-    case 'relay.region': case 'relay.region2': {
-      const extra = key === 'relay.region2' ? ['', 'none'] : [''];
+    case 'hopMode': return oneOf(['', 'no', 'only'], '出站方式');
+    case 'alt.mode': return oneOf(['builtin', 'custom', 'off'], '地区反代模式');
+    case 'alt.region': case 'alt.region2': {
+      const extra = key === 'alt.region2' ? ['', 'none'] : [''];
       const hit = regions.find(r => r.toLowerCase() === v.toLowerCase());
       if (hit) return { value: hit };
-      return oneOf(extra, key === 'relay.region' ? '首选反代地区' : '次选反代地区');
+      return oneOf(extra, key === 'alt.region' ? '首选反代地区' : '次选反代地区');
     }
-    case 'relay.custom': {
+    case 'alt.custom': {
       if (v.length > 1024) return { error: '长度不能超过 1024' };
       const seen = new Set(), out = [];
       for (const raw of v.split(/[\n,;]+/).map(s => s.trim()).filter(Boolean)) {
@@ -1563,7 +1548,7 @@ function checkSetting(key, v) {
         const entry = (h.indexOf(':') >= 0 ? '[' + h + ']' : h) + (port === 443 ? '' : ':' + port);
         if (!seen.has(entry)) { seen.add(entry); out.push(entry); }
       }
-      if (out.length > RELAY_CUSTOM_MAX) return { error: '最多 ' + RELAY_CUSTOM_MAX + ' 个自定义反代（当前 ' + out.length + ' 个）' };
+      if (out.length > ALT_CUSTOM_MAX) return { error: '最多 ' + ALT_CUSTOM_MAX + ' 个自定义反代（当前 ' + out.length + ' 个）' };
       return { value: out.join('\n') };
     }
   }
@@ -1583,8 +1568,8 @@ function sanitizeSettings(input) {
 }
 function crossCheckSettings(flat) {
   const errors = [];
-  if (flat['relay.mode'] === 'custom' && !flat['relay.custom']) {
-    errors.push({ field: 'relay.custom', msg: '已选择「仅使用自定义反代」，请至少填写一个反代地址（或改回内置 / 关闭）' });
+  if (flat['alt.mode'] === 'custom' && !flat['alt.custom']) {
+    errors.push({ field: 'alt.custom', msg: '已选择「仅使用自定义反代」，请至少填写一个反代地址（或改回内置 / 关闭）' });
   }
   return errors;
 }
@@ -1614,10 +1599,10 @@ async function readStoredSettings(kv, fresh) {
   return entry;
 }
 
-// 代理运行时使用的配置：环境变量 + KV 覆盖项（没有 PROXY_KV 或环境变量有问题时就是环境变量本身）
-async function loadProxyConfig(env, base) {
-  const cfg = base || proxyConfig(env);
-  const kv = proxyKv(env);
+// 代理运行时使用的配置：环境变量 + KV 覆盖项（没有 NODE_KV 或环境变量有问题时就是环境变量本身）
+async function loadNodeConfig(env, base) {
+  const cfg = base || nodeConfig(env);
+  const kv = nodeKv(env);
   if (!kv || cfg._problems.length) return cfg;
   const { stored } = await readStoredSettings(kv);
   return applySettings(cfg, stored);
@@ -1625,28 +1610,28 @@ async function loadProxyConfig(env, base) {
 
 // getSettings 的返回值：生效值、环境变量值、每项的来源、可选地区
 function describeSettings(env, stored, error) {
-  const envFlat = flatSettings(proxyConfig(env));
+  const envFlat = flatSettings(nodeConfig(env));
   const settings = Object.assign({}, envFlat, stored);
   const source = {};
   for (const k of SETTINGS_FIELDS) source[k] = k in stored ? 'kv' : (envFlat[k] !== DEFAULT_SETTINGS[k] ? 'env' : 'default');
-  const kv = proxyKv(env);
-  return { ok: true, storage: !!(kv && typeof kv.put === 'function'), settings, env: envFlat, source, regions: Object.keys(RELAY_DOMAINS), error: error || '' };
+  const kv = nodeKv(env);
+  return { ok: true, storage: !!(kv && typeof kv.put === 'function'), settings, env: envFlat, source, regions: Object.keys(ALT_DOMAINS), error: error || '' };
 }
-async function getProxySettings(env) {
-  const kv = proxyKv(env);
+async function getNodeSettings(env) {
+  const kv = nodeKv(env);
   if (!kv) return describeSettings(env, {}, '');
   const { stored, error } = await readStoredSettings(kv);
   return describeSettings(env, stored, error);
 }
 // 保存：patch 里出现的项逐项校验（任何一项出错整批都不保存），与环境变量相同的值不落盘
-async function saveProxySettings(env, patch) {
-  const kv = proxyKv(env);
-  if (!kv || typeof kv.put !== 'function') return { ok: false, error: '代理没有绑定 KV（变量名 PROXY_KV），无法保存设置；这些设置仍可以通过环境变量修改' };
+async function saveNodeSettings(env, patch) {
+  const kv = nodeKv(env);
+  if (!kv || typeof kv.put !== 'function') return { ok: false, error: '代理没有绑定 KV（变量名 NODE_KV），无法保存设置；这些设置仍可以通过环境变量修改' };
   const { values, errors, ignored } = sanitizeSettings(patch);
   if (errors.length) return { ok: false, error: errors.map(e => e.msg).join('；'), errors, ignored };
   const cur = await readStoredSettings(kv, true);
   if (cur.error === 'unavailable') return { ok: false, error: 'KV 暂时无法读取，为避免覆盖已有设置，已禁止保存' };   // 内容损坏（corrupt）时允许保存来修复
-  const envFlat = flatSettings(proxyConfig(env));
+  const envFlat = flatSettings(nodeConfig(env));
   const merged = Object.assign({}, envFlat, cur.stored, values);
   const cross = crossCheckSettings(merged);
   if (cross.length) return { ok: false, error: cross.map(e => e.msg).join('；'), errors: cross, ignored };
@@ -1658,9 +1643,9 @@ async function saveProxySettings(env, patch) {
   return Object.assign(describeSettings(env, next, ''), { ignored });
 }
 // 重置：删除 KV 里的覆盖项，回到环境变量 + 默认值
-async function resetProxySettings(env) {
-  const kv = proxyKv(env);
-  if (!kv || typeof kv.delete !== 'function') return { ok: false, error: '代理没有绑定 KV（变量名 PROXY_KV），没有需要重置的设置' };
+async function resetNodeSettings(env) {
+  const kv = nodeKv(env);
+  if (!kv || typeof kv.delete !== 'function') return { ok: false, error: '代理没有绑定 KV（变量名 NODE_KV），没有需要重置的设置' };
   try { await kv.delete(SETTINGS_KEY); }
   catch (e) { return { ok: false, error: 'KV 删除失败：' + ((e && e.message) || e) }; }
   SETTINGS_MEM.set(kv, { t: Date.now(), stored: {}, error: '' });
@@ -1677,54 +1662,54 @@ export default {
     if (url.protocol === 'http:' && upgrade !== 'websocket') {
       return Response.redirect(url.href.replace('http://', 'https://'), 301);
     }
-    const cfg = proxyConfig(env);
+    const cfg = nodeConfig(env);
     // 必填项缺失或非法：没有 UUID / 路径就无法工作，统一返回设置说明
     if (cfg._problems.length) {
       return new Response(cfg._problems.join('\n'), { status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } });
     }
     const path = url.pathname.replace(/^\/+|\/+$/g, '');
     if (path === cfg.path) {
-      // 只有节点路径上的连接才会读 PROXY_KV 里的在线设置（伪装页请求不触发任何 KV 读取）
-      const live = await loadProxyConfig(env, cfg);
-      if (upgrade === 'websocket') return handleWebSocketProxy(request, live);
+      // 只有节点路径上的连接才会读 NODE_KV 里的在线设置（伪装页请求不触发任何 KV 读取）
+      const live = await loadNodeConfig(env, cfg);
+      if (upgrade === 'websocket') return handleWsProto(request, live);
       if (request.method === 'POST') {
-        try { return await handleXhttpProxy(request, live); }
-        catch (e) { return json({ ok: false, msg: 'xhttp 代理错误: ' + (e.message || e) }, 500); }
+        try { return await handleXhtProto(request, live); }
+        catch (e) { return json({ ok: false, msg: 'xht 错误: ' + (e.message || e) }, 500); }
       }
     }
-    return helloPage();
+    return stubPage();
   }
 };
 
 // 面板 Worker 通过服务绑定调用的 RPC 入口，没有 HTTP 路由，公网访问不到：
-//   ProxyStatus   只读：status() 返回是否在线 / 版本 / 配置问题 / 非敏感的设置摘要（不含 UUID、路径、反代地址与出站代理的主机和密码）
-//   ProxyControl  在 ProxyStatus 之上再加 getSettings() / setSettings() / resetSettings()：读写 7 项运行设置（见 proxy-settings.js）。
+//   NodeStatus   只读：status() 返回是否在线 / 版本 / 配置问题 / 非敏感的设置摘要（不含 UUID、路径、反代地址与出站代理的主机和密码）
+//   NodeControl  在 NodeStatus 之上再加 getSettings() / setSettings() / resetSettings()：读写 7 项运行设置（见 proxy-settings.js）。
 //                 getSettings() 会返回完整的设置值，包括出站代理里的用户名与密码——面板里需要显示并编辑它们；
-//                 UUID 与 PATH 永远不在其中，也改不了。想让面板只读时，服务绑定的入口选 ProxyStatus 即可
-export class ProxyStatus extends WorkerEntrypoint {
+//                 UUID 与 PATH 永远不在其中，也改不了。想让面板只读时，服务绑定的入口选 NodeStatus 即可
+export class NodeStatus extends WorkerEntrypoint {
   async status() {
-    const cfg = await loadProxyConfig(this.env);
-    const out = cfg.outboundProxy ? parseProxyAddress(cfg.outboundProxy) : null;
+    const cfg = await loadNodeConfig(this.env);
+    const out = cfg.hopAddr ? parseHopAddress(cfg.hopAddr) : null;
     return {
       ok: cfg._problems.length === 0,
       version: VERSION,
       problems: cfg._problems,
-      control: this instanceof ProxyControl,
-      storage: !!proxyKv(this.env),
+      control: this instanceof NodeControl,
+      storage: !!nodeKv(this.env),
       settings: {
-        proxyIP: !!cfg.proxyIP,
-        outboundProxy: out ? out.type : '',
-        outboundMode: cfg.outboundMode,
-        relayMode: cfg.relay.mode,
-        relayRegion: cfg.relay.region,
-        relayRegion2: cfg.relay.region2,
-        relayCustom: cfg.relay.custom ? cfg.relay.custom.split('\n').length : 0,
+        edgeIP: !!cfg.edgeIP,
+        hopAddr: out ? out.type : '',
+        hopMode: cfg.hopMode,
+        altMode: cfg.alt.mode,
+        altRegion: cfg.alt.region,
+        altRegion2: cfg.alt.region2,
+        altCustom: cfg.alt.custom ? cfg.alt.custom.split('\n').length : 0,
       },
     };
   }
 }
-export class ProxyControl extends ProxyStatus {
-  getSettings() { return getProxySettings(this.env); }
-  setSettings(patch) { return saveProxySettings(this.env, patch); }
-  resetSettings() { return resetProxySettings(this.env); }
+export class NodeControl extends NodeStatus {
+  getSettings() { return getNodeSettings(this.env); }
+  setSettings(patch) { return saveNodeSettings(this.env, patch); }
+  resetSettings() { return resetNodeSettings(this.env); }
 }

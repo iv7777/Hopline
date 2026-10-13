@@ -122,25 +122,25 @@ test('服务绑定：面板通过 PROXY 绑定读到真实代理的在线状态�
     return res.headers.get('Set-Cookie').split(';')[0];
   };
   const status = async (proxyEnv) => {
-    const penv = { PATH: 'my-panel', ADMIN: 'pw', CONFIG_KV: kv(), PROXY: new proxyModule.ProxyStatus({}, proxyEnv) };
+    const penv = { PATH: 'my-panel', ADMIN: 'pw', CONFIG_KV: kv(), PROXY: new proxyModule.NodeStatus({}, proxyEnv) };
     const res = await panel.fetch(new Request('https://panel.example.org/my-panel/api/proxy-status', { headers: { Cookie: await login(penv) } }), penv, {});
     return (await res.json()).data;
   };
-  const good = await status({ UUID: PROXY_UUID, PATH: PROXY_PATH, OUTBOUND_PROXY: 'http://user:pw@1.2.3.4:8080' });
+  const good = await status({ UUID: PROXY_UUID, PATH: PROXY_PATH, HOP_ADDR: 'http://user:pw@1.2.3.4:8080' });
   assert.equal(good.up, true); assert.equal(good.ok, true);
   assert.match(good.version, /^\d+\.\d+\.\d+$/, '代理自己的版本号');
   assert.ok(!('panelVersion' in good), '面板与代理各自编号，状态里不再带面板版本');
-  assert.equal(good.settings.outboundProxy, 'http');
+  assert.equal(good.settings.hopAddr, 'http');
   assert.ok(!JSON.stringify(good).includes('user:pw') && !JSON.stringify(good).includes(PROXY_UUID));
   const bad = await status({ PATH: PROXY_PATH });
   assert.equal(bad.up, true); assert.equal(bad.ok, false);
   assert.match(bad.problems.join(' '), /UUID/);
 });
 
-test('面板在线修改代理设置：面板 → ProxyControl → 代理自己的 KV → 代理按新设置出站；改不了 UUID / PATH；只读入口 ProxyStatus 不能写', async () => {
-  const proxyKv = kv();
-  const xenv = { UUID: PROXY_UUID, PATH: PROXY_PATH, PROXYIP: 'env-relay.example', PROXY_KV: proxyKv };
-  const penv = { PATH: 'my-panel', ADMIN: 'pw', CONFIG_KV: kv(), PROXY: new proxyModule.ProxyControl({}, xenv) };
+test('面板在线修改代理设置：面板 → NodeControl → 代理自己的 KV → 代理按新设置出站；改不了 UUID / PATH；只读入口 NodeStatus 不能写', async () => {
+  const nodeKv = kv();
+  const xenv = { UUID: PROXY_UUID, PATH: PROXY_PATH, EDGEIP: 'env-alt.example', NODE_KV: nodeKv };
+  const penv = { PATH: 'my-panel', ADMIN: 'pw', CONFIG_KV: kv(), PROXY: new proxyModule.NodeControl({}, xenv) };
   const loginRes = await panel.fetch(new Request('https://panel.example.org/login', {
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': '203.0.113.9' },
     body: 'username=admin&password=pw&next=' + encodeURIComponent('/my-panel'),
@@ -152,16 +152,16 @@ test('面板在线修改代理设置：面板 → ProxyControl → 代理自己�
   };
   const got = await api('proxy-settings');
   assert.equal(got.body.data.storage, true);
-  assert.equal(got.body.data.settings.proxyIP, 'env-relay.example');
-  assert.equal(got.body.data.source.proxyIP, 'env');
-  const saved = await api('proxy-settings', { method: 'POST', body: JSON.stringify({ proxyIP: 'panel-set.example:8443', 'relay.mode': 'off', UUID: 'hijack', PATH: 'hijack' }) });
+  assert.equal(got.body.data.settings.edgeIP, 'env-alt.example');
+  assert.equal(got.body.data.source.edgeIP, 'env');
+  const saved = await api('proxy-settings', { method: 'POST', body: JSON.stringify({ edgeIP: 'panel-set.example:8443', 'alt.mode': 'off', UUID: 'hijack', PATH: 'hijack' }) });
   assert.equal(saved.status, 200, JSON.stringify(saved.body));
-  assert.equal(saved.body.data.settings.proxyIP, 'panel-set.example:8443');
-  assert.deepEqual(JSON.parse(proxyKv.m.get('settings')), { proxyIP: 'panel-set.example:8443', 'relay.mode': 'off' });
-  assert.ok(!proxyKv.m.get('settings').includes('hijack'));
+  assert.equal(saved.body.data.settings.edgeIP, 'panel-set.example:8443');
+  assert.deepEqual(JSON.parse(nodeKv.m.get('settings')), { edgeIP: 'panel-set.example:8443', 'alt.mode': 'off' });
+  assert.ok(!nodeKv.m.get('settings').includes('hijack'));
   const st = (await api('proxy-status')).body.data;
   assert.equal(st.control, true); assert.equal(st.storage, true);
-  assert.equal(st.settings.proxyIP, true); assert.equal(st.settings.relayMode, 'off');
+  assert.equal(st.settings.edgeIP, true); assert.equal(st.settings.altMode, 'off');
   // 代理按新设置工作：relay.mode=off → 目标直连失败后不尝试任何反代
   const upgrade = await proxy.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}`, { headers: { Upgrade: 'websocket' } }), xenv, {});
   assert.equal(upgrade.status, 101);
@@ -177,12 +177,62 @@ test('面板在线修改代理设置：面板 → ProxyControl → 代理自己�
   assert.ok(connections.length >= 1 && connections.every(c => c.hostname === host || c.hostname === 'panel-set.example'), '没有尝试任何地区反代');
   // 恢复为环境变量
   const reset = await api('proxy-reset', { method: 'POST' });
-  assert.equal(reset.body.data.settings.proxyIP, 'env-relay.example');
-  assert.equal(proxyKv.m.has('settings'), false);
+  assert.equal(reset.body.data.settings.edgeIP, 'env-alt.example');
+  assert.equal(nodeKv.m.has('settings'), false);
   // 只读入口：能看状态，不能改
-  const roEnv = { ...penv, PROXY: new proxyModule.ProxyStatus({}, xenv) };
+  const roEnv = { ...penv, PROXY: new proxyModule.NodeStatus({}, xenv) };
   const roRes = await panel.fetch(new Request('https://panel.example.org/my-panel/api/proxy-settings', { method: 'POST', body: '{}', headers: { Cookie: cookie, 'Content-Type': 'application/json' } }), roEnv, {});
   assert.equal(roRes.status, 502);
   const roStatus = await panel.fetch(new Request('https://panel.example.org/my-panel/api/proxy-status', { headers: { Cookie: cookie } }), roEnv, {});
   assert.equal((await roStatus.json()).data.control, false);
+});
+
+test('混淆版代理脚本（顶层名字也已改名）功能不变：WebSocket 与 XHTTP 都能转发，出站设置与地区反代按环境变量 / KV 生效', async () => {
+  const obf = await import('../obf_Hopline-proxy.js?e2e');
+  const xenv = { UUID: PROXY_UUID, PATH: PROXY_PATH };
+  const uuidBytes = PROXY_UUID.replace(/-/g, '').match(/../g).map(h => parseInt(h, 16));
+  const tls = [0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5];
+  const reqFor = (host) => new Uint8Array([0, ...uuidBytes, 0, 1, 1, 187, 2, host.length, ...Buffer.from(host), ...tls]);
+  const waitWritten = async () => { for (let i = 0; i < 100 && !connections.some(c => c.written.length); i++) await new Promise(r => setTimeout(r, 10)); return connections.find(c => c.written.length); };
+  // WebSocket
+  connections.length = 0;
+  const up = await obf.default.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}?ed=2048`, { headers: { Upgrade: 'websocket' } }), xenv, {});
+  assert.equal(up.status, 101);
+  await lastServer.emit('message', { data: reqFor('obf-ws.example').buffer });
+  const ws = await waitWritten();
+  assert.equal(ws && ws.hostname, 'obf-ws.example');
+  assert.deepEqual([...ws.written[0]], tls);
+  // XHTTP
+  connections.length = 0;
+  const xh = await obf.default.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}`, { method: 'POST', body: reqFor('obf-xh.example'), duplex: 'half' }), xenv, {});
+  assert.equal(xh.status, 200);
+  assert.equal((await waitWritten()).hostname, 'obf-xh.example');
+  // 伪装页与错误路径
+  for (const path of ['/', '/other', '/status']) assert.match(await (await obf.default.fetch(new Request(`https://${PROXY_HOST}${path}`), xenv, {})).text(), /Hello World/);
+  // 在线设置（NodeControl + NODE_KV）：写入后的新连接按新设置出站
+  const settingsKv = kv();
+  const env2 = { ...xenv, NODE_KV: settingsKv, EDGEIP: 'env-edge.example' };
+  const ctl = new obf.NodeControl({}, env2);
+  assert.equal((await ctl.getSettings()).settings.edgeIP, 'env-edge.example');
+  const saved = await ctl.setSettings({ edgeIP: 'saved-edge.example', 'alt.mode': 'off', hopMode: 'no' });
+  assert.equal(saved.ok, true, JSON.stringify(saved));
+  assert.deepEqual(JSON.parse(settingsKv.m.get('settings')), { edgeIP: 'saved-edge.example', hopMode: 'no', 'alt.mode': 'off' });
+  const status = await ctl.status();
+  assert.equal(status.control, true); assert.equal(status.settings.altMode, 'off');
+  assert.equal((await ctl.resetSettings()).settings.edgeIP, 'env-edge.example');
+});
+
+test('源码与混淆版都没有协议 / 代理角色的名字：去掉注释后，标识符与字符串里不再出现 vless、xhttp、proxy、relay、outbound、shadowsocks、tunnel 等词（协议规定必须原样出现的字面量除外）', async () => {
+  const { stripJsComments } = await import('../build.mjs');
+  const { readFileSync } = await import('node:fs');
+  const words = /vless|vmess|xhttp|proxy|relay|outbound|shadow|trojan|tunnel|cmliussss|edtunnel|sniff/i;
+  const code = stripJsComments(readFileSync(new URL('../Hopline-proxy.js', import.meta.url), 'utf8'));
+  // 允许出现的：HTTP 协议要求的头名、用户输入的 socks5:// 写法提示（含中文「出站代理」一词的校验提示）
+  const allowed = [/^'Proxy-Authorization: Basic '$/, /^'无法解析出站代理地址（格式如 socks5:\/\/user:pass@1\.2\.3\.4:1080）'$/];
+  const tokens = code.match(/'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|[A-Za-z_$][\w$]*/g) || [];
+  const bad = [...new Set(tokens.filter(t => words.test(t) && !allowed.some(a => a.test(t))))];
+  assert.deepEqual(bad, [], '去掉注释后仍含这些词：' + bad.join(' | '));
+  const obf = readFileSync(new URL('../obf_Hopline-proxy.js', import.meta.url), 'utf8');
+  assert.ok(!/Hopline|vless|xhttp|cmliussss|edtunnel/i.test(obf), '混淆版里没有项目名、横幅或协议名');
+  assert.ok(!obf.includes('handleWsProto') && !obf.includes('openUpstream') && !obf.includes('resolveEdgeIPs'), '混淆版顶层函数名已改名');
 });

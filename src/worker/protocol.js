@@ -5,7 +5,7 @@ const TD = new TextDecoder();
 // ---------------------------------------------------------------------------
 function readAddress(data, view, offset, atyp) {
   // 数据不足一律抛「头部过短」：WS / XHTTP 据此继续等待后续分片，而不是因越界异常直接断开连接
-  const need = (n) => { if (offset + n > data.byteLength) throw new Error('VLESS 头部过短'); };
+  const need = (n) => { if (offset + n > data.byteLength) throw new Error('VSS 头部过短'); };
   if (atyp === 1) { // IPv4
     need(4);
     return { addr: `${view.getUint8(offset)}.${view.getUint8(offset + 1)}.${view.getUint8(offset + 2)}.${view.getUint8(offset + 3)}`, len: 4 };
@@ -39,20 +39,20 @@ function uuidToBytes(u) {
   return b;
 }
 function parseVssProtoHeader(data, cfg) {
-  if (!data || data.byteLength < 1) throw new Error('VLESS 头部过短');
+  if (!data || data.byteLength < 1) throw new Error('VSS 头部过短');
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 0;
-  if (view.getUint8(0) !== 0) throw new Error('不支持的 VLESS 版本');
-  if (data.byteLength < 17) throw new Error('VLESS 头部过短');
+  if (view.getUint8(0) !== 0) throw new Error('不支持的 VSS 版本');
+  if (data.byteLength < 17) throw new Error('VSS 头部过短');
   const want = uuidToBytes(cfg && cfg.uuid);
   let diff = 0;
   for (let i = 0; i < 16; i++) diff |= (view.getUint8(1 + i) ^ want[i]);
   if (diff !== 0) throw new Error('UUID 不匹配');
   offset += 1 + 16;                       // version + uuid
-  if (offset >= data.byteLength) throw new Error('VLESS 头部过短');
+  if (offset >= data.byteLength) throw new Error('VSS 头部过短');
   const addonsLen = view.getUint8(offset); offset += 1;
   offset += addonsLen;
-  if (offset + 4 > data.byteLength) throw new Error('VLESS 头部过短');   // 命令(1) + 端口(2) + 地址类型(1)
+  if (offset + 4 > data.byteLength) throw new Error('VSS 头部过短');   // 命令(1) + 端口(2) + 地址类型(1)
   const command = view.getUint8(offset); offset += 1;
   const port = view.getUint16(offset); offset += 2;
   const atyp = view.getUint8(offset); offset += 1;
