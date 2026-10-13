@@ -25,6 +25,7 @@ const OUT = 'obf_Hopline-proxy.js';
 
 const OPTIONS = {
   compact: true,
+  seed: 20260101,                           // 固定种子：同一份源码每次产出完全相同的混淆文件（CI 自动重新生成时不会产生无意义的差异提交）
   target: 'service-worker',
   identifierNamesGenerator: 'mangled-shuffled',
   renameGlobals: true,                      // 单文件处理：顶层函数 / 变量名一并改名
