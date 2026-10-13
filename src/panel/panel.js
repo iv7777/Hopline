@@ -691,7 +691,7 @@ bindFormEvents();
 /* ===== 订阅 ===== */
 function subUrlOf(fmt){
   // 自定义订阅路径优先：自动保留当前域名（location.origin），只替换路径段；
-  // 用户只填 UUID/别名段（如 AAZ），拼成 https://当前域名/AAZ/sub；留空用 UUID（https://当前域名/<UUID>/sub）。
+  // 用户只填 UUID/别名段（如 mysub），拼成 https://当前域名/mysub/sub；留空用 UUID（https://当前域名/<UUID>/sub）。
   // 填了 /sub 结尾或带前后斜杠时自动归一，格式后缀（clash/singbox 等）拼为 /sub/<格式>
   var custom = (window.CFG && CFG.subUrl) ? String(CFG.subUrl).trim().replace(/^\/+/, '').replace(/\/sub$/, '').replace(/\/+$/, '') : '';
   var seg = custom || (window.CFG && CFG.uuid) || '';

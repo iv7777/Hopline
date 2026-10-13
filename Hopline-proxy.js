@@ -878,6 +878,21 @@ function b64ToUtf8(s) {
 // TLS 数据，由对端按 SNI 路由到目标
 // ---------------------------------------------------------------------------
 // 内置地区备用线路域名池（社区提供，解析为非 Cloudflare IP；以 base64 保存）
+// 当前内容（改动下面的 base64 时可参照，键为地区标签，值为域名）：
+//   HK: proxyip.hk.cmliussss.net
+//   US: proxyip.us.cmliussss.net
+//   SG: proxyip.sg.cmliussss.net
+//   JP: proxyip.jp.cmliussss.net
+//   KR: proxyip.kr.cmliussss.net
+//   DE: proxyip.de.cmliussss.net
+//   SE: proxyip.se.cmliussss.net
+//   NL: proxyip.nl.cmliussss.net
+//   FI: proxyip.fi.cmliussss.net
+//   GB: proxyip.gb.cmliussss.net
+//   Oracle: proxyip.oracle.cmliussss.net
+//   DigitalOcean: proxyip.digitalocean.cmliussss.net
+//   Vultr: proxyip.vultr.cmliussss.net
+//   Multacom: proxyip.multacom.cmliussss.net
 const ALT_DOMAINS = JSON.parse(atob('eyJISyI6InByb3h5aXAuaGsuY21saXVzc3NzLm5ldCIsIlVTIjoicHJveHlpcC51cy5jbWxpdXNzc3MubmV0IiwiU0ciOiJwcm94eWlwLnNnLmNtbGl1c3Nzcy5uZXQiLCJKUCI6InByb3h5aXAuanAuY21saXVzc3NzLm5ldCIsIktSIjoicHJveHlpcC5rci5jbWxpdXNzc3MubmV0IiwiREUiOiJwcm94eWlwLmRlLmNtbGl1c3Nzcy5uZXQiLCJTRSI6InByb3h5aXAuc2UuY21saXVzc3NzLm5ldCIsIk5MIjoicHJveHlpcC5ubC5jbWxpdXNzc3MubmV0IiwiRkkiOiJwcm94eWlwLmZpLmNtbGl1c3Nzcy5uZXQiLCJHQiI6InByb3h5aXAuZ2IuY21saXVzc3NzLm5ldCIsIk9yYWNsZSI6InByb3h5aXAub3JhY2xlLmNtbGl1c3Nzcy5uZXQiLCJEaWdpdGFsT2NlYW4iOiJwcm94eWlwLmRpZ2l0YWxvY2Vhbi5jbWxpdXNzc3MubmV0IiwiVnVsdHIiOiJwcm94eWlwLnZ1bHRyLmNtbGl1c3Nzcy5uZXQiLCJNdWx0YWNvbSI6InByb3h5aXAubXVsdGFjb20uY21saXVzc3NzLm5ldCJ9'));   // 备用线路域名表（base64，启动时解码一次）
 // 根据 Worker 所在机房 colo（IATA 代码）选择最近的中继地区
 function selectAltRegion(colo) {

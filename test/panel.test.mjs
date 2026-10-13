@@ -139,7 +139,7 @@ test('保存只写入字段表登记的配置项，规范化取值，忽略未�
     method: 'POST', cookie,
     body: {
       admin: 'new-secret', _quotaCap: 1, version: '9.9.9', fragment: 'x', src: { customPref: true, native: true },
-      optimizer: { subRandomCount: '30', subMode: 'random' }, nodeLimitCount: 300, subUrl: '/AAZ/sub', host: 'https://Node.Example.com/path', filter: { region: ['all', 'HK'] },
+      optimizer: { subRandomCount: '30', subMode: 'random' }, nodeLimitCount: 300, subUrl: '/mysub/sub', host: 'https://Node.Example.com/path', filter: { region: ['all', 'HK'] },
       preferredIPs: [{ ip: '[2606:4700::1]', port: '8443', name: ' 香港 ' }], preferredDomains: 'x.example.com',
     },
   });
@@ -152,7 +152,7 @@ test('保存只写入字段表登记的配置项，规范化取值，忽略未�
   assert.equal(s.src.native, true);
   for (const k of ['optimizer', 'preferredIPs', 'preferredDomains']) assert.equal(k in s, false, `${k}（已移除的自定义订阅 / 随机优选配置）不写入`);
   assert.equal('nodeLimitCount' in s, false, '已移除的字段不写入');
-  assert.equal(s.subUrl, 'AAZ');
+  assert.equal(s.subUrl, 'mysub');
   assert.equal(s.host, 'Node.Example.com');
   assert.deepEqual(s.filter.region, ['all']);
   assert.ok(r.ignored.includes('admin') && r.ignored.includes('_quotaCap') && r.ignored.includes('src.customPref') && r.ignored.includes('nodeLimitCount'));
@@ -367,13 +367,13 @@ test('环境变量锁定的字段在面板只读、保存时忽略（问题 3）
 });
 
 test('订阅别名只输出订阅，不开放面板 / 管理接口（问题 6）', async () => {
-  const env = baseEnv({ CONFIG_KV: kv({ config: { subUrl: 'AAZ', filter: { ipType: ['IPv4'] } } }) });
+  const env = baseEnv({ CONFIG_KV: kv({ config: { subUrl: 'mysub', filter: { ipType: ['IPv4'] } } }) });
   const cookie = await login(env);
-  const sub = await call(env, '/AAZ/sub', { ua: 'v2rayN/7.0' });
+  const sub = await call(env, '/mysub/sub', { ua: 'v2rayN/7.0' });
   assert.equal(sub.status, 200);
   assert.match(await sub.text(), /^vless:\/\//m);
-  assert.equal((await call(env, '/AAZ', { cookie })).status, 200, '别名下不提供面板');
-  assert.equal((await call(env, '/AAZ/api/config', { cookie })).status, 200, '别名下不提供管理接口');
+  assert.equal((await call(env, '/mysub', { cookie })).status, 200, '别名下不提供面板');
+  assert.equal((await call(env, '/mysub/api/config', { cookie })).status, 200, '别名下不提供管理接口');
   assert.equal((await call(env, `/${UUID}`, { cookie })).status, 200, '面板路径不受影响');
 });
 
@@ -389,8 +389,8 @@ test('自定义订阅路径留空：订阅地址为 /<UUID>/sub（面板路径�
   assert.equal((await call(env, `/${UUID}/api/config`, { cookie })).status, 200, 'UUID 路径下不提供管理接口');
   assert.equal((await call(env, '/panel', { cookie })).status, 200, '面板路径不受影响');
   // 设置了自定义订阅路径：UUID 不再作为订阅入口（面板路径与 UUID 不同时）
-  const env2 = baseEnv({ PATH: 'panel', CONFIG_KV: kv({ config: { subUrl: 'AAZ' } }) });
-  assert.equal((await call(env2, '/AAZ/sub', { ua: 'v2rayN/7.0' })).status, 200);
+  const env2 = baseEnv({ PATH: 'panel', CONFIG_KV: kv({ config: { subUrl: 'mysub' } }) });
+  assert.equal((await call(env2, '/mysub/sub', { ua: 'v2rayN/7.0' })).status, 200);
   assert.equal((await call(env2, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).status, 200);
 });
 

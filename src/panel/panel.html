@@ -280,7 +280,7 @@
       <div class="card">
         <h3><span class="tick"></span>基础配置</h3>
         <div class="field"><label>面板路径（环境变量 PATH 设置，面板中只读）</label><input type="text" id="a-path" autocomplete="off"><div class="hint">面板与订阅共用此路径（与代理的节点路径互相独立）；修改请到面板 Worker 的环境变量 PATH，修改后订阅地址随之改变，客户端需重新添加订阅。</div></div>
-        <div class="field"><label>自定义订阅路径（只填一段，如 AAZ → /AAZ/sub；留空为 /代理 UUID/sub）</label><input type="text" id="a-suburl" placeholder="AAZ" autocomplete="off"></div>
+        <div class="field"><label>自定义订阅路径（只填一段，如 mysub → /mysub/sub；留空为 /代理 UUID/sub）</label><input type="text" id="a-suburl" placeholder="mysub" autocomplete="off"></div>
         <div class="field"><label>管理用户名（登录时需要；留空为 admin，区分大小写）</label><input type="text" id="a-adminuser" placeholder="admin" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <div class="field" style="margin-bottom:0"><label>管理密码（留空保持不变；未设置时面板禁用）</label><input type="password" id="a-admin" placeholder="设置后访问面板需登录" autocomplete="new-password"></div>
         <p class="hint" style="margin-top:10px">未绑定 KV（绑定变量名 CONFIG_KV）时无法保存面板配置，只有环境变量生效。自定义域名访问面板需先在 Cloudflare 面板 → Workers 与 Pages → 面板 Worker → Domains &amp; Routes 添加。</p>

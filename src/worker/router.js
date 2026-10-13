@@ -261,7 +261,7 @@ async function handleRequest(request, env, state) {
     return new Response(loginHTML, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
-  // 订阅入口：自定义订阅路径（如 /AAZ/sub），留空则为 /<UUID>/sub（UUID 即代理 UUID）；
+  // 订阅入口：自定义订阅路径（如 /mysub/sub），留空则为 /<UUID>/sub（UUID 即代理 UUID）；
   // 面板路径下的 /sub 始终可用。
   // 面板入口与管理 API 只认 panelPath，订阅入口下不开放面板与管理接口
   const subAlias = String(cfg.subUrl || '').trim().replace(/^\/+/, '').replace(/\/+$/, '');

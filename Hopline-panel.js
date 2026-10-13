@@ -1,4 +1,4 @@
-/*!Hopline-panel v3.0.4*/
+/*!Hopline-panel v3.0.5*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -19,7 +19,7 @@
 //                    入口 NodeControl = 另可在面板「代理设置」里在线修改代理的出站 / 地区反代设置（代理还需绑定 NODE_KV）
 // ============================================================================
 // 面板脚本（Hopline-panel.js）的版本号：用于检测更新与面板里显示。与代理脚本各自编号、各自升版本
-const VERSION = '3.0.4';
+const VERSION = '3.0.5';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
 // 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
@@ -206,7 +206,7 @@ const CONFIG_SCHEMA = [
     pattern: PATH_SEG_PATTERN, hint: '只能包含字母、数字及 . _ ~ -（不含 /）', reserved: RESERVED_PATHS, envLock: ENV_NAMES.path },
   // 自定义订阅路径：/<别名>/sub 输出订阅（不开放面板与管理接口）；留空为 /<UUID>/sub
   { key: 'subUrl', type: 'string', def: '', el: 'a-suburl', label: '自定义订阅路径', maxLen: 128, strip: ['^/+', '/+$', '/sub$', '/+$'],
-    pattern: PATH_SEG_PATTERN, hint: '只填一段别名，如 AAZ（字母、数字及 . _ ~ -）', reserved: RESERVED_PATHS },
+    pattern: PATH_SEG_PATTERN, hint: '只填一段别名，如 mysub（字母、数字及 . _ ~ -）', reserved: RESERVED_PATHS },
   // 管理用户名：登录时与管理密码一起校验（区分大小写）；留空取默认 admin
   { key: 'adminUser', type: 'string', def: 'admin', el: 'a-adminuser', label: '管理用户名', maxLen: 64, fillDefault: true,
     pattern: '^[^\\s\\x00-\\x1f\\x7f]+$', hint: '不能包含空格或控制字符', envLock: ENV_NAMES.adminUser },
@@ -2842,7 +2842,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
       <div class="card">
         <h3><span class="tick"></span>基础配置</h3>
         <div class="field"><label>面板路径（环境变量 PATH 设置，面板中只读）</label><input type="text" id="a-path" autocomplete="off"><div class="hint">面板与订阅共用此路径（与代理的节点路径互相独立）；修改请到面板 Worker 的环境变量 PATH，修改后订阅地址随之改变，客户端需重新添加订阅。</div></div>
-        <div class="field"><label>自定义订阅路径（只填一段，如 AAZ → /AAZ/sub；留空为 /代理 UUID/sub）</label><input type="text" id="a-suburl" placeholder="AAZ" autocomplete="off"></div>
+        <div class="field"><label>自定义订阅路径（只填一段，如 mysub → /mysub/sub；留空为 /代理 UUID/sub）</label><input type="text" id="a-suburl" placeholder="mysub" autocomplete="off"></div>
         <div class="field"><label>管理用户名（登录时需要；留空为 admin，区分大小写）</label><input type="text" id="a-adminuser" placeholder="admin" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <div class="field" style="margin-bottom:0"><label>管理密码（留空保持不变；未设置时面板禁用）</label><input type="password" id="a-admin" placeholder="设置后访问面板需登录" autocomplete="new-password"></div>
         <p class="hint" style="margin-top:10px">未绑定 KV（绑定变量名 CONFIG_KV）时无法保存面板配置，只有环境变量生效。自定义域名访问面板需先在 Cloudflare 面板 → Workers 与 Pages → 面板 Worker → Domains &amp; Routes 添加。</p>
@@ -4177,7 +4177,7 @@ async function handleRequest(request, env, state) {
     return new Response(loginHTML, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
-  // 订阅入口：自定义订阅路径（如 /AAZ/sub），留空则为 /<UUID>/sub（UUID 即代理 UUID）；
+  // 订阅入口：自定义订阅路径（如 /mysub/sub），留空则为 /<UUID>/sub（UUID 即代理 UUID）；
   // 面板路径下的 /sub 始终可用。
   // 面板入口与管理 API 只认 panelPath，订阅入口下不开放面板与管理接口
   const subAlias = String(cfg.subUrl || '').trim().replace(/^\/+/, '').replace(/\/+$/, '');
