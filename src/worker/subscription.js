@@ -6,10 +6,12 @@ const NODE_CAP = 500;
 async function generateSubscription(cfg, format, ua) {
   // 明文端口节点只由「仅 TLS 端口」控制（默认开启）；ECH 只对 TLS 生效，开启时同样只下发 TLS 端口节点。
   // 自定义域名的明文端口需在 Cloudflare 关闭「始终使用 HTTPS」，否则被 301 重定向、WebSocket 握手失败
-  // 订阅指向第一个启用的代理（域名 / UUID / 节点路径来自面板保存的代理列表）；没有可用的代理就直接报错
+  // 订阅合并所有「可用」的代理（启用且域名 / 节点路径 / UUID 齐全，来自面板保存的代理列表）：每个代理各生成一套节点；没有可用的代理就直接报错
   const missing = endpointMissing(cfg);
   if (missing.length) throw Object.assign(new Error('订阅还不能生成：缺少 ' + missing.join('、') + '。请到「面板设置 → 代理」处理'), { status: 400 });
-  const rc = Object.assign({}, cfg, { host: cfg.proxy.host, uuid: cfg.proxy.uuid, nodePath: cfg.proxy.nodePath });
+  const proxies = readyProxies(cfg);
+  // rc 是各格式生成器共用的配置：host / uuid / nodePath 取第一个代理（Clash 本地凭据按它的 UUID 派生）；节点自己的 SNI / Host / 路径写在各节点链接里
+  const rc = Object.assign({}, cfg, { host: proxies[0].host, uuid: proxies[0].uuid, nodePath: proxies[0].nodePath });
   const prefList = effectivePrefDomains(cfg);   // 面板填写的优选域名（整体替换内置列表）或内置列表
   if (rc.ech) rc.tlsOnly = true;
   // 筛选含 IPv6 时查询 AAAA 记录并生成 IPv6 节点（默认双选 IPv4+IPv6 同样生效）；
@@ -29,12 +31,12 @@ async function generateSubscription(cfg, format, ua) {
   const useIp = src.prefIp !== false;               // 启用优选 IP（内置池 + 实时拉取，默认开）
   rc.preferredDomains = '';
   rc.preferredIPs = [];
-  // 原生地址（工作器域名，IPv4 入口）：仅勾选 IPv6 时跳过，避免 v4 域名混入
-  if (useNative && !onlyV6) rc.preferredDomains = rc.host + '#原生地址';
+  // 优选域名（各代理共用）。原生地址（代理自己的域名，IPv4 入口）因代理而异，在下面按代理加上：仅勾选 IPv6 时跳过，避免 v4 域名混入
   // 仅勾选 IPv6 时跳过 v4 优选域名（域名节点为 IPv4 入口，混入会占满 cap 并被 filterNodes 剔除，导致数量控制下发不足）
+  let sharedDomains = '';
   if (useDomain && !onlyV6) {
     // 域名按原样下发（不预检）：客户端连接时自行解析到当前最优的 CF 边缘 IP；失效的域名可用「优选配置 → 优选域名 → 测试」找出
-    rc.preferredDomains = (rc.preferredDomains ? rc.preferredDomains + '\n' : '') + prefList;
+    sharedDomains = prefList;
   }
   // 「优选 IP」的在线来源（面板「优选配置 → 优选 IP 来源」开关控制，并行拉取，每个来源 1 个子请求、缓存 10 分钟）：
   // 自定义优选 API 1 / 2（用户自选来源排最前）→ HostMonit → uouin → 微测网。HostMonit 为纯 IPv4，仅勾选 IPv6 时跳过；微测网只拉取所选 IP 类型对应的页面
@@ -66,7 +68,7 @@ async function generateSubscription(cfg, format, ua) {
     } catch (e) { /* AAAA 解析失败不影响其它来源 */ }
   }
   // 地址来源全部关闭时用官方域名兜底，保证订阅不为空（客户端不会收到「无效订阅」）
-  if (!useNative && !useDomain && !useIp) rc.preferredDomains = BUILTIN_OFFICIAL_DOMAINS.map((d, i) => d + '#域名-' + String(i + 1).padStart(2, '0')).join('\n');
+  if (!useNative && !useDomain && !useIp) sharedDomains = BUILTIN_OFFICIAL_DOMAINS.map((d, i) => d + '#域名-' + String(i + 1).padStart(2, '0')).join('\n');
   // 仅勾选 IPv6（单选）时清掉各来源混入的 IPv4（域名 AAAA 解析的 v4 与各在线来源中的 v4 一并剔除，
   // 避免 filterNodes 过滤空集后放宽回退全 v4）
   if (onlyV6 && rc.preferredIPs) rc.preferredIPs = rc.preferredIPs.filter(x => String(x.ip).indexOf(':') >= 0);
@@ -74,15 +76,25 @@ async function generateSubscription(cfg, format, ua) {
   const forced = (format || '').toLowerCase();
   const cap = NODE_CAP;
   // 不做任何测活剔除：Worker 边缘连通性 ≠ 客户端连通性，且 Workers 无法连接 CF 段 IP；全量按顺序下发由客户端自行择优
-  let nodes = filterNodes(await buildNodes(rc, cap), cfg.filter);
-  // 所有来源都没有产出节点时（如在线来源全部失败），用官方域名节点兜底，保证订阅不为空
-  // （客户端不会收到「无效订阅」）；域名节点由客户端自行解析，IPv4 / IPv6 均可
-  if (!nodes.length) {
-    const fb = Object.assign({}, rc, { preferredDomains: BUILTIN_OFFICIAL_DOMAINS.map((d, i) => d + '#域名-' + String(i + 1).padStart(2, '0')).join('\n'), preferredIPs: [], tlsOnly: true });
-    nodes = await buildNodes(fb, cap);
+  // 每个代理各生成一套节点（来源只拉取一次，各代理共用），总数封顶 cap：多个代理时平均分配，来源不足时按实际数量下发。
+  // 筛选在加代理名后缀之前做（代理名里即使含 HK 等字样，也不会影响地区 / 运营商筛选）
+  const capEach = Math.max(1, Math.floor(cap / proxies.length));
+  let nodes = [];
+  for (const px of proxies) {
+    const pc = Object.assign({}, rc, { host: px.host, uuid: px.uuid, nodePath: px.nodePath });
+    pc.preferredDomains = [useNative && !onlyV6 ? px.host + '#原生地址' : '', sharedDomains].filter(Boolean).join('\n');
+    let mine = filterNodes(await buildNodes(pc, capEach), cfg.filter);
+    // 所有来源都没有产出节点时（如在线来源全部失败），用官方域名节点兜底，保证订阅不为空
+    // （客户端不会收到「无效订阅」）；域名节点由客户端自行解析，IPv4 / IPv6 均可
+    if (!mine.length) {
+      const fb = Object.assign({}, pc, { preferredDomains: BUILTIN_OFFICIAL_DOMAINS.map((d, i) => d + '#域名-' + String(i + 1).padStart(2, '0')).join('\n'), preferredIPs: [], tlsOnly: true });
+      mine = await buildNodes(fb, capEach);
+    }
+    // 严格封顶：多协议膨胀可能越过上限，统一截断
+    if (mine.length > capEach) mine.length = capEach;
+    if (proxies.length > 1) mine = mine.map(n => tagNodeName(n, px.name));
+    nodes.push(...mine);
   }
-  // 严格封顶：多协议膨胀可能越过上限，统一截断（节点数量只做上限，来源不足时按实际数量下发）
-  if (nodes.length > cap) nodes.length = cap;
   nodes = uniqueNodeNames(nodes);
   let type, body;
   if (forced === 'clash' || forced === 'stash') { type = 'text/yaml'; body = generateClash(rc, nodes, CLASH_TEMPLATE); }   // Stash 使用 Clash 格式（与按 UA 识别一致）

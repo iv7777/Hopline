@@ -50,15 +50,14 @@ function clashProxyYaml(p) {
   return L.join('\n');
 }
 function generateClash(cfg, nodes, clashTemplate) {
-  const host = cfg.host;
-  const path = '/' + cfg.nodePath;
-  // TLS 下 ws 路径携带 ed=2048：mihomo 据此启用 early data（首包预发进 Sec-WebSocket-Protocol，省 1 个 RTT）
-  const wsPath = path + '?ed=2048';
+  // SNI / Host 与节点路径取自每个节点（多个代理合并订阅时各不相同）
   const alpnArr = alpnList(cfg.alpn);   // 面板 ALPN 设置；未设置时 ws 用 http/1.1、xhttp 用 h2
   const seen = new Set();
   // XHTTP 节点按 mihomo xhttp-opts 规范输出（含 x-padding 混淆参数），与 WS 一并下发
   const proxies = nodes.map((n) => {
-    const { user, srv, prt, name: baseName, tls } = parseShareNode(n, 0);
+    const { user, srv, prt, name: baseName, tls, host, path } = parseShareNode(n, 0);
+    // TLS 下 ws 路径携带 ed=2048：mihomo 据此启用 early data（首包预发进 Sec-WebSocket-Protocol，省 1 个 RTT）
+    const wsPath = path + '?ed=2048';
     let name = baseName;
     const xType = getParam(n, 'type') || 'ws';
     // 同名去重：同一名称（同一 IP 多协议节点或不同 IP 同名优选池）追加协议后缀并保证全局唯一——
@@ -127,13 +126,11 @@ const SINGBOX_RULE_SETS = [
 // MetaCubeX 规则库 sing 分支的二进制规则集（.srs），经 jsDelivr 直连下载（国内可达）
 const SINGBOX_RULE_BASE = 'https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/';
 function generateSingbox(cfg, nodes) {
-  const host = cfg.host;
-  const path = '/' + cfg.nodePath;
   const alpnArr = alpnList(cfg.alpn);
   const seen = new Set();
   // 官方 sing-box 内核没有 xhttp 传输（仅部分第三方分支支持），含 xhttp 出站的配置整体无法加载，因此不下发 XHTTP 节点
   const outbounds = nodes.filter(n => getParam(n, 'type') !== 'xhttp').map((n, i) => {
-    const { user, srv, prt, name: baseName, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name: baseName, tls, host, path } = parseShareNode(n, i);
     // tag 必须唯一（重复时 sing-box 拒绝启动）：名称已由 uniqueNodeNames 去重，这里再兜底一次
     let name = baseName, k = 2;
     while (seen.has(name)) name = baseName + '·' + k++;
@@ -220,9 +217,8 @@ function dropXhttp(nodes, client) {
 // ---------- Surge ----------
 function generateSurge(cfg, nodes) {
   nodes = dropXhttp(nodes, 'Surge');
-  const host = cfg.host, path = '/' + cfg.nodePath;
   const proxies = nodes.map((n, i) => {
-    const { user, srv, prt, name, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name, tls, host, path } = parseShareNode(n, i);
     const tlsPart = tls ? ', tls=true, skip-cert-verify=false, sni=' + host : ', tls=false';
     return `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
   });
@@ -248,9 +244,8 @@ FINAL,🐟 漏网之鱼
 // ---------- Loon ----------
 function generateLoon(cfg, nodes) {
   nodes = dropXhttp(nodes, 'Loon');
-  const host = cfg.host, path = '/' + cfg.nodePath;
   const proxies = nodes.map((n, i) => {
-    const { user, srv, prt, name, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name, tls, host, path } = parseShareNode(n, i);
     const tlsPart = tls ? ', tls=true, skip-cert-verify=false, sni=' + host : ', tls=false';
     return `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
   });
@@ -275,11 +270,10 @@ FINAL,🐟 漏网之鱼
 // ---------- Quantumult X ----------
 function generateQuanX(cfg, nodes) {
   nodes = dropXhttp(nodes, 'Quantumult X');
-  const host = cfg.host, path = '/' + cfg.nodePath;
   // QuanX 的 ip:port 格式中 IPv6 必须带方括号（裸 v6 与端口冒号歧义）
   const qxHost = (srv) => srv.indexOf(':') >= 0 ? '[' + srv + ']' : srv;
   const servers = nodes.map((n, i) => {
-    const { user, srv, prt, name, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name, tls, host, path } = parseShareNode(n, i);
     return `vless=${qxHost(srv)}:${prt}, method=none, password=${user}, obfs=${tls ? 'wss' : 'ws'}, obfs-host=${host}, obfs-uri=${path}${tls ? ', tls-verification=true, tls13=true' : ''}, tag=${name}`;
   });
   const names = nodes.map((n, i) => {

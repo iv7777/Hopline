@@ -222,3 +222,12 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
 .modal-head b{flex:1;min-width:0;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .modal .qrbox img{width:auto;height:auto;max-width:100%;background:#fff}
 .modal pre.code{max-height:96px;margin-top:8px}
+
+.pxrow{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px;cursor:pointer;background:var(--card2)}
+.pxrow:hover{border-color:var(--accent)}
+.pxrow.sel{border-color:var(--accent);background:var(--accent-dim)}
+.pxmain{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+.pxst{font-size:12px;color:var(--dim);white-space:nowrap}
+.pxst.ok{color:var(--ok)}
+.pxst.bad{color:var(--err)}
+.pxon{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);white-space:nowrap;cursor:pointer}

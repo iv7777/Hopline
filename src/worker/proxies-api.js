@@ -34,6 +34,8 @@ async function handleProxiesApi(apiName, request, env, cfg, segs, url) {
 
   if (apiName === 'proxy-status') {
     if (method !== 'GET') return json({ ok: false, msg: '仅支持 GET' }, 405);
+    // ?all=1：全部代理的状态（并行查询，给仪表盘与代理列表）
+    if (url.searchParams.get('all') === '1') return json({ ok: true, data: { proxies: await Promise.all(cfg.proxies.map(proxyStatusOf)) } });
     return json({ ok: true, data: await proxyStatusOf(pickProxy(cfg, url.searchParams.get('id'))) });
   }
   if (apiName === 'proxy-settings' || apiName === 'proxy-reset') {

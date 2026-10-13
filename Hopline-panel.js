@@ -1,4 +1,4 @@
-/*!Hopline-panel v3.1.0*/
+/*!Hopline-panel v3.1.1*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -16,7 +16,7 @@
 //  代理的域名、节点路径、密钥在面板「面板设置 → 代理」里填写（保存在 CONFIG_KV）。
 // ============================================================================
 // 面板脚本（Hopline-panel.js）的版本号：用于检测更新与面板里显示。与代理脚本各自编号、各自升版本
-const VERSION = '3.1.0';
+const VERSION = '3.1.1';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
 // 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
@@ -855,7 +855,7 @@ async function syncProxy(proxy) {
 // 代理列表：面板 KV 里的 proxies（一个 JSON 数组），每项 { id, name, host, nodePath, uuid, key, enabled }
 // ---------------------------------------------------------------------------
 // 面板是 UUID 的权威：由面板生成并下发给代理（见 proxy-client.js 的 syncProxy）。密钥只写不读：接口不回传，备份不导出。
-// 目前订阅只使用第一个启用的代理；数据结构、接口与代理设置页已经按「多个代理」设计，之后加多代理订阅不需要迁移。
+// 订阅合并所有可用的代理（见 readyProxies）；接口 /api/proxies 与面板的代理列表按多个代理设计。
 const PROXIES_KEY = 'proxies';
 const PROXIES_MAX = 8;
 
@@ -872,7 +872,7 @@ function cleanProxyRecord(r) {
     uuid: isUUID(r.uuid) ? String(r.uuid).toLowerCase() : '', key: typeof r.key === 'string' ? r.key : '', enabled: r.enabled !== false,
   };
 }
-// 读入面板配置时附带代理列表：cfg.proxies 全部，cfg.proxy 第一个启用的（订阅用）；读取失败记在 cfg._proxiesError（此时拒绝保存）
+// 读入面板配置时附带代理列表：cfg.proxies 全部，cfg.proxy 第一个启用的（面板接口没指定 id 时的默认代理）；读取失败记在 cfg._proxiesError（此时拒绝保存）
 async function attachProxies(env, cfg) {
   cfg.proxies = []; cfg.proxy = null;
   const kv = kvStore(env);
@@ -928,11 +928,17 @@ function sanitizeProxyInput(input, { partial } = {}) {
 }
 function newProxyId() { return b64uOfBytes(crypto.getRandomValues(new Uint8Array(6))); }
 
+// 订阅会下发的代理：启用、且域名 / 节点路径 / UUID 都已齐全（多个时订阅合并它们的节点）
+function readyProxies(cfg) {
+  return (cfg.proxies || []).filter(p => p.enabled && p.host && p.nodePath && p.uuid);
+}
 // 订阅需要的代理端点是否齐全：返回尚未就绪的说明（空数组 = 可以生成订阅）
 function endpointMissing(cfg) {
   if (cfg._proxiesError) return ['代理列表（' + (cfg._proxiesError === 'corrupt' ? 'KV 里的内容已损坏' : 'KV 暂时无法读取') + '）'];
-  const px = cfg.proxy;
-  if (!px) return [cfg.proxies && cfg.proxies.length ? '启用中的代理（现有的都已停用）' : '代理（请先在「面板设置 → 代理」添加）'];
+  if (readyProxies(cfg).length) return [];
+  const on = (cfg.proxies || []).filter(p => p.enabled);
+  if (!on.length) return [cfg.proxies && cfg.proxies.length ? '启用中的代理（现有的都已停用）' : '代理（请先在「面板设置 → 代理」添加）'];
+  const px = on[0];
   return [['host', '代理域名'], ['nodePath', '节点路径'], ['uuid', 'UUID（点「连接并同步」会自动生成并下发）']].filter(([k]) => !px[k]).map(([, label]) => label);
 }
 // ---------------------------------------------------------------------------
@@ -971,6 +977,8 @@ async function handleProxiesApi(apiName, request, env, cfg, segs, url) {
 
   if (apiName === 'proxy-status') {
     if (method !== 'GET') return json({ ok: false, msg: '仅支持 GET' }, 405);
+    // ?all=1：全部代理的状态（并行查询，给仪表盘与代理列表）
+    if (url.searchParams.get('all') === '1') return json({ ok: true, data: { proxies: await Promise.all(cfg.proxies.map(proxyStatusOf)) } });
     return json({ ok: true, data: await proxyStatusOf(pickProxy(cfg, url.searchParams.get('id'))) });
   }
   if (apiName === 'proxy-settings' || apiName === 'proxy-reset') {
@@ -1360,6 +1368,16 @@ function uniqueNodeNames(nodes) {
   });
 }
 
+// 多个代理合并订阅时，给节点名追加「·代理名」以区分来自哪个代理（名称里会破坏 Surge / Loon 配置语法的字符换成 -）
+function tagNodeName(n, tag) {
+  const h = n.indexOf('#');
+  if (h < 0) return n;
+  let name;
+  try { name = decodeURIComponent(n.slice(h + 1)); } catch (e) { name = n.slice(h + 1); }
+  const safe = String(tag || '').replace(/[,=#%?\s]+/g, '-').replace(/^-+|-+$/g, '');
+  return safe ? n.slice(0, h + 1) + uriFragName(name + '·' + safe) : n;
+}
+
 // 面板 ALPN 设置（h2 / http/1.1，逗号分隔）→ 数组；未设置返回 null（各格式按协议取默认值）
 function alpnList(alpn) {
   const a = String(alpn || '').split(',').map(x => x.trim()).filter(x => /^[\w./-]+$/.test(x));
@@ -1736,7 +1754,10 @@ function parseShareNode(n, i) {
   }
   // 明文端口节点（security=none）不启用 TLS
   const tls = (getParam(n, 'security') || 'tls') === 'tls';
-  return { srv, prt, name, user, tls };
+  // 每个节点自带它所属代理的 SNI / Host 与节点路径（多个代理合并订阅时各不相同）；ws 路径里的 ?ed=2048 另由各格式按协议处理，这里只取路径本身
+  const host = getParam(n, 'host') || '';
+  const path = (getParam(n, 'path') || '').replace(/\?.*$/, '') || '/';
+  return { srv, prt, name, user, tls, host, path };
 }
 
 // 地区 / 运营商标签表：按节点名称中的关键字匹配
@@ -1858,15 +1879,14 @@ function clashProxyYaml(p) {
   return L.join('\n');
 }
 function generateClash(cfg, nodes, clashTemplate) {
-  const host = cfg.host;
-  const path = '/' + cfg.nodePath;
-  // TLS 下 ws 路径携带 ed=2048：mihomo 据此启用 early data（首包预发进 Sec-WebSocket-Protocol，省 1 个 RTT）
-  const wsPath = path + '?ed=2048';
+  // SNI / Host 与节点路径取自每个节点（多个代理合并订阅时各不相同）
   const alpnArr = alpnList(cfg.alpn);   // 面板 ALPN 设置；未设置时 ws 用 http/1.1、xhttp 用 h2
   const seen = new Set();
   // XHTTP 节点按 mihomo xhttp-opts 规范输出（含 x-padding 混淆参数），与 WS 一并下发
   const proxies = nodes.map((n) => {
-    const { user, srv, prt, name: baseName, tls } = parseShareNode(n, 0);
+    const { user, srv, prt, name: baseName, tls, host, path } = parseShareNode(n, 0);
+    // TLS 下 ws 路径携带 ed=2048：mihomo 据此启用 early data（首包预发进 Sec-WebSocket-Protocol，省 1 个 RTT）
+    const wsPath = path + '?ed=2048';
     let name = baseName;
     const xType = getParam(n, 'type') || 'ws';
     // 同名去重：同一名称（同一 IP 多协议节点或不同 IP 同名优选池）追加协议后缀并保证全局唯一——
@@ -1935,13 +1955,11 @@ const SINGBOX_RULE_SETS = [
 // MetaCubeX 规则库 sing 分支的二进制规则集（.srs），经 jsDelivr 直连下载（国内可达）
 const SINGBOX_RULE_BASE = 'https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/';
 function generateSingbox(cfg, nodes) {
-  const host = cfg.host;
-  const path = '/' + cfg.nodePath;
   const alpnArr = alpnList(cfg.alpn);
   const seen = new Set();
   // 官方 sing-box 内核没有 xhttp 传输（仅部分第三方分支支持），含 xhttp 出站的配置整体无法加载，因此不下发 XHTTP 节点
   const outbounds = nodes.filter(n => getParam(n, 'type') !== 'xhttp').map((n, i) => {
-    const { user, srv, prt, name: baseName, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name: baseName, tls, host, path } = parseShareNode(n, i);
     // tag 必须唯一（重复时 sing-box 拒绝启动）：名称已由 uniqueNodeNames 去重，这里再兜底一次
     let name = baseName, k = 2;
     while (seen.has(name)) name = baseName + '·' + k++;
@@ -2028,9 +2046,8 @@ function dropXhttp(nodes, client) {
 // ---------- Surge ----------
 function generateSurge(cfg, nodes) {
   nodes = dropXhttp(nodes, 'Surge');
-  const host = cfg.host, path = '/' + cfg.nodePath;
   const proxies = nodes.map((n, i) => {
-    const { user, srv, prt, name, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name, tls, host, path } = parseShareNode(n, i);
     const tlsPart = tls ? ', tls=true, skip-cert-verify=false, sni=' + host : ', tls=false';
     return `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
   });
@@ -2056,9 +2073,8 @@ FINAL,🐟 漏网之鱼
 // ---------- Loon ----------
 function generateLoon(cfg, nodes) {
   nodes = dropXhttp(nodes, 'Loon');
-  const host = cfg.host, path = '/' + cfg.nodePath;
   const proxies = nodes.map((n, i) => {
-    const { user, srv, prt, name, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name, tls, host, path } = parseShareNode(n, i);
     const tlsPart = tls ? ', tls=true, skip-cert-verify=false, sni=' + host : ', tls=false';
     return `${name} = vless, ${srv}, ${prt}, username=${user}, ws=true, ws-path=${path}, ws-headers=Host:${host}${tlsPart}`;
   });
@@ -2083,11 +2099,10 @@ FINAL,🐟 漏网之鱼
 // ---------- Quantumult X ----------
 function generateQuanX(cfg, nodes) {
   nodes = dropXhttp(nodes, 'Quantumult X');
-  const host = cfg.host, path = '/' + cfg.nodePath;
   // QuanX 的 ip:port 格式中 IPv6 必须带方括号（裸 v6 与端口冒号歧义）
   const qxHost = (srv) => srv.indexOf(':') >= 0 ? '[' + srv + ']' : srv;
   const servers = nodes.map((n, i) => {
-    const { user, srv, prt, name, tls } = parseShareNode(n, i);
+    const { user, srv, prt, name, tls, host, path } = parseShareNode(n, i);
     return `vless=${qxHost(srv)}:${prt}, method=none, password=${user}, obfs=${tls ? 'wss' : 'ws'}, obfs-host=${host}, obfs-uri=${path}${tls ? ', tls-verification=true, tls13=true' : ''}, tag=${name}`;
   });
   const names = nodes.map((n, i) => {
@@ -2122,10 +2137,12 @@ const NODE_CAP = 500;
 async function generateSubscription(cfg, format, ua) {
   // 明文端口节点只由「仅 TLS 端口」控制（默认开启）；ECH 只对 TLS 生效，开启时同样只下发 TLS 端口节点。
   // 自定义域名的明文端口需在 Cloudflare 关闭「始终使用 HTTPS」，否则被 301 重定向、WebSocket 握手失败
-  // 订阅指向第一个启用的代理（域名 / UUID / 节点路径来自面板保存的代理列表）；没有可用的代理就直接报错
+  // 订阅合并所有「可用」的代理（启用且域名 / 节点路径 / UUID 齐全，来自面板保存的代理列表）：每个代理各生成一套节点；没有可用的代理就直接报错
   const missing = endpointMissing(cfg);
   if (missing.length) throw Object.assign(new Error('订阅还不能生成：缺少 ' + missing.join('、') + '。请到「面板设置 → 代理」处理'), { status: 400 });
-  const rc = Object.assign({}, cfg, { host: cfg.proxy.host, uuid: cfg.proxy.uuid, nodePath: cfg.proxy.nodePath });
+  const proxies = readyProxies(cfg);
+  // rc 是各格式生成器共用的配置：host / uuid / nodePath 取第一个代理（Clash 本地凭据按它的 UUID 派生）；节点自己的 SNI / Host / 路径写在各节点链接里
+  const rc = Object.assign({}, cfg, { host: proxies[0].host, uuid: proxies[0].uuid, nodePath: proxies[0].nodePath });
   const prefList = effectivePrefDomains(cfg);   // 面板填写的优选域名（整体替换内置列表）或内置列表
   if (rc.ech) rc.tlsOnly = true;
   // 筛选含 IPv6 时查询 AAAA 记录并生成 IPv6 节点（默认双选 IPv4+IPv6 同样生效）；
@@ -2145,12 +2162,12 @@ async function generateSubscription(cfg, format, ua) {
   const useIp = src.prefIp !== false;               // 启用优选 IP（内置池 + 实时拉取，默认开）
   rc.preferredDomains = '';
   rc.preferredIPs = [];
-  // 原生地址（工作器域名，IPv4 入口）：仅勾选 IPv6 时跳过，避免 v4 域名混入
-  if (useNative && !onlyV6) rc.preferredDomains = rc.host + '#原生地址';
+  // 优选域名（各代理共用）。原生地址（代理自己的域名，IPv4 入口）因代理而异，在下面按代理加上：仅勾选 IPv6 时跳过，避免 v4 域名混入
   // 仅勾选 IPv6 时跳过 v4 优选域名（域名节点为 IPv4 入口，混入会占满 cap 并被 filterNodes 剔除，导致数量控制下发不足）
+  let sharedDomains = '';
   if (useDomain && !onlyV6) {
     // 域名按原样下发（不预检）：客户端连接时自行解析到当前最优的 CF 边缘 IP；失效的域名可用「优选配置 → 优选域名 → 测试」找出
-    rc.preferredDomains = (rc.preferredDomains ? rc.preferredDomains + '\n' : '') + prefList;
+    sharedDomains = prefList;
   }
   // 「优选 IP」的在线来源（面板「优选配置 → 优选 IP 来源」开关控制，并行拉取，每个来源 1 个子请求、缓存 10 分钟）：
   // 自定义优选 API 1 / 2（用户自选来源排最前）→ HostMonit → uouin → 微测网。HostMonit 为纯 IPv4，仅勾选 IPv6 时跳过；微测网只拉取所选 IP 类型对应的页面
@@ -2182,7 +2199,7 @@ async function generateSubscription(cfg, format, ua) {
     } catch (e) { /* AAAA 解析失败不影响其它来源 */ }
   }
   // 地址来源全部关闭时用官方域名兜底，保证订阅不为空（客户端不会收到「无效订阅」）
-  if (!useNative && !useDomain && !useIp) rc.preferredDomains = BUILTIN_OFFICIAL_DOMAINS.map((d, i) => d + '#域名-' + String(i + 1).padStart(2, '0')).join('\n');
+  if (!useNative && !useDomain && !useIp) sharedDomains = BUILTIN_OFFICIAL_DOMAINS.map((d, i) => d + '#域名-' + String(i + 1).padStart(2, '0')).join('\n');
   // 仅勾选 IPv6（单选）时清掉各来源混入的 IPv4（域名 AAAA 解析的 v4 与各在线来源中的 v4 一并剔除，
   // 避免 filterNodes 过滤空集后放宽回退全 v4）
   if (onlyV6 && rc.preferredIPs) rc.preferredIPs = rc.preferredIPs.filter(x => String(x.ip).indexOf(':') >= 0);
@@ -2190,15 +2207,25 @@ async function generateSubscription(cfg, format, ua) {
   const forced = (format || '').toLowerCase();
   const cap = NODE_CAP;
   // 不做任何测活剔除：Worker 边缘连通性 ≠ 客户端连通性，且 Workers 无法连接 CF 段 IP；全量按顺序下发由客户端自行择优
-  let nodes = filterNodes(await buildNodes(rc, cap), cfg.filter);
-  // 所有来源都没有产出节点时（如在线来源全部失败），用官方域名节点兜底，保证订阅不为空
-  // （客户端不会收到「无效订阅」）；域名节点由客户端自行解析，IPv4 / IPv6 均可
-  if (!nodes.length) {
-    const fb = Object.assign({}, rc, { preferredDomains: BUILTIN_OFFICIAL_DOMAINS.map((d, i) => d + '#域名-' + String(i + 1).padStart(2, '0')).join('\n'), preferredIPs: [], tlsOnly: true });
-    nodes = await buildNodes(fb, cap);
+  // 每个代理各生成一套节点（来源只拉取一次，各代理共用），总数封顶 cap：多个代理时平均分配，来源不足时按实际数量下发。
+  // 筛选在加代理名后缀之前做（代理名里即使含 HK 等字样，也不会影响地区 / 运营商筛选）
+  const capEach = Math.max(1, Math.floor(cap / proxies.length));
+  let nodes = [];
+  for (const px of proxies) {
+    const pc = Object.assign({}, rc, { host: px.host, uuid: px.uuid, nodePath: px.nodePath });
+    pc.preferredDomains = [useNative && !onlyV6 ? px.host + '#原生地址' : '', sharedDomains].filter(Boolean).join('\n');
+    let mine = filterNodes(await buildNodes(pc, capEach), cfg.filter);
+    // 所有来源都没有产出节点时（如在线来源全部失败），用官方域名节点兜底，保证订阅不为空
+    // （客户端不会收到「无效订阅」）；域名节点由客户端自行解析，IPv4 / IPv6 均可
+    if (!mine.length) {
+      const fb = Object.assign({}, pc, { preferredDomains: BUILTIN_OFFICIAL_DOMAINS.map((d, i) => d + '#域名-' + String(i + 1).padStart(2, '0')).join('\n'), preferredIPs: [], tlsOnly: true });
+      mine = await buildNodes(fb, capEach);
+    }
+    // 严格封顶：多协议膨胀可能越过上限，统一截断
+    if (mine.length > capEach) mine.length = capEach;
+    if (proxies.length > 1) mine = mine.map(n => tagNodeName(n, px.name));
+    nodes.push(...mine);
   }
-  // 严格封顶：多协议膨胀可能越过上限，统一截断（节点数量只做上限，来源不足时按实际数量下发）
-  if (nodes.length > cap) nodes.length = cap;
   nodes = uniqueNodeNames(nodes);
   let type, body;
   if (forced === 'clash' || forced === 'stash') { type = 'text/yaml'; body = generateClash(rc, nodes, CLASH_TEMPLATE); }   // Stash 使用 Clash 格式（与按 UA 识别一致）
@@ -2860,6 +2887,15 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
 .modal-head b{flex:1;min-width:0;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .modal .qrbox img{width:auto;height:auto;max-width:100%;background:#fff}
 .modal pre.code{max-height:96px;margin-top:8px}
+
+.pxrow{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px;cursor:pointer;background:var(--card2)}
+.pxrow:hover{border-color:var(--accent)}
+.pxrow.sel{border-color:var(--accent);background:var(--accent-dim)}
+.pxmain{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+.pxst{font-size:12px;color:var(--dim);white-space:nowrap}
+.pxst.ok{color:var(--ok)}
+.pxst.bad{color:var(--err)}
+.pxon{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);white-space:nowrap;cursor:pointer}
 </style>
 </head>
 <body>
@@ -2993,6 +3029,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
         <div class="kv"><span class="k">KV 持久化</span><span class="v" id="stKv">—</span></div>
         <div class="kv"><span class="k">面板入口</span><span class="v" id="stEntry">—</span></div>
         <div class="kv"><span class="k">代理状态</span><span class="v" id="stProxy">—</span></div>
+        <div id="stProxyList"></div>
         <div class="inrow" style="margin-top:10px;align-items:center"><button class="btn sm" onclick="checkProxy()">检测代理</button><span class="hint" id="stProxyHint" style="margin:0"></span></div>
       </div>
     </section>
@@ -3065,6 +3102,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
       <div class="card">
         <h3><span class="tick"></span>状态</h3>
         <div class="note-box" id="px-note" style="margin:0">读取中…</div>
+        <div class="field" id="px-whichbox" style="display:none;margin:12px 0 0"><label>要修改的代理</label><select id="px-which" onchange="onProxyWhich()"></select></div>
         <div class="inrow" style="margin-top:12px">
           <button class="btn" id="px-reload" onclick="loadProxySettings()">重新读取</button>
           <button class="btn primary" id="px-save" onclick="saveProxySettings()">保存到代理</button>
@@ -3117,8 +3155,10 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
     <section class="view" data-view="account" data-title="面板设置" data-sub="代理（域名、节点路径、密钥、UUID、启停）、面板路径（PATH）、管理用户名与密码">
       <div class="card">
         <h3><span class="tick"></span>代理</h3>
-        <p class="hint" style="margin-top:0;margin-bottom:12px">订阅里的节点指向哪里：填写代理脚本（Hopline-proxy.js）所在的域名、它的环境变量 PATH（节点路径）和 NODE_KEY（密钥）。面板用密钥签名后通过 HTTPS 联系代理：<b>UUID 由面板生成并下发给代理</b>（存在代理的 NODE_KV 里），不需要手工填写。密钥只写入、不回显；留空保持不变。</p>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">订阅里的节点指向哪里：可以添加多个代理，订阅会<b>合并所有启用的代理</b>（每个代理各出一套节点，多个时节点名带「·代理名」后缀，总数仍受 500 的上限，平均分给各代理）。点列表里的代理进行编辑。每个代理填写代理脚本（Hopline-proxy.js）所在的域名、它的环境变量 PATH（节点路径）和 NODE_KEY（密钥）。面板用密钥签名后通过 HTTPS 联系代理：<b>UUID 由面板生成并下发给代理</b>（存在代理的 NODE_KV 里），不需要手工填写。密钥只写入、不回显；留空保持不变。</p>
         <div class="note-box" id="px-conn" style="margin:0 0 12px">读取中…</div>
+        <div id="px-list"></div>
+        <div class="inrow" style="margin:0 0 14px"><button class="btn sm" onclick="newProxyEntry()">＋ 添加代理</button></div>
         <div class="field"><label>名称（可选）</label><input type="text" id="a-pname" placeholder="代理 1" autocomplete="off"></div>
         <div class="field"><label>代理域名（节点 SNI / Host，如 node.example.com；须是代理 Worker 的自定义域名）</label><input type="text" id="a-host" placeholder="node.example.com" autocomplete="off"></div>
         <div class="field"><label>节点路径（须与代理脚本的环境变量 PATH 相同）</label><input type="text" id="a-nodepath" placeholder="mynode" autocomplete="off"></div>
@@ -3143,7 +3183,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
           <button class="btn" id="px-rotate" onclick="rotateProxyUuid()">更换 UUID</button>
           <button class="btn danger" id="px-del" onclick="deleteProxyEntry()">删除</button>
         </div>
-        <p class="hint" style="margin-top:10px">XHTTP 与面板联系代理都要求代理使用自定义域名（Cloudflare 面板 → Workers 与 Pages → 代理 Worker → Domains &amp; Routes 添加）；面板与代理在同一个 Cloudflare 区域（zone）时请把代理设为 Custom Domain。代理需要绑定一个 KV（变量名 NODE_KV）来保存 UUID。「更换 UUID」后旧 UUID 在代理上还会保留 10 分钟，已有客户端更新订阅即可。当前界面一次管理一个代理，数据结构已支持多个。</p>
+        <p class="hint" style="margin-top:10px">XHTTP 与面板联系代理都要求代理使用自定义域名（Cloudflare 面板 → Workers 与 Pages → 代理 Worker → Domains &amp; Routes 添加）；面板与代理在同一个 Cloudflare 区域（zone）时请把代理设为 Custom Domain。代理需要绑定一个 KV（变量名 NODE_KV）来保存 UUID。「更换 UUID」后旧 UUID 在代理上还会保留 10 分钟，已有客户端更新订阅即可。最多 8 个代理。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>基础配置</h3>
@@ -3442,6 +3482,9 @@ function setConn(ok){
 var PROXY_FIELDS = { 'edgeIP': 's-proxyIP', 'hopAddr': 's-outbound', 'hopMode': 's-outmode', 'alt.mode': 'rl-mode', 'alt.region': 'rl-region', 'alt.region2': 'rl-region2', 'alt.custom': 'rl-custom' };
 var PROXY_ENV_NAMES = { 'edgeIP': 'EDGEIP', 'hopAddr': 'HOP_ADDR', 'hopMode': 'HOP_MODE', 'alt.mode': 'ALT_MODE', 'alt.region': 'ALT_REGION', 'alt.region2': 'ALT_REGION2', 'alt.custom': 'ALT_CUSTOM' };
 var RELAY_ZH = { HK: '香港', US: '美国', SG: '新加坡', JP: '日本', KR: '韩国', DE: '德国', SE: '瑞典', NL: '荷兰', FI: '芬兰', GB: '英国' };
+var PXSEL = '';   
+function pxq(){ return PXSEL ? '?id=' + encodeURIComponent(PXSEL) : ''; }
+function onProxyWhich(){ PXSEL = $('px-which').value; loadProxySettings(); }
 function proxyNote(text, kind){
   var n = $('px-note');
   n.textContent = text;
@@ -3503,7 +3546,7 @@ function collectProxy(){
 function loadProxySettings(){
   proxyNote('读取中…');
   setProxyFormEnabled(false);
-  return api('proxy-settings').then(function(r){
+  return api('proxy-settings' + pxq()).then(function(r){
     if (!r || !r.ok || !r.data){
       proxyNote((r && r.msg) || '读取失败', 'err');
       return;
@@ -3521,7 +3564,7 @@ function loadProxySettings(){
 function saveProxySettings(){
   var btn = $('px-save');
   btn.disabled = true;
-  api('proxy-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(collectProxy()) })
+  api('proxy-settings' + pxq(), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(collectProxy()) })
     .then(function(r){
       if (r && r.ok && r.data){
         fillProxy(r.data);
@@ -3538,7 +3581,7 @@ function saveProxySettings(){
 }
 function resetProxySettings(){
   if (!confirm('确定恢复？将清除这里保存的全部覆盖项，代理回到环境变量 + 默认值。')) return;
-  api('proxy-reset', { method: 'POST' }).then(function(r){
+  api('proxy-reset' + pxq(), { method: 'POST' }).then(function(r){
     if (r && r.ok && r.data){ fillProxy(r.data); toast('已恢复为环境变量设置：代理约 1 分钟内生效', 'ok'); checkProxy(); }
     else toast((r && r.msg) || '恢复失败', 'err');
   }).catch(function(){ toast('恢复失败：无法连接服务器', 'err'); });
@@ -3554,30 +3597,44 @@ function proxySummary(s){
   a.push('地区反代：' + (s.altMode || 'builtin') + (s.altMode === 'custom' ? '（' + (s.altCustom || 0) + ' 个）' : ''));
   return a.join(' · ');
 }
+var PXSTAT = {};   
+
+function pxStatusInfo(d){
+  if (!d.up) return { text: '无法连接：' + (d.error || ''), ok: false };
+  var tags = [];
+  if (!d.provisioned) tags.push('尚未下发 UUID');
+  else if (!d.uuidMatch) tags.push('UUID 与面板不一致');
+  if (!d.enabled) tags.push('代理已停用');
+  if (!d.storage) tags.push('代理未绑定 NODE_KV');
+  if (!d.ok) tags.push('配置有问题：' + (d.problems || []).join(' '));
+  return { text: '在线 · v' + (d.version || '?') + (tags.length ? '（' + tags.join('，') + '）' : ''), ok: !tags.length };
+}
 function checkProxy(){
-  var v = $('stProxy'), h = $('stProxyHint');
-  v.textContent = '检测中…'; v.className = 'v'; h.textContent = '';
-  api('proxy-status').then(function(r){
-    var d = r && r.ok && r.data;
-    if (!d){ v.textContent = '检测失败'; v.className = 'v bad'; return; }
-    if (!d.configured){
+  var v = $('stProxy'), h = $('stProxyHint'), l = $('stProxyList');
+  v.textContent = '检测中…'; v.className = 'v'; h.textContent = ''; l.textContent = '';
+  api('proxy-status?all=1').then(function(r){
+    var list = r && r.ok && r.data && r.data.proxies;
+    if (!list){ v.textContent = '检测失败'; v.className = 'v bad'; return; }
+    PXSTAT = {};
+    list.forEach(function(d){ PXSTAT[d.id] = d; });
+    pxApplyStatus();
+    if (!list.length){
       v.textContent = '未添加';
       h.textContent = '到「面板设置 → 代理」添加代理（域名、节点路径、密钥），面板会自动生成 UUID 并下发';
       return;
     }
-    if (!d.up){
-      v.textContent = '无法连接'; v.className = 'v bad';
-      h.textContent = d.error || '';
-      return;
-    }
-    var tags = [];
-    if (!d.provisioned) tags.push('尚未下发 UUID');
-    else if (!d.uuidMatch) tags.push('UUID 与面板不一致');
-    if (!d.enabled) tags.push('代理已停用');
-    if (!d.storage) tags.push('代理未绑定 NODE_KV');
-    v.textContent = '在线 · 代理 v' + (d.version || '?') + (tags.length ? '（' + tags.join('，') + '）' : '');
-    v.className = 'v ' + (d.ok && !tags.length ? 'ok' : 'bad');
-    h.textContent = d.ok ? proxySummary(d.settings) : '代理配置有问题：' + (d.problems || []).join(' ');
+    var good = 0;
+    list.forEach(function(d){
+      var info = pxStatusInfo(d);
+      if (info.ok) good++;
+      var line = document.createElement('div');
+      line.className = 'hint';
+      line.style.margin = '6px 0 0';
+      line.textContent = d.name + (d.enabledHere ? '' : '（面板已停用）') + '：' + info.text + (d.up && d.ok ? ' · ' + proxySummary(d.settings) : '');
+      l.appendChild(line);
+    });
+    v.textContent = list.length === 1 ? (good ? '在线' : '有问题') : (good + ' / ' + list.length + ' 正常');
+    v.className = 'v ' + (good === list.length ? 'ok' : 'bad');
   }).catch(function(){ v.textContent = '检测失败'; v.className = 'v bad'; });
 }
 function renderStatus(d){
@@ -3849,7 +3906,8 @@ function copyKey(){
   copyText(v);
 }
 
-var PX = null; 
+var PX = null;      
+var PXLIST = [];    
 function pxConn(text, kind){
   var n = $('px-conn');
   n.textContent = text;
@@ -3869,6 +3927,45 @@ function pxFill(p){
   $('px-rotate').disabled = !p;
   $('px-del').disabled = !p;
   ['a-host', 'a-nodepath', 'a-key', 'a-uuid'].forEach(function(id){ clearFieldError($(id)); });
+  pxRenderList();
+}
+
+function pxApplyStatus(){
+  document.querySelectorAll('#px-list .pxst').forEach(function(el){
+    var d = PXSTAT[el.getAttribute('data-id')];
+    if (!d){ el.textContent = ''; return; }
+    var info = pxStatusInfo(d);
+    el.textContent = d.up ? (info.ok ? '正常' : '有问题') : '连不上';
+    el.title = info.text;
+    el.className = 'pxst ' + (info.ok ? 'ok' : 'bad');
+  });
+}
+function pxRenderList(){
+  var box = $('px-list');
+  box.textContent = '';
+  PXLIST.forEach(function(p){
+    var row = document.createElement('div');
+    row.className = 'pxrow' + (PX && PX.id === p.id ? ' sel' : '');
+    var main = document.createElement('div');
+    main.className = 'pxmain';
+    var b = document.createElement('b'); b.textContent = p.name;
+    main.appendChild(b);
+    main.appendChild(document.createTextNode(' · ' + p.host + '/' + p.nodePath));
+    var st = document.createElement('span');
+    st.className = 'pxst'; st.setAttribute('data-id', p.id);
+    var lab = document.createElement('label');
+    lab.className = 'pxon';
+    lab.onclick = function(e){ e.stopPropagation(); };
+    var cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = p.enabled;
+    cb.onchange = function(){ toggleProxyEnabled(p.id, cb.checked); };
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode('启用'));
+    row.onclick = function(){ pxFill(p); pxConn('正在编辑「' + p.name + '」。'); };
+    row.appendChild(main); row.appendChild(st); row.appendChild(lab);
+    box.appendChild(row);
+  });
+  pxApplyStatus();
 }
 var PX_FIELD = { host: 'a-host', nodePath: 'a-nodepath', key: 'a-key', uuid: 'a-uuid', name: 'a-pname' };
 function pxErrors(errors){
@@ -3895,23 +3992,49 @@ function pxSyncText(sync){
   if (sync.ok) return sync.actions && sync.actions.length ? '已连接，并完成：' + sync.actions.join('、') : '已连接，代理状态已是最新';
   return '没能同步到代理：' + (sync.error || '未知错误');
 }
-function loadProxyEntry(){
-  pxConn('读取中…');
+
+function loadProxyEntry(selectId, keepNote){
+  if (!keepNote) pxConn('读取中…');
+  var want = selectId !== undefined ? selectId : (PX && PX.id);
   return api('proxies').then(function(r){
     if (!r || !r.ok || !r.data){ pxConn((r && r.msg) || '读取失败', 'err'); return; }
-    var list = r.data.proxies || [];
-    pxFill(list[0] || null);
+    PXLIST = r.data.proxies || [];
+    var cur = null;
+    PXLIST.forEach(function(p){ if (p.id === want) cur = p; });
+    pxFill(cur || (selectId === null ? null : PXLIST[0]) || null);
+    
+    var sel = $('px-which');
+    sel.textContent = '';
+    PXLIST.forEach(function(p){ var o = document.createElement('option'); o.value = p.id; o.textContent = p.name + '（' + p.host + '）'; sel.appendChild(o); });
+    if (!PXLIST.some(function(p){ return p.id === PXSEL; })) PXSEL = PXLIST.length ? PXLIST[0].id : '';
+    sel.value = PXSEL;
+    $('px-whichbox').style.display = PXLIST.length > 1 ? '' : 'none';
+    if (keepNote) return;
     if (r.data.error){ pxConn('代理列表读取失败（' + r.data.error + '）：为避免覆盖已有数据，暂时不能保存。', 'err'); return; }
-    pxConn(list.length ? '已添加代理「' + list[0].name + '」。' + (list[0].enabled ? '' : '当前已停用：订阅里不会下发它的节点。') : '还没有代理：填写下面的域名、节点路径和密钥，点「保存并连接」。');
+    pxConn(PXLIST.length ? '已添加 ' + PXLIST.length + ' 个代理，订阅会合并其中启用的。点列表里的代理编辑，或「添加代理」。' : '还没有代理：填写下面的域名、节点路径和密钥，点「保存并连接」。');
   }).catch(function(){ pxConn('无法连接服务器', 'err'); });
+}
+function newProxyEntry(){
+  pxFill(null);
+  pxConn('添加新代理：填写下面的域名、节点路径和密钥，点「保存并连接」。');
+  try { $('a-host').focus(); } catch (e) {}
 }
 function pxDone(r, okMsg){
   var d = r.data || {};
-  if (d.proxy) pxFill(d.proxy);
   var t = (d.sync ? pxSyncText(d.sync) : '') || okMsg;
   pxConn(t, d.sync && !d.sync.ok ? 'err' : '');
   toast(t, d.sync && !d.sync.ok ? 'err' : 'ok');
-  pxRefreshAll();
+  loadProxyEntry(d.proxy ? d.proxy.id : undefined, true).then(pxRefreshAll);
+}
+function toggleProxyEnabled(id, on){
+  api('proxies/' + id + '/enabled', { method: 'POST', headers: JSON_H, body: JSON.stringify({ enabled: on }) }).then(function(r){
+    if (r && r.ok){
+      var w = r.data && r.data.warning;
+      toast(w || (on ? '已启用' : '已停用：订阅里不再下发它，代理对外只显示 Hello World'), w ? 'err' : 'ok');
+      if (PX && PX.id === id) $('a-penabled').checked = on;
+    } else toast((r && r.msg) || '操作失败', 'err');
+    loadProxyEntry(undefined, true).then(pxRefreshAll);
+  }).catch(function(){ toast('操作失败：无法连接服务器', 'err'); loadProxyEntry(undefined, true); });
 }
 function pxBusy(on){
   ['px-connect', 'px-sync', 'px-rotate', 'px-del'].forEach(function(id){ var b = $(id); if (b) b.disabled = on || (id !== 'px-connect' && !PX); });
@@ -3950,7 +4073,7 @@ function deleteProxyEntry(){
   if (!confirm('从面板删除这个代理？代理本身不会被改动（想让它停止服务，请先取消勾选「启用」并保存，再删除）。')) return;
   pxBusy(true);
   api('proxies/' + PX.id, { method: 'DELETE' }).then(function(r){
-    if (r && r.ok){ pxFill(null); pxConn('已删除。'); toast('已从面板删除', 'ok'); pxRefreshAll(); }
+    if (r && r.ok){ pxConn('已删除。'); toast('已从面板删除', 'ok'); loadProxyEntry(null, true).then(pxRefreshAll); }
     else toast((r && r.msg) || '删除失败', 'err');
   }).catch(function(){ toast('删除失败：无法连接服务器', 'err'); }).then(function(){ pxBusy(false); });
 }

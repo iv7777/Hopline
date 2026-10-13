@@ -142,6 +142,7 @@
         <div class="kv"><span class="k">KV 持久化</span><span class="v" id="stKv">—</span></div>
         <div class="kv"><span class="k">面板入口</span><span class="v" id="stEntry">—</span></div>
         <div class="kv"><span class="k">代理状态</span><span class="v" id="stProxy">—</span></div>
+        <div id="stProxyList"></div>
         <div class="inrow" style="margin-top:10px;align-items:center"><button class="btn sm" onclick="checkProxy()">检测代理</button><span class="hint" id="stProxyHint" style="margin:0"></span></div>
       </div>
     </section>
@@ -214,6 +215,7 @@
       <div class="card">
         <h3><span class="tick"></span>状态</h3>
         <div class="note-box" id="px-note" style="margin:0">读取中…</div>
+        <div class="field" id="px-whichbox" style="display:none;margin:12px 0 0"><label>要修改的代理</label><select id="px-which" onchange="onProxyWhich()"></select></div>
         <div class="inrow" style="margin-top:12px">
           <button class="btn" id="px-reload" onclick="loadProxySettings()">重新读取</button>
           <button class="btn primary" id="px-save" onclick="saveProxySettings()">保存到代理</button>
@@ -266,8 +268,10 @@
     <section class="view" data-view="account" data-title="面板设置" data-sub="代理（域名、节点路径、密钥、UUID、启停）、面板路径（PATH）、管理用户名与密码">
       <div class="card">
         <h3><span class="tick"></span>代理</h3>
-        <p class="hint" style="margin-top:0;margin-bottom:12px">订阅里的节点指向哪里：填写代理脚本（Hopline-proxy.js）所在的域名、它的环境变量 PATH（节点路径）和 NODE_KEY（密钥）。面板用密钥签名后通过 HTTPS 联系代理：<b>UUID 由面板生成并下发给代理</b>（存在代理的 NODE_KV 里），不需要手工填写。密钥只写入、不回显；留空保持不变。</p>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">订阅里的节点指向哪里：可以添加多个代理，订阅会<b>合并所有启用的代理</b>（每个代理各出一套节点，多个时节点名带「·代理名」后缀，总数仍受 500 的上限，平均分给各代理）。点列表里的代理进行编辑。每个代理填写代理脚本（Hopline-proxy.js）所在的域名、它的环境变量 PATH（节点路径）和 NODE_KEY（密钥）。面板用密钥签名后通过 HTTPS 联系代理：<b>UUID 由面板生成并下发给代理</b>（存在代理的 NODE_KV 里），不需要手工填写。密钥只写入、不回显；留空保持不变。</p>
         <div class="note-box" id="px-conn" style="margin:0 0 12px">读取中…</div>
+        <div id="px-list"></div>
+        <div class="inrow" style="margin:0 0 14px"><button class="btn sm" onclick="newProxyEntry()">＋ 添加代理</button></div>
         <div class="field"><label>名称（可选）</label><input type="text" id="a-pname" placeholder="代理 1" autocomplete="off"></div>
         <div class="field"><label>代理域名（节点 SNI / Host，如 node.example.com；须是代理 Worker 的自定义域名）</label><input type="text" id="a-host" placeholder="node.example.com" autocomplete="off"></div>
         <div class="field"><label>节点路径（须与代理脚本的环境变量 PATH 相同）</label><input type="text" id="a-nodepath" placeholder="mynode" autocomplete="off"></div>
@@ -292,7 +296,7 @@
           <button class="btn" id="px-rotate" onclick="rotateProxyUuid()">更换 UUID</button>
           <button class="btn danger" id="px-del" onclick="deleteProxyEntry()">删除</button>
         </div>
-        <p class="hint" style="margin-top:10px">XHTTP 与面板联系代理都要求代理使用自定义域名（Cloudflare 面板 → Workers 与 Pages → 代理 Worker → Domains &amp; Routes 添加）；面板与代理在同一个 Cloudflare 区域（zone）时请把代理设为 Custom Domain。代理需要绑定一个 KV（变量名 NODE_KV）来保存 UUID。「更换 UUID」后旧 UUID 在代理上还会保留 10 分钟，已有客户端更新订阅即可。当前界面一次管理一个代理，数据结构已支持多个。</p>
+        <p class="hint" style="margin-top:10px">XHTTP 与面板联系代理都要求代理使用自定义域名（Cloudflare 面板 → Workers 与 Pages → 代理 Worker → Domains &amp; Routes 添加）；面板与代理在同一个 Cloudflare 区域（zone）时请把代理设为 Custom Domain。代理需要绑定一个 KV（变量名 NODE_KV）来保存 UUID。「更换 UUID」后旧 UUID 在代理上还会保留 10 分钟，已有客户端更新订阅即可。最多 8 个代理。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>基础配置</h3>

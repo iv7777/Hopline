@@ -42,6 +42,16 @@ function uniqueNodeNames(nodes) {
   });
 }
 
+// 多个代理合并订阅时，给节点名追加「·代理名」以区分来自哪个代理（名称里会破坏 Surge / Loon 配置语法的字符换成 -）
+function tagNodeName(n, tag) {
+  const h = n.indexOf('#');
+  if (h < 0) return n;
+  let name;
+  try { name = decodeURIComponent(n.slice(h + 1)); } catch (e) { name = n.slice(h + 1); }
+  const safe = String(tag || '').replace(/[,=#%?\s]+/g, '-').replace(/^-+|-+$/g, '');
+  return safe ? n.slice(0, h + 1) + uriFragName(name + '·' + safe) : n;
+}
+
 // 面板 ALPN 设置（h2 / http/1.1，逗号分隔）→ 数组；未设置返回 null（各格式按协议取默认值）
 function alpnList(alpn) {
   const a = String(alpn || '').split(',').map(x => x.trim()).filter(x => /^[\w./-]+$/.test(x));
@@ -418,7 +428,10 @@ function parseShareNode(n, i) {
   }
   // 明文端口节点（security=none）不启用 TLS
   const tls = (getParam(n, 'security') || 'tls') === 'tls';
-  return { srv, prt, name, user, tls };
+  // 每个节点自带它所属代理的 SNI / Host 与节点路径（多个代理合并订阅时各不相同）；ws 路径里的 ?ed=2048 另由各格式按协议处理，这里只取路径本身
+  const host = getParam(n, 'host') || '';
+  const path = (getParam(n, 'path') || '').replace(/\?.*$/, '') || '/';
+  return { srv, prt, name, user, tls, host, path };
 }
 
 // 地区 / 运营商标签表：按节点名称中的关键字匹配

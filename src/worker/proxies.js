@@ -2,7 +2,7 @@
 // 代理列表：面板 KV 里的 proxies（一个 JSON 数组），每项 { id, name, host, nodePath, uuid, key, enabled }
 // ---------------------------------------------------------------------------
 // 面板是 UUID 的权威：由面板生成并下发给代理（见 proxy-client.js 的 syncProxy）。密钥只写不读：接口不回传，备份不导出。
-// 目前订阅只使用第一个启用的代理；数据结构、接口与代理设置页已经按「多个代理」设计，之后加多代理订阅不需要迁移。
+// 订阅合并所有可用的代理（见 readyProxies）；接口 /api/proxies 与面板的代理列表按多个代理设计。
 const PROXIES_KEY = 'proxies';
 const PROXIES_MAX = 8;
 
@@ -19,7 +19,7 @@ function cleanProxyRecord(r) {
     uuid: isUUID(r.uuid) ? String(r.uuid).toLowerCase() : '', key: typeof r.key === 'string' ? r.key : '', enabled: r.enabled !== false,
   };
 }
-// 读入面板配置时附带代理列表：cfg.proxies 全部，cfg.proxy 第一个启用的（订阅用）；读取失败记在 cfg._proxiesError（此时拒绝保存）
+// 读入面板配置时附带代理列表：cfg.proxies 全部，cfg.proxy 第一个启用的（面板接口没指定 id 时的默认代理）；读取失败记在 cfg._proxiesError（此时拒绝保存）
 async function attachProxies(env, cfg) {
   cfg.proxies = []; cfg.proxy = null;
   const kv = kvStore(env);
@@ -75,10 +75,16 @@ function sanitizeProxyInput(input, { partial } = {}) {
 }
 function newProxyId() { return b64uOfBytes(crypto.getRandomValues(new Uint8Array(6))); }
 
+// 订阅会下发的代理：启用、且域名 / 节点路径 / UUID 都已齐全（多个时订阅合并它们的节点）
+function readyProxies(cfg) {
+  return (cfg.proxies || []).filter(p => p.enabled && p.host && p.nodePath && p.uuid);
+}
 // 订阅需要的代理端点是否齐全：返回尚未就绪的说明（空数组 = 可以生成订阅）
 function endpointMissing(cfg) {
   if (cfg._proxiesError) return ['代理列表（' + (cfg._proxiesError === 'corrupt' ? 'KV 里的内容已损坏' : 'KV 暂时无法读取') + '）'];
-  const px = cfg.proxy;
-  if (!px) return [cfg.proxies && cfg.proxies.length ? '启用中的代理（现有的都已停用）' : '代理（请先在「面板设置 → 代理」添加）'];
+  if (readyProxies(cfg).length) return [];
+  const on = (cfg.proxies || []).filter(p => p.enabled);
+  if (!on.length) return [cfg.proxies && cfg.proxies.length ? '启用中的代理（现有的都已停用）' : '代理（请先在「面板设置 → 代理」添加）'];
+  const px = on[0];
   return [['host', '代理域名'], ['nodePath', '节点路径'], ['uuid', 'UUID（点「连接并同步」会自动生成并下发）']].filter(([k]) => !px[k]).map(([, label]) => label);
 }

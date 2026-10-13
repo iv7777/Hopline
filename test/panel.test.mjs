@@ -404,12 +404,12 @@ test('代理设置 API：需登录；没有代理时给出明确提示；读取 
   assert.deepEqual(proxyState(m2).set, { hopMode: 'no' });
 });
 
-test('订阅使用第一个启用的代理：停用的跳过；多个代理时数据结构完整保留', async () => {
+test('订阅只下发启用的代理：停用的跳过（只剩一个时节点名不加后缀）；缺 UUID 的提示去连接并同步', async () => {
   const second = { ...PROXY, id: 'px-test-2', name: '代理 2', host: 'second.example.com', nodePath: 'np2', uuid: UUID2 };
   const env = baseEnv({ CONFIG_KV: kv({ proxies: [{ ...PROXY, enabled: false }, second], config: customCfg() }) });
   const links = await withFetch(nodesFetch, async () => (await (await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).text()).split('\n').filter(l => /^vless:\/\//.test(l)));
   assert.ok(links.length > 0);
-  assert.ok(links.every(l => l.startsWith(`vless://${UUID2}@`) && /[?&]sni=second\.example\.com(&|#)/.test(l) && /path=%2Fnp2(%3F|&)/.test(l)), '跳过停用的第一个，用第二个');
+  assert.ok(links.every(l => l.startsWith(`vless://${UUID2}@`) && /[?&]sni=second\.example\.com(&|#)/.test(l) && /path=%2Fnp2(%3F|&)/.test(l)), '跳过停用的第一个，只用第二个');
   const list = await (await call(env, `/${UUID}/api/proxies`, { cookie: await login(env) })).json();
   assert.deepEqual(list.data.proxies.map(p => [p.id, p.enabled]), [['px-test-1', false], ['px-test-2', true]]);
   // 缺 UUID：提示去「连接并同步」
@@ -1633,3 +1633,86 @@ test('主题：页面头部提前套用主题，登录页同样默认跟随系�
 });
 
 // ---------------- Clash 配置模板：与面板同一套「版本标签 + SHA-256 + 分层缓存」加载 ----------------
+
+// ---------------- 多个代理合并订阅 ----------------
+const P2 = { ...PROXY, id: 'px-test-2', name: '备用', host: 'second.example.com', nodePath: 'np2', uuid: UUID2 };
+const linkOf = (l) => { const u = new URL(l.replace('vless://', 'http://')); return { uuid: decodeURIComponent(u.username), sni: u.searchParams.get('sni'), host: u.searchParams.get('host'), path: u.searchParams.get('path').split('?')[0], type: u.searchParams.get('type'), name: decodeURIComponent(l.split('#')[1]) }; };
+const vlessLinks = async (env, fmt = '') => withFetch(nodesFetch, async () => (await (await call(env, `/${UUID}/sub${fmt}`, { ua: 'v2rayN/7.0' })).text()).split('\n').filter(l => /^vless:\/\//.test(l)));
+
+test('多代理订阅：每个启用的代理各出一套节点（各自的 UUID / SNI / 路径），节点名带「·代理名」后缀且全局唯一；筛选在加后缀之前，代理名不影响地区筛选', async () => {
+  const lines = '104.16.9.1:443#a\n104.16.9.2:443#b';
+  const proxies = [{ ...PROXY, name: '香港主力' }, { ...P2, name: '美国 备用' }];
+  const env = baseEnv({ CONFIG_KV: kv({ proxies, config: fixedNodes(lines, { enableXhttp: true, filter: { ipType: ['IPv4'], region: ['US'] } }) }) });
+  const links = (await vlessLinks(env)).map(linkOf);
+  assert.equal(links.length, 8, '2 个代理 × 2 个地址 × (VLESS + XHTTP)');   // 默认开启 XHTTP
+  for (const [uuid, host, path, tag] of [[UUID, 'node.example.com', '/' + UUID, '香港主力'], [UUID2, 'second.example.com', '/np2', '美国-备用']]) {
+    const mine = links.filter(l => l.uuid === uuid);
+    assert.equal(mine.length, 4, host);
+    assert.ok(mine.every(l => l.sni === host && l.host === host && l.path === path), host + ' 的 SNI / Host / 路径');
+    assert.ok(mine.every(l => l.name.endsWith('·' + tag)), '名称后缀：' + mine.map(l => l.name));
+    assert.deepEqual(mine.map(l => l.type).sort(), ['ws', 'ws', 'xhttp', 'xhttp']);
+  }
+  assert.equal(new Set(links.map(l => l.name)).size, links.length, '节点名全局唯一');
+  // 单个代理时不加后缀
+  const single = baseEnv({ CONFIG_KV: kv({ proxies: [PROXY], config: fixedNodes(lines) }) });
+  assert.ok((await vlessLinks(single)).map(linkOf).every(l => !l.name.includes('·')));
+});
+
+test('多代理订阅：节点总数封顶 500 并平均分给各代理；缺 UUID / 停用的代理被跳过；代理名里的逗号与等号被替换（不破坏 Surge / Loon 语法）', async () => {
+  const lines = Array.from({ length: 200 }, (_, i) => `104.16.0.${i + 1}:443#n${i}`).join('\n');   // 自定义优选 API 单个来源最多取 200 个
+  const cfg = fixedNodes(lines, { enableXhttp: true });   // 每个地址 2 个节点：每个代理 400 个，封顶后各 250
+  const three = [{ ...PROXY, name: 'a,b=c' }, { ...P2, name: '第二' }, { ...P2, id: 'px-test-3', name: '第三', host: 'third.example.com', uuid: '' }, { ...P2, id: 'px-test-4', name: '第四', host: 'fourth.example.com', enabled: false }];
+  const env = baseEnv({ CONFIG_KV: kv({ proxies: three, config: cfg }) });
+  const links = (await vlessLinks(env)).map(linkOf);
+  assert.equal(links.length, 500, '2 个可用代理各 250');
+  assert.deepEqual([...new Set(links.map(l => l.sni))].sort(), ['node.example.com', 'second.example.com'], '缺 UUID 与停用的被跳过');
+  assert.equal(links.filter(l => l.uuid === UUID).length, 250);
+  assert.ok(links.every(l => !/[,=]/.test(l.name)), '名称里没有逗号 / 等号');
+  assert.ok(links.some(l => l.name.endsWith('·a-b-c')));
+  const surge = await (await withFetch(nodesFetch, () => call(env, `/${UUID}/sub/surge`, { ua: 'x' }))).text();
+  for (const l of surge.split('\n').filter(x => / = vless, /.test(x))) assert.equal(l.split(' = ').length, 2, l);
+});
+
+test('多代理订阅：Clash / sing-box / Surge / Loon / Quantumult X 里每个节点用自己代理的 SNI / Host、路径与 UUID', async () => {
+  const env = baseEnv({ CONFIG_KV: kv({ proxies: [PROXY, P2], config: fixedNodes('104.16.9.1:443#a', { enableXhttp: false }) }) });
+  const get = async (fmt) => (await withFetch(nodesFetch, () => call(env, `/${UUID}/sub/${fmt}`, { ua: 'x' }))).text();
+  const clash = await get('clash');
+  assert.match(clash, /servername: node\.example\.com/); assert.match(clash, /servername: second\.example\.com/);
+  assert.ok(clash.includes('/' + UUID + '?ed=2048'));
+  assert.ok(clash.includes('/np2?ed=2048'));
+  assert.ok(clash.includes(`uuid: ${UUID2}`) && clash.includes(`uuid: ${UUID}`));
+  const sb = JSON.parse(await get('singbox')).outbounds.filter(o => o.type === 'vless');
+  assert.deepEqual(sb.map(o => [o.tls.server_name, o.transport.path, o.transport.headers.Host, o.uuid]).sort(),
+    [['node.example.com', '/' + UUID, 'node.example.com', UUID], ['second.example.com', '/np2', 'second.example.com', UUID2]].sort());
+  for (const fmt of ['surge', 'loon']) {
+    const t = await get(fmt);
+    assert.match(t, new RegExp(`username=${UUID2}, ws=true, ws-path=/np2, ws-headers=Host:second\\.example\\.com, tls=true, skip-cert-verify=false, sni=second\\.example\\.com`), fmt);
+    assert.match(t, new RegExp(`username=${UUID}, ws=true, ws-path=/${UUID}, ws-headers=Host:node\\.example\\.com`), fmt);
+  }
+  const qx = await get('quanx');
+  assert.match(qx, new RegExp(`password=${UUID2}, obfs=wss, obfs-host=second\\.example\\.com, obfs-uri=/np2`));
+  assert.match(qx, new RegExp(`password=${UUID}, obfs=wss, obfs-host=node\\.example\\.com, obfs-uri=/${UUID}`));
+});
+
+test('多代理订阅：原生地址按各代理自己的域名下发；所有来源都没有产出时每个代理都有官方域名兜底', async () => {
+  const native = baseEnv({ CONFIG_KV: kv({ proxies: [PROXY, P2], config: { src: { native: true, prefDomain: false, prefIp: false }, enableXhttp: false } }) });
+  const links = (await vlessLinks(native)).map(linkOf);
+  assert.deepEqual(links.map(l => [l.uuid, l.name]).sort(), [[UUID, '原生地址·代理 1'.replace(' ', '-')], [UUID2, '原生地址·备用']].sort());
+  const empty = baseEnv({ CONFIG_KV: kv({ proxies: [PROXY, P2], config: { src: { prefDomain: false }, ipsrc: { hostmonit: false, uouin: false }, enableXhttp: false } }) });
+  const fb = (await vlessLinks(empty)).map(linkOf);
+  assert.ok(fb.some(l => l.uuid === UUID) && fb.some(l => l.uuid === UUID2), '两个代理都有节点');
+});
+
+test('代理状态 /api/proxy-status?all=1：全部代理的状态（一个连不上不影响其它）；需登录', async () => {
+  const env = baseEnv({ CONFIG_KV: kv({ proxies: [PROXY, P2] }) });
+  assert.equal((await call(env, `/${UUID}/api/proxy-status?all=1`)).status, 403);
+  mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
+  mountProxy('second.example.com').down = true;
+  const r = await (await call(env, `/${UUID}/api/proxy-status?all=1`, { cookie: await login(env) })).json();
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.data.proxies.map(p => [p.id, p.up]), [['px-test-1', true], ['px-test-2', false]]);
+  assert.match(r.data.proxies[1].error, /无法连接代理/);
+  assert.ok(!JSON.stringify(r).includes(KEY));
+  const none = baseEnv({ CONFIG_KV: kv({ proxies: [] }) });
+  assert.deepEqual((await (await call(none, `/${UUID}/api/proxy-status?all=1`, { cookie: await login(none) })).json()).data, { proxies: [] });
+});
