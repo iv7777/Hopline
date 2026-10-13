@@ -1,25 +1,14 @@
-name: Obfuscate Hopline.js
+name: Obfuscate Hopline-proxy.js
 
-# Hopline.js 或 obfuscate.mjs 变化（push 到 main）时自动生成 obf_Hopline.js；
-# 也可以手动触发（workflow_dispatch）并选择混淆强度，产出一次性的强度更高/更低的版本。
-# 强度定义见 obfuscate.mjs 中的 PRESETS（light / medium / heavy）。
+# Hopline-proxy.js 或 obfuscate.mjs 变化（push 到 main）时自动生成 obf_Hopline-proxy.js；也可以手动触发（workflow_dispatch）。
+# 只混淆代理脚本，且只做零运行时成本的处理（见 obfuscate.mjs）；面板脚本不提供混淆版。
 on:
   push:
     branches: [main]
     paths:
-      - 'Hopline.js'
+      - 'Hopline-proxy.js'
       - 'obfuscate.mjs'
   workflow_dispatch:
-    inputs:
-      level:
-        description: '混淆强度'
-        required: false
-        type: choice
-        options:
-          - light
-          - medium
-          - heavy
-        default: medium
 
 permissions:
   contents: write
@@ -37,17 +26,17 @@ jobs:
         with:
           node-version: 22
 
-      - name: Generate obf_Hopline.js
-        run: node obfuscate.mjs "${{ github.event.inputs.level || 'medium' }}"
+      - name: Generate obf_Hopline-proxy.js
+        run: node obfuscate.mjs
 
       - name: Commit and push the obfuscated file
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add obf_Hopline.js
+          git add obf_Hopline-proxy.js
           if git diff --staged --quiet; then
-            echo "No changes to commit, obf_Hopline.js is already up-to-date."
+            echo "No changes to commit, obf_Hopline-proxy.js is already up-to-date."
           else
-            git commit -m "chore: regenerate obf_Hopline.js"
+            git commit -m "chore: regenerate obf_Hopline-proxy.js"
             git push
           fi

@@ -15,10 +15,10 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      - name: Hopline.js 与 src/ 同步
+      - name: Hopline-proxy.js / Hopline-panel.js 与 src/ 同步
         run: node build.mjs --check
       - name: 语法检查
-        run: node --check Hopline.js
+        run: node --check Hopline-proxy.js && node --check Hopline-panel.js
       - name: 静态检查（eslint）
         run: npm run lint
       - name: 测试
