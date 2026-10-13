@@ -5,9 +5,9 @@
 // 其它机房最多约 1 分钟后同步（面板保存提示即此含义）。
 // ---------------------------------------------------------------------------
 
-// KV 读取失败 / 配置损坏时不能静默当作「没有配置」：否则未设置环境变量 UUID 时会重新生成 UUID（登录与全部节点同时失效），
-// 在此状态下保存还会用默认值覆盖掉真实配置。cfg._kvError 记录原因（unavailable：KV 读取出错；corrupt：存储内容不是合法 JSON），
-// 调用方据此拒绝写入；节点与订阅在环境变量提供了有效 UUID 时继续按环境变量 + 默认值工作
+// KV 读取失败 / 配置损坏时不能静默当作「没有配置」：否则在此状态下保存会用默认值覆盖掉真实配置。
+// cfg._kvError 记录原因（unavailable：KV 读取出错；corrupt：存储内容不是合法 JSON），调用方据此拒绝写入；
+// 读取不到 KV 时面板与订阅按环境变量 + 默认值工作
 async function loadConfig(env) {
   let kvCfg = null, kvError = '';
   const kv = kvStore(env);
@@ -22,7 +22,6 @@ async function loadConfig(env) {
   }
   const cfg = buildConfig(env, kvCfg);
   if (kvError) cfg._kvError = kvError;
-  if (!cfg.uuid && !kvError) await provisionUuid(env, kvCfg, cfg);
   return cfg;
 }
 
@@ -30,24 +29,6 @@ async function loadConfig(env) {
 function envUuid(env) {
   const v = String(envVar(env, 'uuid') || '').toLowerCase();
   return isUUID(v) ? v : '';
-}
-
-// UUID 未设置（环境变量与 KV 都没有）：随机生成一个并保存到 KV，之后一直沿用；面板里可以查看与修改。
-// 未绑定 KV 时无处保存（每次请求都重新生成会让节点失效），cfg._uuidUnsaved 标记，由 handleRequest 提示设置 UUID。
-// 首次生成只发生在第一次访问时；KV 跨机房最终一致，极端情况下两个机房同时首次访问可能各生成一个，后写入者生效——
-// 部署后请先自己打开一次面板。同一实例内用 WeakMap 记住已生成的值（KV 边缘缓存最长 30 秒内可能还读不到刚写入的）
-const AUTO_UUIDS = new WeakMap();
-async function provisionUuid(env, kvCfg, cfg) {
-  const kv = kvStore(env);
-  if (!kv || typeof kv.put !== 'function') { cfg._uuidUnsaved = true; return; }
-  let uuid = AUTO_UUIDS.get(kv);
-  if (!uuid) {
-    uuid = uuidv4();
-    try { await kv.put('config', JSON.stringify(Object.assign({}, kvCfg || {}, { uuid }))); }
-    catch (e) { cfg._kvError = 'unavailable'; return; }
-    AUTO_UUIDS.set(kv, uuid);
-  }
-  cfg.uuid = uuid;
 }
 
 // 面板路径（环境变量 PATH）：去掉首尾 /，只允许 字母 数字 . _ ~ -，且不能是保留路径。返回 { value, error }
@@ -60,15 +41,17 @@ function normalizePanelPath(raw) {
 }
 
 // 由「默认值 < 环境变量 < KV 配置 < 锁定的环境变量」组装完整配置（纯函数：保存接口用刚写入的数据直接组装，
-// 不经 KV 边缘缓存，避免保存后回读到旧配置）。cfg.uuid 为空表示尚未设置（loadConfig 负责生成），cfg.path 为空表示 PATH 未设置 / 非法
+// 不经 KV 边缘缓存，避免保存后回读到旧配置）。cfg.uuid / cfg.host / cfg.nodePath 为空表示代理端点尚未填写，cfg.path 为空表示 PATH 未设置 / 非法
 function buildConfig(env, kvCfg) {
   const cfg = schemaDefaults();
   const flag = (v) => v === true || v === 'true' || v === '1' || v === 1;
   // 环境变量
+  const envBase = { host: '', nodePath: '' };
   if (envVar(env, 'uuid')) cfg.uuid = String(envVar(env, 'uuid')).toLowerCase();
-  if (env.HOST) cfg.host = String(env.HOST).replace(/^https?:\/\//, '').split('/')[0];
-  if (env.PROXYIP) cfg.proxyIP = String(env.PROXYIP);
-  if (envVar(env, 'outbound')) cfg.outboundProxy = String(envVar(env, 'outbound'));
+  if (env.HOST) envBase.host = String(env.HOST).replace(/^https?:\/\//, '').split('/')[0];
+  if (envVar(env, 'nodePath')) envBase.nodePath = String(envVar(env, 'nodePath')).trim().replace(/^\/+/, '').replace(/\/+$/, '');
+  cfg.host = envBase.host;
+  cfg.nodePath = envBase.nodePath;
   if (flag(envVar(env, 'ech'))) cfg.ech = true;
   if (env.ALPN) cfg.alpn = String(env.ALPN);
   // KV 图形化配置（更高优先级）：按字段表逐项合并，未登记的字段自动忽略
@@ -86,9 +69,11 @@ function buildConfig(env, kvCfg) {
     if (d.lower) v = v.toLowerCase();
     setPath(cfg, key, v);
   }
-  // UUID：KV 中为空或非法时回退环境变量；仍无效则留空（loadConfig 生成并保存）
+  // 代理端点三项：面板里留空（或 UUID 非法）时回退环境变量；仍没有则留空，订阅会提示尚未填写
   cfg.uuid = String(cfg.uuid || '').toLowerCase();
   if (!isUUID(cfg.uuid)) cfg.uuid = envUuid(env);
+  if (!cfg.host) cfg.host = envBase.host;
+  if (!cfg.nodePath) cfg.nodePath = envBase.nodePath;
   // 面板路径只认环境变量 PATH（不再回退 UUID）；非法值按未设置处理并记下原因
   const np = normalizePanelPath(locked.path ? env[locked.path] : '');
   cfg.path = np.value;
@@ -102,7 +87,7 @@ async function saveConfig(env, cfg) {
   const kv = kvStore(env);
   if (!kv || typeof kv.put !== 'function') return null;
   const stored = pickSchema(cfg);
-  // 环境变量提供、且面板里没有被改动的值不写入 KV：否则一次保存就会把 PROXYIP / ALPN 等
+  // 环境变量提供、且面板里没有被改动的值不写入 KV：否则一次保存就会把 HOST / ALPN 等
   // 环境变量快照进 KV（KV 优先级更高），之后再改环境变量会被静默忽略。
   // 面板中改成与环境变量不同的值才视为覆盖并保存
   const envBase = buildConfig(env, null), defaults = schemaDefaults();

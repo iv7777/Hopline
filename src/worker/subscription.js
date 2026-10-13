@@ -3,10 +3,13 @@
 const NODE_CAP = 500;
 
 // 根据 UA 或指定格式生成订阅
-async function generateSubscription(env, cfg, requestUrl, format, ua) {
+async function generateSubscription(cfg, format, ua) {
   // 明文端口节点只由「仅 TLS 端口」控制（默认开启）；ECH 只对 TLS 生效，开启时同样只下发 TLS 端口节点。
   // 自定义域名的明文端口需在 Cloudflare 关闭「始终使用 HTTPS」，否则被 301 重定向、WebSocket 握手失败
-  const rc = Object.assign({}, cfg, { host: cfg.host || new URL(requestUrl).hostname });
+  // 代理端点（域名 / UUID / 节点路径）来自面板设置；没填全就没有可指向的代理，直接报错
+  const missing = endpointMissing(cfg);
+  if (missing.length) throw Object.assign(new Error('请先在面板「代理端点」里填写：' + missing.join('、') + '（与代理脚本的域名、UUID、PATH 一致）'), { status: 400 });
+  const rc = Object.assign({}, cfg);
   const prefList = effectivePrefDomains(cfg);   // 面板填写的优选域名（整体替换内置列表）或内置列表
   if (rc.ech) rc.tlsOnly = true;
   // 筛选含 IPv6 时查询 AAAA 记录并生成 IPv6 节点（默认双选 IPv4+IPv6 同样生效）；
@@ -82,7 +85,7 @@ async function generateSubscription(env, cfg, requestUrl, format, ua) {
   if (nodes.length > cap) nodes.length = cap;
   nodes = uniqueNodeNames(nodes);
   let type, body;
-  if (forced === 'clash' || forced === 'stash') { type = 'text/yaml'; body = generateClash(rc, nodes, await requireClashTemplate(env)); }   // Stash 使用 Clash 格式（与按 UA 识别一致）
+  if (forced === 'clash' || forced === 'stash') { type = 'text/yaml'; body = generateClash(rc, nodes, CLASH_TEMPLATE); }   // Stash 使用 Clash 格式（与按 UA 识别一致）
   else if (forced === 'singbox' || forced === 'sing-box') { type = 'application/json'; body = generateSingbox(rc, nodes); }
   else if (forced === 'surge') { type = 'text/plain'; body = generateSurge(rc, nodes); }
   else if (forced === 'loon') { type = 'text/plain'; body = generateLoon(rc, nodes); }
@@ -94,7 +97,7 @@ async function generateSubscription(env, cfg, requestUrl, format, ua) {
     type = 'text/plain'; body = nodes.join('\n');
   }
   // UA 自动识别
-  else if (ua.includes('clash') || ua.includes('stash')) { type = 'text/yaml'; body = generateClash(rc, nodes, await requireClashTemplate(env)); }
+  else if (ua.includes('clash') || ua.includes('stash')) { type = 'text/yaml'; body = generateClash(rc, nodes, CLASH_TEMPLATE); }
   else if (ua.includes('sing-box')) { type = 'application/json'; body = generateSingbox(rc, nodes); }
   else if (ua.includes('surge')) { type = 'text/plain'; body = generateSurge(rc, nodes); }
   else if (ua.includes('loon')) { type = 'text/plain'; body = generateLoon(rc, nodes); }

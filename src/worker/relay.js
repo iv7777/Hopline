@@ -1,9 +1,24 @@
 // ---------------------------------------------------------------------------
-// 内置地区反代域名池：proxyip.<地区>.cmliussss.net 社区反代服务（解析为非 Cloudflare IP）
 // 出站兜底：直连与自定义反代均失败后使用，透明代理模式发送去掉 VLESS 头部的原始
 // TLS 数据，由对端按 SNI 路由到目标
 // ---------------------------------------------------------------------------
-// （RELAY_DOMAINS 在 constants.js 中定义：配置字段表需要引用其地区列表）
+// 内置地区反代域名池：proxyip.<地区>.cmliussss.net 社区反代服务（解析为非 Cloudflare IP）
+const RELAY_DOMAINS = {
+  HK: 'proxyip.hk.cmliussss.net',
+  US: 'proxyip.us.cmliussss.net',
+  SG: 'proxyip.sg.cmliussss.net',
+  JP: 'proxyip.jp.cmliussss.net',
+  KR: 'proxyip.kr.cmliussss.net',
+  DE: 'proxyip.de.cmliussss.net',
+  SE: 'proxyip.se.cmliussss.net',
+  NL: 'proxyip.nl.cmliussss.net',
+  FI: 'proxyip.fi.cmliussss.net',
+  GB: 'proxyip.gb.cmliussss.net',
+  Oracle: 'proxyip.oracle.cmliussss.net',
+  DigitalOcean: 'proxyip.digitalocean.cmliussss.net',
+  Vultr: 'proxyip.vultr.cmliussss.net',
+  Multacom: 'proxyip.multacom.cmliussss.net'
+};
 // 根据 Worker 所在机房 colo（IATA 代码）选择最近的中继地区
 function selectRelayRegion(colo) {
   const c = (colo || '').toUpperCase();
@@ -26,8 +41,6 @@ function selectRelayRegion(colo) {
 
 // PROXYIP 反代 IP 解析缓存（TTL 5 分钟：域名 → DoH TXT/A 解析结果）
 const PROXYIP_CACHE = new Map();
-// 限制缓存表大小：超出时淘汰最先插入的项（Map 按插入顺序遍历），避免长期运行的实例内存无限增长
-function capMap(map, max) { while (map.size > max) map.delete(map.keys().next().value); }
 
 // 解析反代域名为 IP 候选列表：
 //   - IP 字面量直接返回

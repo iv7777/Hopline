@@ -70,7 +70,7 @@ function vssProtoNode(cfg, server, port, name, extra = {}) {
   }
   else q += '&type=ws';   // 明文端口与默认路径均走 ws
   // TLS 下的 ws 路径携带 ed=2048（WS 0-RTT 早数据，见 decodeEarlyData）；明文端口与 xhttp 不带
-  q += '&path=' + enc('/' + cfg.path + (!isXhttp && isTls ? '?ed=2048' : ''));
+  q += '&path=' + enc('/' + cfg.nodePath + (!isXhttp && isTls ? '?ed=2048' : ''));
   // ALPN：面板设置优先；XHTTP stream-one 依赖 HTTP/2 双向流，未设置时显式指定 h2（与 Clash 输出一致），不依赖客户端内核的默认值
   if (isTls && (cfg.alpn || isXhttp)) q += '&alpn=' + (cfg.alpn ? alpnParam(cfg.alpn) : 'h2');
   if (cfg.ech && isTls) {
@@ -87,16 +87,6 @@ async function storeUrlCache(ck, rec) {
   DNH_CACHE.set(ck, { t: Date.now(), ips: rec });
   capMap(DNH_CACHE, 300);
   await sharedCachePut('url-' + md5hex(ck), rec, 600);
-}
-// 带超时的 fetch（手动 AbortController，兼容所有运行时）
-function fetchTimeout(url, opts, ms) {
-  return new Promise((resolve) => {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), ms);
-    fetch(url, Object.assign({}, opts, { signal: ctrl.signal }))
-      .then(r => { clearTimeout(timer); resolve(r); })
-      .catch(() => { clearTimeout(timer); resolve(null); });
-  });
 }
 // 解析优选域名/优选API为 IP：URL 数据源与域名并发拉取（避免串行拖垮订阅墙钟）；按输入顺序均衡截断 maxTotal，保证各地区节点都有
 // filterCF：true（订阅生成）只保留 Cloudflare 段 IP，保证可达；false 仅用于面板「测试」按钮，需要看到被丢弃的非 CF 段地址

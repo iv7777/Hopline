@@ -10,16 +10,21 @@ const rules = {
   'no-unused-vars': ['error', { args: 'none', caughtErrors: 'none' }],
   'no-empty': ['error', { allowEmptyCatch: true }],
 };
+const workerGlobals = {
+  crypto: 'readonly', fetch: 'readonly', Request: 'readonly', Response: 'readonly', Headers: 'readonly', URL: 'readonly',
+  URLSearchParams: 'readonly', TextEncoder: 'readonly', TextDecoder: 'readonly', AbortController: 'readonly', AbortSignal: 'readonly',
+  caches: 'readonly', ReadableStream: 'readonly', WritableStream: 'readonly', TransformStream: 'readonly',
+  setTimeout: 'readonly', clearTimeout: 'readonly', atob: 'readonly', btoa: 'readonly',
+};
 export default [
-  {   // 构建产物：Cloudflare Workers 运行时
-    files: ['Hopline.js'],
-    languageOptions: { ...common, sourceType: 'module', globals: {
-      crypto: 'readonly', fetch: 'readonly', Request: 'readonly', Response: 'readonly', Headers: 'readonly', URL: 'readonly',
-      URLSearchParams: 'readonly', TextEncoder: 'readonly', TextDecoder: 'readonly', AbortController: 'readonly', AbortSignal: 'readonly',
-      WebSocketPair: 'readonly', caches: 'readonly', ReadableStream: 'readonly', WritableStream: 'readonly',
-      TransformStream: 'readonly', IdentityTransformStream: 'readonly',
-      setTimeout: 'readonly', clearTimeout: 'readonly', atob: 'readonly', btoa: 'readonly',
-    } },
+  {   // 构建产物：Cloudflare Workers 运行时（分别检查：任一脚本引用了另一个脚本才有的名字都会报 no-undef）
+    files: ['Hopline-proxy.js'],
+    languageOptions: { ...common, sourceType: 'module', globals: { ...workerGlobals, WebSocketPair: 'readonly', IdentityTransformStream: 'readonly' } },
+    rules,
+  },
+  {
+    files: ['Hopline-panel.js'],
+    languageOptions: { ...common, sourceType: 'module', globals: workerGlobals },
     rules,
   },
   {   // 面板脚本：浏览器环境（SCHEMA / sharedCheck 由服务端下发页面时注入，qrcode 来自 CDN 脚本）

@@ -1,3 +1,1 @@
-dist/panel.html -text
-dist/clash-template.yaml -text
 src/worker/clash-template.yaml -text

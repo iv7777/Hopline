@@ -22,13 +22,14 @@
 //   custom    面板中由专用代码回填 / 收集（通用逻辑跳过）
 // ---------------------------------------------------------------------------
 // 环境变量名（旧版短变量名 U / D / S / K / ECH 等已不再识别）。
-// PATH 与 ADMIN 为必填；其余均可选（UUID 未设置时自动生成，见 config.js）
+// PATH 与 ADMIN 为必填；其余均可选。uuid / nodePath / host 描述的是代理脚本（Hopline-proxy.js）的 UUID、节点路径与域名，
+// 环境变量只提供默认值，面板里填写后以面板为准
 const ENV_NAMES = {
   uuid: ['UUID'],
   path: ['PATH'],
+  nodePath: ['NODE_PATH'],
   admin: ['ADMIN'],
   adminUser: ['ADMIN_USER'],
-  outbound: ['OUTBOUND_PROXY'],
   ech: ['ENABLE_ECH'],
   kv: ['CONFIG_KV'],   // KV 命名空间的绑定变量名
 };
@@ -48,10 +49,15 @@ const HOSTNAME_PATTERN = '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]
 const RESERVED_PATHS = ['login', 'version'];
 
 const CONFIG_SCHEMA = [
-  // ---- 面板设置 ----
-  { key: 'uuid', type: 'string', def: '', el: 'a-uuid', label: 'UUID', required: true, lower: true,
+  // ---- 代理端点：订阅里的节点指向哪里（填写代理脚本的 域名、UUID 与节点路径；三项都填了才能生成订阅） ----
+  { key: 'host', type: 'string', def: '', el: 'a-host', label: '代理域名', maxLen: 253, strip: ['^https?://', '[/?#].*$'],
+    pattern: HOSTNAME_PATTERN, hint: '请填写代理的域名，如 node.example.com' },
+  { key: 'uuid', type: 'string', def: '', el: 'a-uuid', label: '代理 UUID', lower: true,
     pattern: UUID_PATTERN, hint: 'UUID 格式不正确（应为 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx，可点「生成」）' },
-  // 面板 / 订阅 / 节点（WebSocket、XHTTP）共用的访问路径：由必填的环境变量 PATH 提供（面板中只读）
+  { key: 'nodePath', type: 'string', def: '', el: 'a-nodepath', label: '代理节点路径', maxLen: 128, strip: ['^/+', '/+$'],
+    pattern: PATH_SEG_PATTERN, hint: '只能包含字母、数字及 . _ ~ -（不含 /），须与代理脚本的 PATH 相同' },
+  // ---- 面板设置 ----
+  // 面板与订阅的访问路径：由必填的环境变量 PATH 提供（面板中只读）；与代理的节点路径互相独立
   { key: 'path', type: 'string', def: '', el: 'a-path', label: '面板路径', maxLen: 128, strip: ['^/+', '/+$'],
     pattern: PATH_SEG_PATTERN, hint: '只能包含字母、数字及 . _ ~ -（不含 /）', reserved: RESERVED_PATHS, envLock: ENV_NAMES.path },
   // 自定义订阅路径：/<别名>/sub 输出订阅（不开放面板与管理接口）；留空为 /<UUID>/sub
@@ -61,10 +67,7 @@ const CONFIG_SCHEMA = [
   { key: 'adminUser', type: 'string', def: 'admin', el: 'a-adminuser', label: '管理用户名', maxLen: 64, fillDefault: true,
     pattern: '^[^\\s\\x00-\\x1f\\x7f]+$', hint: '不能包含空格或控制字符', envLock: ENV_NAMES.adminUser },
   { key: 'admin', type: 'secret', def: '', el: 'a-admin', label: '管理密码', trim: false, maxLen: 256, envLock: ENV_NAMES.admin, check: 'adminPass' },
-  // 绑定域名：节点 SNI / Host，留空使用访问域名
-  { key: 'host', type: 'string', def: '', el: 'a-host', label: '绑定域名', maxLen: 253, strip: ['^https?://', '[/?#].*$'],
-    pattern: HOSTNAME_PATTERN, hint: '请填写域名，如 node.example.com' },
-  // ---- 协议开关 ----
+  // ---- 协议开关：只决定订阅里下发哪些节点（代理脚本始终同时接受两种传输） ----
   { key: 'enableVless', type: 'bool', def: true, el: 'en-vless', label: 'VLESS 协议' },
   { key: 'enableXhttp', type: 'bool', def: true, el: 'en-xhttp', label: 'XHTTP 协议' },
   // ---- 传输参数 ----
@@ -79,19 +82,8 @@ const CONFIG_SCHEMA = [
     pattern: '^https://\\S+$', hint: '须为 https:// 开头的 DoH 地址' },
   // TLS 控制：默认开启，只下发 TLS 端口节点；关闭后 443 节点另追加 80 明文节点，来源自带的明文端口原样下发（开启 ECH 时强制仅 TLS）
   { key: 'tlsOnly', type: 'bool', def: true, el: 'tls-only', label: '仅 TLS 端口' },
-  // ---- 落地与出站 ----
-  { key: 'proxyIP', type: 'string', def: '', el: 's-proxyIP', label: '反代 / 落地 IP', maxLen: 256,
-    pattern: '^[^\\s/]+$', hint: '格式为 host 或 host:port', check: 'hostPort' },
-  { key: 'outboundProxy', type: 'string', def: '', el: 's-outbound', label: '出站代理', maxLen: 1024,
-    pattern: '^\\S+$', hint: '出站代理不能包含空格', check: 'proxy' },
-  { key: 'outboundMode', type: 'enum', def: '', el: 's-outmode', label: '出站方式', options: ['', 'no', 'only'] },
   // ---- 优选域名：留空使用内置列表；填写后整体替换内置列表（每行一个纯主机名，最多 30 个） ----
   { key: 'prefDomains', type: 'text', def: '', el: 'o-prefdomains', label: '优选域名', maxLen: 4096, check: 'domainList' },
-  // ---- 内置地区反代：builtin 内置（默认，按机房自动选地区）/ custom 仅用自定义反代列表 / off 不使用地区反代 ----
-  { key: 'relay.mode', type: 'enum', def: 'builtin', el: 'rl-mode', label: '地区反代模式', options: ['builtin', 'custom', 'off'] },
-  { key: 'relay.region', type: 'enum', def: '', el: 'rl-region', label: '首选反代地区', options: ['', ...Object.keys(RELAY_DOMAINS)] },
-  { key: 'relay.region2', type: 'enum', def: '', el: 'rl-region2', label: '次选反代地区', options: ['', 'none', ...Object.keys(RELAY_DOMAINS)] },
-  { key: 'relay.custom', type: 'text', def: '', el: 'rl-custom', label: '自定义反代列表', maxLen: 1024, check: 'relayList' },
   // ---- 订阅筛选（按节点名称中的地区/运营商标记 + 地址 IP 类型过滤下发） ----
   { key: 'filter.region', type: 'list', def: ['all'], label: '节点地区', options: ['all', 'HK', 'TW', 'US', 'SG', 'JP', 'KR', 'DE'],
     exclusive: 'all', emptyValue: ['all'],
@@ -173,13 +165,11 @@ function checkFieldValue(def, v) {
 }
 
 // 仅服务端执行的附加校验：返回错误信息字符串或 { value } 规范化结果
-const SS_METHODS = ['aes-128-gcm', 'aes-256-gcm', 'chacha20-ietf-poly1305'];
 // 优选域名只接受纯主机名：至少一个点，每段 1-63 位字母数字或连字符，末段不能全为数字（排除 IP）；最多 30 个
 const PREF_DOMAIN_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const PREF_DOMAIN_MAX = 30;
 // 经 DoH 逐个解析的上限（免费版每次请求最多 50 个子请求，需给其它来源留出余量）：超出部分仍作为域名节点下发，只是不参与解析
 const PREF_DOMAIN_DOH_LIMIT = 25;
-const RELAY_CUSTOM_MAX = 3;   // 自定义反代最多 3 个：与直连并发竞速，受 Workers 6 个同时出站连接的限制
 const SERVER_CHECKS = {
   domainList(v) {
     const seen = new Set(), out = [];
@@ -193,38 +183,9 @@ const SERVER_CHECKS = {
     if (out.length > PREF_DOMAIN_MAX) return '最多 ' + PREF_DOMAIN_MAX + ' 个域名（当前 ' + out.length + ' 个）';
     return { value: out.join('\n') };
   },
-  relayList(v) {
-    const seen = new Set(), out = [];
-    for (const raw of String(v || '').split(/[\n,;]+/).map(s => s.trim()).filter(Boolean)) {
-      const { host, port } = parseHostPort(raw, 443);
-      const h = host.toLowerCase();
-      if (!h || !(isValidIp(h) || new RegExp(HOSTNAME_PATTERN).test(h))) return '「' + raw.slice(0, 60) + '」不是有效的反代地址（格式 host 或 host:port，IPv6 需加方括号）';
-      if (!(port >= 1 && port <= 65535)) return '「' + raw.slice(0, 60) + '」的端口须为 1 - 65535';
-      const entry = (h.indexOf(':') >= 0 ? '[' + h + ']' : h) + (port === 443 ? '' : ':' + port);
-      if (!seen.has(entry)) { seen.add(entry); out.push(entry); }
-    }
-    if (out.length > RELAY_CUSTOM_MAX) return '最多 ' + RELAY_CUSTOM_MAX + ' 个自定义反代（当前 ' + out.length + ' 个）';
-    return { value: out.join('\n') };
-  },
   adminPass(v) {
     // 以摘要前缀开头的密码会被误当成已哈希的值，直接拒绝
     if (v && String(v).startsWith('hopline-pbkdf2$')) return '密码不能以 hopline-pbkdf2$ 开头';
-  },
-  hostPort(v) {
-    if (!v) return;
-    const { host, port } = parseHostPort(v, 443);
-    if (!host) return '缺少主机名';
-    if (!(port >= 1 && port <= 65535)) return '端口须为 1 - 65535';
-  },
-  proxy(v) {
-    if (!v) return;
-    const p = parseProxyAddress(v);
-    if (!p || !p.host) return '无法解析出站代理地址（格式如 socks5://user:pass@1.2.3.4:1080）';
-    if (!(p.port >= 1 && p.port <= 65535)) return '出站代理端口须为 1 - 65535';
-    if (p.type === 'ss') {
-      if (!ssCipherAlgo(p.method)) return 'SS 加密方式仅支持 ' + SS_METHODS.join(' / ');
-      if (!p.password) return 'SS 缺少密码';
-    }
   },
 };
 
@@ -310,9 +271,6 @@ function crossCheckConfig(cfg) {
   const errors = [];
   if (!cfg['enableVl' + 'ess'] && !cfg.enableXhttp) {
     errors.push({ field: 'enableVless', label: '协议开关', msg: '至少启用一种协议，否则订阅中没有任何节点' });
-  }
-  if (cfg.relay && cfg.relay.mode === 'custom' && !String(cfg.relay.custom || '').trim()) {
-    errors.push({ field: 'relay.custom', label: '自定义反代列表', msg: '已选择「仅使用自定义反代」，请至少填写一个反代地址（或改回内置 / 关闭）' });
   }
   for (const n of [1, 2]) {
     const s = cfg.ipsrc || {};

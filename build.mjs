@@ -1,30 +1,31 @@
 #!/usr/bin/env node
-// 构建脚本：把 src/ 下的源文件合并为可直接粘贴部署的单文件 Hopline.js
+// 构建脚本：把 src/ 下的源文件合并为两个可直接粘贴部署的单文件脚本
 //
-//   node build.mjs          生成 Hopline.js、dist/panel.html 与 dist/clash-template.yaml
-//   node build.mjs --check  仅校验这三个产物是否与 src/ 同步（CI 使用，不同步时退出码 1）
+//   node build.mjs          生成 Hopline-proxy.js（代理）与 Hopline-panel.js（面板 + 订阅）
+//   node build.mjs --check  仅校验这两个产物是否与 src/ 同步（CI 使用，不同步时退出码 1）
 //
+// 两个脚本互不依赖，各自由一个入口文件按 // @include worker/xxx.js 的清单拼接而成：
+//   src/proxy-worker.js  代理：环境变量配置，只处理节点路径上的 WebSocket / XHTTP，其余返回伪装页
+//   src/panel-worker.js  面板：登录、管理 API、订阅生成；面板页面、登录页与 Clash 模板内嵌在脚本里
 // 处理流程：
-//   1. 合并 src/worker.js 中的  // @include worker/xxx.js  （保持模块级顺序，保留注释与原始名称）
-//   2. 把登录页内联进 worker；面板 HTML / CSS / JS 合并成 dist/panel.html（按语言各自去掉注释，保留 @HOPLINE_ 占位注释），
-//      它不再内嵌进 Worker：Worker 运行时按版本标签 v<VERSION> 从 jsDelivr / GitHub 拉取并校验 SHA-256，
-//      该哈希在此处计算并写进 Worker（/* @panel-sha256 */ 占位）
-//   3. Clash 配置模板 src/worker/clash-template.yaml 同样不内嵌：原样复制为 dist/clash-template.yaml，
-//      Worker 运行时按版本标签拉取并校验 SHA-256（/* @clash-sha256 */ 占位）
-//   4. 顶部加一行版本横幅 /*!Hopline vX.Y.Z*/，供旧版「检测更新」从远端文件解析版本号
+//   1. 合并入口文件中的  // @include worker/xxx.js  （保持模块级顺序，保留注释与原始名称）
+//   2. /* @inline 文件 */ '' 占位符替换为 String.raw 模板字符串：登录页、面板页面（HTML / CSS / JS 合并并按语言各自去掉注释，
+//      保留 @HOPLINE_ 占位注释）和 Clash 配置模板
+//   3. 顶部加一行版本横幅 /*!Hopline-proxy vX.Y.Z*/ / /*!Hopline-panel vX.Y.Z*/（版本号取自 src/worker/update.js 的 VERSION，两者同号）
 //
-// Hopline.js 不再经 terser 压缩/重命名：内容即 src/ 原样拼接（如需混淆发布，见 obfuscate.mjs）。
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+// 产物不经压缩/重命名：内容即 src/ 原样拼接。代理脚本如需混淆发布，见 obfuscate.mjs（面板脚本不提供混淆版）。
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const SRC = join(ROOT, 'src');
-const OUT = join(ROOT, 'Hopline.js');
-const PANEL_OUT = join(ROOT, 'dist', 'panel.html');   // 面板页面成品：按版本标签发布，由 Worker 运行时拉取
-const CLASH_SRC = join(SRC, 'worker', 'clash-template.yaml');
-const CLASH_OUT = join(ROOT, 'dist', 'clash-template.yaml');   // Clash 配置模板成品：同上
+// 两个产物：入口文件（src/ 下）→ 输出文件（仓库根目录）
+export const TARGETS = {
+  proxy: { entry: 'proxy-worker.js', out: 'Hopline-proxy.js', banner: 'Hopline-proxy' },
+  panel: { entry: 'panel-worker.js', out: 'Hopline-panel.js', banner: 'Hopline-panel' },
+};
+const VERSION_FILE = join(SRC, 'worker', 'update.js');   // VERSION 常量所在文件（面板脚本包含它；两个产物共用同一个版本号）
 const KEEP_COMMENT = /@HOPLINE_/;          // 内联面板代码时唯一保留的注释（运行时占位符）
 
 function read(path) {
@@ -113,65 +114,54 @@ function expandWorker(text, file) {
   });
 }
 
-// 面板页面成品（HTML + CSS + JS 合并、去注释，运行时占位符原样保留）。Worker 校验的就是这份内容的 SHA-256
-export function assemblePanel() {
-  const text = loadPanel(join(SRC, 'panel/panel.html'));
-  return text.endsWith('\n') ? text : text + '\n';
-}
-const sha256Of = (text) => createHash('sha256').update(text, 'utf8').digest('hex');
-export function panelSha256(text = assemblePanel()) { return sha256Of(text); }
-
-// Clash 配置模板成品（原样复制；Worker 校验的就是这份内容的 SHA-256）
-export function assembleClash() { return read(CLASH_SRC); }
-export function clashSha256(text = assembleClash()) { return sha256Of(text); }
-
-// 合并出完整源码（含 worker 注释、登录页已去注释、保留 import / export）。这也是 Hopline.js 的内容。
+// 合并出某个目标的完整源码（保留 import / export 与 worker 注释；@inline 的内嵌内容已去注释）。这也是产物的内容（不含版本横幅）。
 // 测试用它取内部纯函数（这些函数不对外导出，无法直接 import，需借 Function() 在作用域内求值取出）。
-export function assemble() {
-  const entry = join(SRC, 'worker.js');
-  const worker = expandWorker(read(entry), entry);
-  const out = worker
-    .replace(/\/\*\s*@panel-sha256\s*\*\/\s*''/g, () => `'${panelSha256()}'`)
-    .replace(/\/\*\s*@clash-sha256\s*\*\/\s*''/g, () => `'${clashSha256()}'`)
+export function assemble(kind = 'panel') {
+  const t = TARGETS[kind];
+  if (!t) throw new Error('未知构建目标：' + kind);
+  const entry = join(SRC, t.entry);
+  const out = expandWorker(read(entry), entry)
     .replace(/\/\*\s*@inline\s+(\S+)\s*\*\/\s*''/g, (_, name) => {
       const text = loadPanel(join(SRC, name));
       if (text.includes('`')) throw new Error(`${name}: 内联内容不能包含反引号 \``);
       if (text.includes('${')) throw new Error(`${name}: 内联内容不能包含 \${`);
       return 'String.raw`\n' + text + '`';
     });
-  if (/@inline|@panel-sha256|@clash-sha256/.test(out.replace(/\/\/.*$/gm, ''))) throw new Error('存在未处理的 @inline / @panel-sha256 / @clash-sha256 标记');
+  if (/@inline/.test(out.replace(/\/\/.*$/gm, ''))) throw new Error(`${t.entry}: 存在未处理的 @inline 标记`);
   return out;
 }
 
-function versionOf(src) {
-  const m = src.match(/const\s+VERSION\s*=\s*['"]([^'"]+)['"]/);
-  if (!m) throw new Error('未在源码中找到 VERSION');
+export function versionOf() {
+  const m = read(VERSION_FILE).match(/const\s+VERSION\s*=\s*['"]([^'"]+)['"]/);
+  if (!m) throw new Error('未在 src/worker/update.js 中找到 VERSION');
   return m[1];
 }
 
 // 生成部署文件（CRLF，与仓库历史一致）：src/ 原样拼接，只加版本横幅，不做压缩/重命名
-export function build() {
-  const src = assemble();
-  const version = versionOf(src);
-  const code = `/*!Hopline v${version}*/\n${src}`.replace(/\n+$/, '');
+export function build(kind = 'panel') {
+  const src = assemble(kind);
+  const code = `/*!${TARGETS[kind].banner} v${versionOf()}*/\n${src}`.replace(/\n+$/, '');
   return (code + '\n').replace(/\n/g, '\r\n');
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
-  const code = build();
-  const outputs = [[PANEL_OUT, assemblePanel()], [CLASH_OUT, assembleClash()]];
+  const kinds = Object.keys(TARGETS);
   if (process.argv.includes('--check')) {
-    const stale = [OUT, ...outputs.map(([f]) => f)].filter((f, i) => (existsSync(f) ? readFileSync(f, 'utf8') : '') !== (i === 0 ? code : outputs[i - 1][1]));
+    const stale = kinds.filter((k) => {
+      const f = join(ROOT, TARGETS[k].out);
+      return (existsSync(f) ? readFileSync(f, 'utf8') : '') !== build(k);
+    }).map((k) => TARGETS[k].out);
     if (stale.length) {
-      console.error('Hopline.js / dist/ 下的构建产物与 src/ 不同步：请运行 `node build.mjs` 并提交生成结果。不同步的文件：' + stale.map(f => f.slice(ROOT.length + 1)).join('、'));
+      console.error('构建产物与 src/ 不同步：请运行 `node build.mjs` 并提交生成结果。不同步的文件：' + stale.join('、'));
       process.exit(1);
     }
-    console.log('Hopline.js、dist/panel.html 与 dist/clash-template.yaml 同步。');
+    console.log(kinds.map((k) => TARGETS[k].out).join('、') + ' 与 src/ 同步。');
   } else {
-    writeFileSync(OUT, code);
-    mkdirSync(dirname(PANEL_OUT), { recursive: true });
-    for (const [f, text] of outputs) writeFileSync(f, text);
-    console.log(`已生成 Hopline.js（${code.length} 字符）、dist/panel.html（${outputs[0][1].length} 字符，sha256 ${sha256Of(outputs[0][1]).slice(0, 12)}…）与 dist/clash-template.yaml（${outputs[1][1].length} 字符，sha256 ${sha256Of(outputs[1][1]).slice(0, 12)}…）`);
+    for (const k of kinds) {
+      const code = build(k);
+      writeFileSync(join(ROOT, TARGETS[k].out), code);
+      console.log(`已生成 ${TARGETS[k].out}（${code.length} 字符）`);
+    }
   }
 }

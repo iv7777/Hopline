@@ -426,3 +426,72 @@ function findBytes(hay, needle) {
   return -1;
 }
 
+// Base64 编码（出站 HTTP 代理认证用）
+function b64FromBytes(bytes) {
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+// 出站代理地址解析：socks5:// / http(s):// / ss:// 或 host:port，可带 user:pass@
+function parseProxyAddress(addr) {
+  if (!addr) return null;
+  let type = 'socks5', rest = String(addr).trim();
+  const m = rest.match(/^(socks5|http|https|ss):\/\/(.+)$/i);
+  if (m) { type = m[1].toLowerCase(); rest = m[2]; }
+  if (type === 'ss') return parseSsProxy(rest);
+  let user = '', pass = '';
+  if (rest.includes('@')) {
+    // 以最后一个 @ 分隔凭据与主机：密码中未编码的 @ 不会把主机名截断
+    const at = rest.lastIndexOf('@');
+    const u = rest.slice(0, at), h = rest.slice(at + 1);
+    // 用户名/密码可能经 URL 编码（含 %40/@、%28/() 等特殊字符时），需解码后再用于认证，
+    // 否则 socks5 用户名密码 / HTTP Basic 认证会失败
+    const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
+    const idx = u.indexOf(':');
+    if (idx >= 0) { user = dec(u.slice(0, idx)); pass = dec(u.slice(idx + 1)); }
+    else user = dec(u);
+    rest = h;
+  }
+  const defaultPort = type === 'http' ? 80 : type === 'https' ? 443 : 1080;
+  const { host, port } = parseHostPort(rest, defaultPort);
+  return { type, host, port, user, pass };
+}
+
+// SS 出站解析：SIP002（ss://method:password@host:port#name 或 ss://BASE64(method:password)@host:port#name）
+// 及旧格式 ss://BASE64(method:password@host:port)（整段无 @）。密码支持 percent-encoding。
+function parseSsProxy(rest) {
+  let hostPort = rest, userinfo = '';
+  const hashIdx = rest.indexOf('#');
+  if (hashIdx >= 0) hostPort = rest.slice(0, hashIdx);
+  const atIdx = hostPort.lastIndexOf('@');
+  if (atIdx >= 0) { userinfo = hostPort.slice(0, atIdx); hostPort = hostPort.slice(atIdx + 1); }
+  else {
+    const dec = b64ToUtf8(hostPort);   // 旧格式：整段 BASE64(method:password@host:port)
+    if (dec && dec.includes('@')) {
+      const at2 = dec.lastIndexOf('@');
+      userinfo = dec.slice(0, at2); hostPort = dec.slice(at2 + 1);
+    }
+  }
+  let method = '', password = '';
+  if (userinfo) {
+    let ui = b64ToUtf8(userinfo) || userinfo;   // SIP002 userinfo 可为 BASE64(method:password) 或明文
+    try { ui = decodeURIComponent(ui); } catch (e) { /* 保持原样 */ }
+    const ci = ui.indexOf(':');
+    if (ci > 0) { method = ui.slice(0, ci); password = ui.slice(ci + 1); }
+    else method = ui;
+  }
+  const { host, port } = parseHostPort(hostPort, 8388);
+  return { type: 'ss', host, port, method, password };
+}
+function b64ToUtf8(s) {
+  try {
+    const bin = atob(String(s).replace(/-/g, '+').replace(/_/g, '/'));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder('utf-8').decode(bytes);
+  } catch (e) { return null; }
+}

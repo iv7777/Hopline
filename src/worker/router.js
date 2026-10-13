@@ -56,8 +56,8 @@ const AUTH_MAX_MS = 7 * 24 * 60 * 60 * 1000;
 const AUTH_REFRESH_MIN_MS = 10 * 60 * 1000;   // 新有效期至少比当前晚 10 分钟才重新签发（连续操作时不必每个请求都换 Cookie）
 // 当前生效的管理用户名（KV 中为空等异常情况回落默认 admin）
 function adminUserOf(cfg) { return String(cfg.adminUser || '') || 'admin'; }
-// 会话签名密钥含用户名：修改用户名与修改密码一样，使其它浏览器的登录态失效
-function authKey(cfg) { return 'hopline-auth|' + String(cfg.admin) + '|' + String(cfg.uuid) + '|' + adminUserOf(cfg); }
+// 会话签名密钥含用户名：修改用户名与修改密码一样，使其它浏览器的登录态失效（代理端点的 UUID 等与登录无关，不参与）
+function authKey(cfg) { return 'hopline-auth|' + String(cfg.admin) + '|' + adminUserOf(cfg); }
 // iat：登录时间（续期时沿用，保证 7 天上限从首次登录算起）；返回 { token, exp }
 async function makeAuthToken(cfg, iat) {
   const now = Date.now();
@@ -140,6 +140,7 @@ function publicConfig(cfg, env) {
   delete out.admin;
   out.path = cfg.path;                              // 环境变量 PATH 提供（面板中只读）
   out.panelPath = cfg.path;                         // 当前生效的面板路径
+  out.endpointMissing = endpointMissing(cfg);       // 尚未填写的代理端点字段（空数组 = 可以生成订阅）
   out.envLocked = envLockedFields(env);             // { 字段: 环境变量名 }：面板中只读
   out.kv = !!(kvStore(env) && typeof kvStore(env).put === 'function');
   out.builtinPrefDomains = DEFAULT_PREFERRED_DOMAINS.split('\n');   // 面板「载入内置列表」使用
@@ -154,47 +155,35 @@ function formatConfigErrors(errors) {
 }
 
 // 生成订阅：/sub 与面板预览共用同一流程，保证预览与客户端实际拿到的一致
-async function serveSubscription(request, env, cfg, fmt) {
+async function serveSubscription(request, cfg, fmt) {
   const UA = request.headers.get('User-Agent') || '';
-  return generateSubscription(env, Object.assign({}, cfg), request.url, fmt, UA);
+  return generateSubscription(Object.assign({}, cfg), fmt, UA);
 }
 
-// 必填环境变量检查：返回说明文字（有问题时），否则空串。PATH 必填；ADMIN 必填（缺失时面板与管理接口禁用，见面板入口处的提示）；
-// UUID 可选——未绑定 KV 时没有地方保存自动生成的 UUID，此时必须手动设置
+// 必填环境变量检查：返回说明文字（有问题时），否则空串。PATH 必填；ADMIN 必填（缺失时面板与管理接口禁用，见面板入口处的提示）
 function setupProblems(env, cfg) {
-  const lines = [];
-  if (!cfg.path) {
-    lines.push(cfg._pathError
-      ? '环境变量 PATH 的值不正确：' + cfg._pathError + '。'
-      : 'Hopline 尚未完成配置：请在 Worker 环境变量中设置 PATH（面板、订阅与节点共用的访问路径，如 mypanel）和 ADMIN（管理密码），然后重新访问。从旧版升级时：旧版的默认路径就是 UUID，把 PATH 设为原来的 UUID（或之前用 D 设置的路径）即可保持节点与订阅地址不变。');
-  }
-  if (cfg._uuidUnsaved) lines.push('未绑定 KV 命名空间（绑定变量名 CONFIG_KV）时，必须设置环境变量 UUID（节点用户 ID）；绑定 KV 后可留空，系统会自动生成并保存。');
-  return lines.join('\n');
+  if (cfg.path) return '';
+  return cfg._pathError
+    ? '环境变量 PATH 的值不正确：' + cfg._pathError + '。'
+    : 'Hopline 面板尚未完成配置：请在 Worker 环境变量中设置 PATH（面板与订阅的访问路径，如 mypanel）和 ADMIN（管理密码），然后重新访问。';
 }
 
-// 路径不对（根路径、未知路由）时返回一个普通的 Hello World 页面作为伪装：
-// 看起来像个占位站点，既不暴露面板路径 / UUID，也不返回 404 引人注意
-function helloPage() {
-  return new Response('<!doctype html><html><head><meta charset="utf-8"><title>Hello World</title></head><body><h1>Hello World !</h1></body></html>',
-    { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+// 代理端点（订阅里的节点指向哪里）：域名、UUID、节点路径三项都填了才能生成订阅。返回尚未填写的字段名
+function endpointMissing(cfg) {
+  return [['host', '代理域名'], ['uuid', '代理 UUID'], ['nodePath', '代理节点路径']].filter(([k]) => !cfg[k]).map(([, label]) => label);
 }
 
 async function handleRequest(request, env, state) {
   const url = new URL(request.url);
   const UA = request.headers.get('User-Agent') || '';
-  const upgrade = (request.headers.get('Upgrade') || '').toLowerCase();
 
-  // HTTP → HTTPS（WebSocket 升级除外：明文端口节点 80/8080 等以 http 到达，重定向会让其永远无法连接）
-  if (url.protocol === 'http:' && upgrade !== 'websocket') {
+  // HTTP → HTTPS
+  if (url.protocol === 'http:') {
     return Response.redirect(url.href.replace('http://', 'https://'), 301);
   }
 
   const cfg = await loadConfig(env);
-  // 配置存储异常且环境变量没有提供有效 UUID：此时拿不到真实的 UUID，继续处理只会让所有节点和登录失效，直接返回 503
-  if (cfg._kvError && !envUuid(env)) {
-    return new Response('配置存储暂不可用，请稍后重试', { status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '30' } });
-  }
-  // 必填项缺失：PATH（面板 / 订阅 / 节点的访问路径）未设置或非法，或没有 UUID 又无处保存。没有路径就无法路由任何请求，统一返回设置说明
+  // 必填项缺失：PATH（面板与订阅的访问路径）未设置或非法。没有路径就无法路由任何请求，统一返回设置说明
   const setupMsg = setupProblems(env, cfg);
   if (setupMsg) return new Response(setupMsg, { status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } });
   const panelPath = cfg.path;
@@ -204,7 +193,7 @@ async function handleRequest(request, env, state) {
   // ---------- 版本接口（仅登录后可用；公开会让扫描器识别部署与版本） ----------
   if (segs[0] === 'version') {
     if (!(await requireAuth(request, cfg, state))) return new Response('Not Found', { status: 404 });
-    return json({ version: VERSION, obfuscated: IS_OBFUSCATED });
+    return json({ version: VERSION });
   }
 
   // ---------- 登录 ----------
@@ -238,9 +227,9 @@ async function handleRequest(request, env, state) {
     return new Response(loginHTML, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
-  // 订阅入口：自定义订阅路径（如 /AAZ/sub），留空则为 /<UUID>/sub（面板路径自定义时也是 UUID）；
-  // 面板路径下的 /sub 继续可用（兼容已导入的旧订阅地址）。
-  // 面板入口、管理 API 与代理入口只认 panelPath，订阅入口下不开放面板与管理接口
+  // 订阅入口：自定义订阅路径（如 /AAZ/sub），留空则为 /<UUID>/sub（UUID 即代理 UUID）；
+  // 面板路径下的 /sub 始终可用。
+  // 面板入口与管理 API 只认 panelPath，订阅入口下不开放面板与管理接口
   const subAlias = String(cfg.subUrl || '').trim().replace(/^\/+/, '').replace(/\/+$/, '');
   const subRoot = subAlias || cfg.uuid;
   const isPanelRoot = segs[0] === panelPath;
@@ -251,24 +240,11 @@ async function handleRequest(request, env, state) {
     return helloPage();
   }
 
-  // ---------- 代理：WebSocket / xhttp ----------
-  if (isPanelRoot && segs.length === 1) {
-    if (upgrade === 'websocket') {
-      return handleWebSocketProxy(request, cfg);
-    }
-    if (request.method === 'POST') {
-      if (cfg.enableXhttp) {
-        try { return await handleXhttpProxy(request, cfg); }
-        catch (e) { return json({ ok: false, msg: 'xhttp 代理错误: ' + (e.message || e) }, 500); }
-      }
-    }
-  }
-
   // ---------- 订阅 ----------
   if (isSubRoot && (segs[1] === 'sub' || (segs.length === 1 && !isBrowserUA(UA)))) {
     const fmt = segs.length >= 3 ? segs[2] : '';
     try {
-      const sub = await serveSubscription(request, env, cfg, fmt);
+      const sub = await serveSubscription(request, cfg, fmt);
       return new Response(sub.body, { status: 200, headers: { 'Content-Type': sub.type + '; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Disposition': 'attachment; filename="Hopline"; filename*=utf-8\'\'Hopline' } });
     } catch (e) {
       const status = (e && e.status) || 500;
@@ -284,9 +260,7 @@ async function handleRequest(request, env, state) {
     if (!(await requireAuth(request, cfg, state))) {
       return Response.redirect(new URL('/login?next=' + encodeURIComponent('/' + panelPath), request.url).href, 302);
     }
-    const page = await panelPage(env);
-    if (!page) return panelUnavailable();
-    return new Response(page, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+    return new Response(panelPage(), { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
   }
 
   // ---------- API ----------
@@ -355,7 +329,7 @@ async function handleRequest(request, env, state) {
     }
 
     if (apiName === 'status') {
-      return json({ ok: true, data: { version: VERSION, obfuscated: IS_OBFUSCATED, host: url.hostname, path: panelPath, region: (request.cf && request.cf.colo) || 'unknown', kv: !!(kvStore(env) && typeof kvStore(env).get === 'function'), workersDev: /\.workers\.dev$/i.test(url.hostname) } });
+      return json({ ok: true, data: { version: VERSION, host: url.hostname, path: panelPath, region: (request.cf && request.cf.colo) || 'unknown', kv: !!(kvStore(env) && typeof kvStore(env).get === 'function'), workersDev: /\.workers\.dev$/i.test(url.hostname) } });
     }
 
     if (apiName === 'update') {
@@ -402,7 +376,7 @@ async function handleRequest(request, env, state) {
     if (apiName === 'sub') {
       const fmt = url.searchParams.get('fmt') || '';
       try {
-        const sub = await serveSubscription(request, env, cfg, fmt);
+        const sub = await serveSubscription(request, cfg, fmt);
         return json({ ok: true, type: sub.type, body: sub.body, count: sub.count });
       } catch (e) { return json({ ok: false, msg: '订阅生成失败: ' + (e.message || e) }, (e && e.status) || 500); }
     }

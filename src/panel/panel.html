@@ -35,7 +35,8 @@
     <span class="pill" id="connPill"><span class="dot"></span><span id="connText">连接中</span></span>
     <button class="icon-btn" id="themeBtn" title="切换主题：跟随系统 / 日间 / 夜间"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path id="themeIcon" d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
   </div>
-  <div class="wdwarn" id="wdwarn">当前运行在 *.workers.dev 域名上：订阅与节点下发功能正常；若遇连接不稳或访问受限，建议在 Cloudflare 面板绑定自定义域名后使用。</div>
+  <div class="wdwarn" id="wdwarn">当前运行在 *.workers.dev 域名上：面板与订阅功能正常；若客户端更新订阅失败或访问受限，建议在 Cloudflare 面板给面板 Worker 绑定自定义域名后使用。</div>
+  <div class="wdwarn" id="epwarn">尚未填写代理端点：<b id="epMissing"></b>。订阅需要知道代理脚本的域名、UUID 与节点路径，请到 <a href="#" onclick="switchView('account');return false">面板设置 → 代理端点</a> 填写。</div>
 
   <div class="content">
     <!-- ===== 视图：仪表盘 ===== -->
@@ -43,7 +44,7 @@
       <div class="card">
         <h3><span class="tick"></span>快速开始</h3>
         <ol class="steps">
-          <li><b>部署即用</b>：绑定域名后客户端订阅即可获得一批 Cloudflare 优选节点（优选域名与在线优选 IP 来源）；Clash / Mihomo 与 Sing-box 订阅已内置大陆直连分流规则（大陆应用、微软、苹果直连，国外服务走代理）。</li>
+          <li><b>填写代理端点</b>：在「面板设置 → 代理端点」填入代理脚本（Hopline-proxy.js）的域名、UUID 与节点路径，客户端订阅即可获得一批 Cloudflare 优选节点（优选域名与在线优选 IP 来源）；Clash / Mihomo 与 Sing-box 订阅已内置大陆直连分流规则（大陆应用、微软、苹果直连，国外服务走代理）。</li>
           <li><b>调优节点</b>：用本地工具（如 CloudflareSpeedTest）在自己的网络下测速，把最优 IP 列表托管成一个地址（纯 IP 行 / CSV），填入「优选配置 → 优选 IP 来源」的自定义优选 API；也可以在「优选配置 → 优选域名」换成自己的优选域名。</li>
           <li><b>检查来源</b>：在「优选配置 → 优选 IP 来源」开关各在线来源，点「测试」可立即查看该来源实时拉取到的 IP；单次订阅最多下发 500 个节点，保证在免费计划 10ms CPU 限制内稳定生成。</li>
         </ol>
@@ -143,8 +144,8 @@
       </div>
     </section>
 
-    <!-- ===== 视图：节点配置（协议 / TLS / ECH / 落地出站） ===== -->
-    <section class="view" data-view="nodes" data-title="节点配置" data-sub="代理协议、TLS/ECH 与落地出站（保存后立即生效）">
+    <!-- ===== 视图：节点配置（协议 / TLS / ECH） ===== -->
+    <section class="view" data-view="nodes" data-title="节点配置" data-sub="订阅里下发的协议、TLS 与 ECH（保存后立即生效）">
       <div class="grid3">
         <div class="card">
           <h3><span class="tick"></span>协议开关</h3>
@@ -166,42 +167,6 @@
           <div class="field" style="margin-bottom:0"><label>自定义 ECH DNS（DoH 地址，留空使用 https://223.5.5.5/dns-query）</label><input type="text" id="ech-dns" placeholder="https://223.5.5.5/dns-query" autocomplete="off"></div>
         </div>
         <p class="hint">开启后，链接类订阅（v2rayN / Shadowrocket 等）的 TLS 节点附带 ech 参数，Clash 订阅附带 ech-opts；Sing-box、Surge、Loon、Quantumult X 订阅不含 ECH。客户端需支持 ECH 才能生效。</p>
-      </div>
-      <div class="card">
-        <h3><span class="tick"></span>落地与出站</h3>
-        <div class="field"><label>反代 / 落地 IP（填写后作为固定出口优先使用；留空则直连失败后由地区反代兜底（见下方「内置地区反代」），格式 host 或 host:port）</label><input type="text" id="s-proxyIP" placeholder="留空则直连失败后走地区反代" autocomplete="off"></div>
-        <div class="field"><label>出站代理（可选）</label><input type="text" id="s-outbound" placeholder="socks5://user:pass@1.2.3.4:1080 或 ss://chacha20-ietf-poly1305:密码@1.2.3.4:8388" autocomplete="off"></div>
-        <p class="hint">支持 socks5://（可带 user:pass@）、http(s)://、ss:// 或 host:port（默认按 socks5，端口 1080）。SS 加密支持 aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305。未填写出站代理时，三种出站方式都按直连处理。</p>
-        <div class="field" style="margin-bottom:0"><label>出站方式</label>
-          <select id="s-outmode">
-            <option value="">默认（先走代理，失败后直连 / 地区反代）</option>
-            <option value="no">直连 / 地区反代优先，都不通再走代理（no）</option>
-            <option value="only">仅走代理，失败后只用地区反代、不直连（only）</option>
-          </select>
-        </div>
-      </div>
-      <div class="card">
-        <h3><span class="tick"></span>内置地区反代</h3>
-        <p class="hint" style="margin-top:0">直连不通（例如目标站同在 Cloudflare 上）时，Worker 会把 TLS 流量交给地区反代按 SNI 转发，并与直连并发竞速。反代是第三方服务器，能看到目标域名与连接元数据；不想经第三方时选「关闭」，或改用自己的反代。非 TLS 流量不会走地区反代。</p>
-        <div class="field"><label>地区反代模式</label>
-          <select id="rl-mode" onchange="onRelayMode()">
-            <option value="builtin">内置（proxyip.*.cmliussss.net，按 Worker 机房自动选地区）</option>
-            <option value="custom">仅使用我的反代列表</option>
-            <option value="off">关闭（只直连 / 出站代理）</option>
-          </select>
-        </div>
-        <div id="rl-builtin-box">
-          <div class="inrow">
-            <div class="field" style="flex:1;margin-bottom:0"><label>首选地区（取 2 个 IP）</label><select id="rl-region"></select></div>
-            <div class="field" style="flex:1;margin-bottom:0"><label>次选地区（取 1 个 IP）</label><select id="rl-region2"></select></div>
-          </div>
-          <div class="hint">首选留空 = 按 Worker 所在机房自动选择；次选留空 = 默认的另一地区（首选为 HK 时用 US，否则用 HK），选「不使用」则只用首选地区。</div>
-        </div>
-        <div class="field" id="rl-custom-box" style="margin-bottom:0">
-          <label>自定义反代列表（每行一个 host 或 host:port，最多 3 个，IPv6 需加方括号）</label>
-          <textarea id="rl-custom" rows="3" placeholder="proxyip.example.com&#10;203.0.113.10:443" autocomplete="off"></textarea>
-          <div class="hint">域名按 TXT / A 记录解析（与「反代 / 落地 IP」相同，缓存 5 分钟）；多个条目并发竞速。「反代 / 落地 IP」仍然优先于这里。</div>
-        </div>
       </div>
       <div class="card">
         <h3><span class="tick"></span>保存与生效</h3>
@@ -243,25 +208,31 @@
     </section>
 
     <!-- ===== 视图：面板设置 ===== -->
-    <section class="view" data-view="account" data-title="面板设置" data-sub="部署基础信息：UUID、面板路径（PATH）、管理用户名与密码、绑定域名">
+    <section class="view" data-view="account" data-title="面板设置" data-sub="代理端点（域名、UUID、节点路径）、面板路径（PATH）、管理用户名与密码">
       <div class="card">
-        <h3><span class="tick"></span>基础配置</h3>
-        <div class="field"><label>UUID（订阅节点身份；环境变量 UUID 留空时已自动生成）</label>
+        <h3><span class="tick"></span>代理端点</h3>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">订阅里的节点指向哪里：填写代理脚本（Hopline-proxy.js）所在的域名，以及它的环境变量 UUID 与 PATH。面板与代理之间没有任何联系，这三项只用来生成节点链接，三项都填了才能生成订阅。</p>
+        <div class="field"><label>代理域名（节点 SNI / Host，如 node.example.com）</label><input type="text" id="a-host" placeholder="node.example.com" autocomplete="off"></div>
+        <div class="field"><label>代理 UUID（须与代理脚本的环境变量 UUID 相同）</label>
           <div class="inrow">
             <input type="text" id="a-uuid" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
             <button class="btn sm" onclick="genUuid()">生成</button>
           </div>
         </div>
-        <div class="field"><label>面板路径（环境变量 PATH 设置，面板中只读）</label><input type="text" id="a-path" autocomplete="off"><div class="hint">面板、订阅与节点（WebSocket / XHTTP）共用此路径；修改请到 Worker 环境变量 PATH，修改后节点路径随之改变，客户端需重新更新订阅。</div></div>
-        <div class="field"><label>自定义订阅路径（只填一段，如 AAZ → /AAZ/sub；留空为 /UUID/sub）</label><input type="text" id="a-suburl" placeholder="AAZ" autocomplete="off"></div>
+        <div class="field" style="margin-bottom:0"><label>代理节点路径（须与代理脚本的环境变量 PATH 相同）</label><input type="text" id="a-nodepath" placeholder="mynode" autocomplete="off"></div>
+        <p class="hint" style="margin-top:10px">XHTTP 协议要求代理使用自定义域名（在 Cloudflare 面板 → Workers 与 Pages → 代理 Worker → Domains &amp; Routes 添加）。「生成」只是在这里生成一个 UUID，需要自己把它填进代理脚本的环境变量 UUID。</p>
+      </div>
+      <div class="card">
+        <h3><span class="tick"></span>基础配置</h3>
+        <div class="field"><label>面板路径（环境变量 PATH 设置，面板中只读）</label><input type="text" id="a-path" autocomplete="off"><div class="hint">面板与订阅共用此路径（与代理的节点路径互相独立）；修改请到面板 Worker 的环境变量 PATH，修改后订阅地址随之改变，客户端需重新添加订阅。</div></div>
+        <div class="field"><label>自定义订阅路径（只填一段，如 AAZ → /AAZ/sub；留空为 /代理 UUID/sub）</label><input type="text" id="a-suburl" placeholder="AAZ" autocomplete="off"></div>
         <div class="field"><label>管理用户名（登录时需要；留空为 admin，区分大小写）</label><input type="text" id="a-adminuser" placeholder="admin" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
-        <div class="field"><label>管理密码（留空保持不变；未设置时面板禁用）</label><input type="password" id="a-admin" placeholder="设置后访问面板需登录" autocomplete="new-password"></div>
-        <div class="field" style="margin-bottom:0"><label>绑定域名（留空使用当前访问的域名）</label><input type="text" id="a-host" placeholder="node.example.com" autocomplete="off"></div>
-        <p class="hint" style="margin-top:10px">「绑定域名」仅用于订阅节点主机名（XHTTP 协议要求绑定自定义域名），不负责域名解析。自定义域名访问面板需先在 Cloudflare 面板 → Workers 与 Pages → 该 Worker → Domains &amp; Routes 添加自定义域名（DNS 由 Cloudflare 托管，证书自动签发），此字段留空即使用你访问面板 / 订阅时的域名。未绑定 KV（绑定变量名 CONFIG_KV）时无法保存面板配置，只有环境变量生效。</p>
+        <div class="field" style="margin-bottom:0"><label>管理密码（留空保持不变；未设置时面板禁用）</label><input type="password" id="a-admin" placeholder="设置后访问面板需登录" autocomplete="new-password"></div>
+        <p class="hint" style="margin-top:10px">未绑定 KV（绑定变量名 CONFIG_KV）时无法保存面板配置，只有环境变量生效。自定义域名访问面板需先在 Cloudflare 面板 → Workers 与 Pages → 面板 Worker → Domains &amp; Routes 添加。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>备份与恢复</h3>
-        <p class="hint" style="margin-top:0;margin-bottom:12px">以 JSON 格式导出全部面板设置（含协议、优选、筛选），可保存到本地或迁移到其他部署；导入后请点右下角「保存全部」生效。<b>备份文件包含 UUID（节点身份，知道它即可使用你的节点），请妥善保管、不要分享；管理密码不会导出。</b></p>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">以 JSON 格式导出全部面板设置（含协议、优选、筛选），可保存到本地或迁移到其他部署；导入后请点右下角「保存全部」生效。<b>备份文件包含代理 UUID（节点身份，知道它即可使用你的节点），请妥善保管、不要分享；管理密码不会导出。</b></p>
         <div class="inrow">
           <button class="btn" onclick="exportConfig()">导出配置</button>
           <button class="btn" onclick="$('importFile').click()">导入配置</button>
@@ -270,7 +241,7 @@
       </div>
       <div class="card">
         <h3><span class="tick"></span>登录会话</h3>
-        <p class="hint" style="margin-top:0;margin-bottom:12px">登录状态保存在浏览器 Cookie 中：使用面板时自动顺延，24 小时未使用即失效；自登录起最长 7 天，到期需重新登录。退出只清除当前浏览器的登录状态；要让所有已签发的登录状态立即失效，请修改管理密码、管理用户名或 UUID。</p>
+        <p class="hint" style="margin-top:0;margin-bottom:12px">登录状态保存在浏览器 Cookie 中：使用面板时自动顺延，24 小时未使用即失效；自登录起最长 7 天，到期需重新登录。退出只清除当前浏览器的登录状态；要让所有已签发的登录状态立即失效，请修改管理密码或管理用户名。</p>
         <button class="btn" onclick="logout()">退出登录</button>
       </div>
       <div class="card">
@@ -297,9 +268,7 @@
             <tr><td>uouin 分线路优选（对方网站内部接口）</td><td class="mono">api.uouin.com/index.php/index/Cloudflare</td></tr>
             <tr><td>微测网优选（对方公开页面）</td><td class="mono">www.wetest.vip/page/cloudflare/address_v4.html · address_v6.html</td></tr>
             <tr><td>自定义优选 API 1 / 2、优选域名测试</td><td>你填写的地址 / 域名</td></tr>
-            <tr><td>DoH 解析（优选域名、反代域名、UDP DNS）</td><td class="mono">cloudflare-dns.com / dns.google / dns.alidns.com / doh.pub</td></tr>
-            <tr><td>内置地区反代（直连不通时使用）</td><td class="mono">proxyip.*.cmliussss.net</td></tr>
-            <tr><td>面板页面本身（Worker 在服务端拉取并校验 SHA-256，缓存后提供）</td><td class="mono">cdn.jsdelivr.net / fastly.jsdelivr.net / raw.githubusercontent.com 上 iv7777/Hopline 的版本标签</td></tr>
+            <tr><td>DoH 解析（优选域名）</td><td class="mono">cloudflare-dns.com / dns.google / dns.alidns.com / doh.pub</td></tr>
             <tr><td>版本更新检测</td><td class="mono">raw.githubusercontent.com/iv7777/Hopline/...</td></tr>
             <tr><td>面板二维码库（浏览器加载）</td><td class="mono">cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js（SRI 校验）</td></tr>
             <tr><td>订阅内的规则集与图标（由客户端下载）</td><td class="mono">cdn.jsdelivr.net（MetaCubeX、blackmatrix7）/ github.com（666OS、DustinWin）/ raw.githubusercontent.com（AWAvenue）/ rule.kelee.one</td></tr>

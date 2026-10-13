@@ -118,7 +118,6 @@ applyTheme();
 
 /* ===== 更新检测 ===== */
 var topVerText = 'v—';
-var verTag = '';   // 当前部署是否为混淆版，由 renderStatus() 按 /api/status 的 obfuscated 字段写入，checkUpdate() 重建版本号时沿用
 function legacyCopy(t){
   try {
     var ta = document.createElement('textarea');
@@ -159,7 +158,7 @@ function checkUpdate(){
     sv.classList.remove('checking');
     if (!r || !r.ok || !r.data) { sv.textContent = topVerText; toast('检测更新失败，请稍后重试', 'err'); return; }
     var d = r.data;
-    topVerText = 'v' + d.current + verTag;
+    topVerText = 'v' + d.current;
     sv.textContent = topVerText;
     if (d.hasUpdate && d.code) {
       sv.classList.add('has-update');
@@ -226,10 +225,15 @@ function renderStatus(d){
   $('aKv').textContent = kvTxt;
   $('aKv').className = 'v ' + (kv ? 'ok' : 'bad');
   var v = d.version || '—';
-  verTag = d.obfuscated ? ' · 混淆版' : '';
-  $('sideVer').textContent = 'v' + v + verTag;
-  topVerText = 'v' + v + verTag;
-  $('aVer').textContent = v + verTag;
+  $('sideVer').textContent = 'v' + v;
+  topVerText = 'v' + v;
+  $('aVer').textContent = v;
+}
+// 代理端点（域名 / UUID / 节点路径）没填全时在顶部提示
+function renderEndpoint(){
+  var miss = (CFG && CFG.endpointMissing) || [];
+  $('epwarn').style.display = miss.length ? 'block' : 'none';
+  $('epMissing').textContent = miss.join('、');
 }
 function protoText(){
   if (!CFG) return '—';
@@ -240,6 +244,7 @@ function protoText(){
 }
 function renderAll(){
   $('stProto').textContent = protoText();
+  renderEndpoint();
   rerenderIpTest();
 }
 /* ===== 配置表单：由服务端字段表 SCHEMA 驱动 =====
@@ -335,7 +340,6 @@ function fillForm(){
   if (!CFG) return;
   clearFieldErrors();
   SCHEMA.forEach(function(d){ fillField(d, getPath(CFG, d.key)); applyEnvLock(d); });
-  onRelayMode();
   updatePdCount();
 }
 function collectForm(){
@@ -415,8 +419,8 @@ function saveAll(){
         var oldPath = currentPanelPath();
         CFG = r.data;
         btn.classList.remove('dirty');
-        // 面板路径变更（改了面板路径，或路径跟随 UUID 且 UUID 已变）：跳转到新入口。
-        // 服务端已为新 UUID / 密码签发登录态，无需重新登录
+        // 面板路径变更（环境变量 PATH 已改）：跳转到新入口。
+        // 服务端已为新密码 / 用户名签发登录态，无需重新登录
         if (CFG.panelPath && CFG.panelPath !== oldPath){
           $('savedAt').textContent = '已保存，正在跳转到新的面板路径…';
           toast('已保存：面板路径已变更，正在跳转…', 'ok');
@@ -466,7 +470,7 @@ function genUuid(){
   $('a-uuid').value = u;
   clearFieldError($('a-uuid'));
   markDirty();
-  toast('已生成新 UUID', 'ok');
+  toast('已生成新 UUID：请同时填入代理脚本的环境变量 UUID', 'ok');
 }
 // 备份：把当前面板表单值收集成 JSON 下载（与保存配置同一套字段，恢复后可直接保存；不含密码与令牌）
 function exportConfig(){
@@ -815,27 +819,7 @@ function renderDomainTest(out, head, d){
   if (d.rawLength > d.raw.length || /未测试/.test(d.raw || '')) out.appendChild(mkEl('div', 'ipt-dim', (d.raw.split('\n').pop() || '')));
 }
 
-/* ===== 优选域名 / 内置地区反代 ===== */
-var RELAY_ZH = { HK: '香港', US: '美国', SG: '新加坡', JP: '日本', KR: '韩国', DE: '德国', SE: '瑞典', NL: '荷兰', FI: '芬兰', GB: '英国' };
-// 地区下拉框的选项来自服务端字段表（与 RELAY_DOMAINS 同源）
-function populateRelaySelects(){
-  [['rl-region', 'relay.region', '自动（按 Worker 机房）'], ['rl-region2', 'relay.region2', '自动（默认的另一地区）']].forEach(function(c){
-    var el = $(c[0]), d = SCHEMA_BY_KEY[c[1]];
-    if (!el || !d) return;
-    el.innerHTML = '';
-    d.options.forEach(function(o){
-      var op = document.createElement('option');
-      op.value = o;
-      op.textContent = o === '' ? c[2] : (o === 'none' ? '不使用' : (RELAY_ZH[o] ? o + ' ' + RELAY_ZH[o] : o));
-      el.appendChild(op);
-    });
-  });
-}
-function onRelayMode(){
-  var m = $('rl-mode').value;
-  $('rl-builtin-box').style.display = (m === 'builtin') ? '' : 'none';
-  $('rl-custom-box').style.display = (m === 'custom') ? '' : 'none';
-}
+/* ===== 优选域名 ===== */
 function updatePdCount(){
   var n = $('o-prefdomains').value.split(/[\n,;\s]+/).filter(function(x){ return x; }).length;
   var builtin = (CFG && CFG.builtinPrefDomains) ? CFG.builtinPrefDomains.length : 0;
@@ -854,7 +838,6 @@ $('tls-only').addEventListener('change', rerenderIpTest);
 $('ech-on').addEventListener('change', rerenderIpTest);
 /* ===== 启动 ===== */
 buildNav();
-populateRelaySelects();   // 先建好地区下拉选项（在 loadAll 回填表单之前）
 var initView = 'dashboard';
 try {
   var qv = new URLSearchParams(location.search).get('v');

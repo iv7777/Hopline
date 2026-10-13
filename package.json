@@ -2,12 +2,12 @@
   "name": "hopline",
   "private": true,
   "type": "module",
-  "description": "Hopline：Cloudflare Workers / Pages 代理订阅面板（src/ 为源码，Hopline.js 为构建产物）",
+  "description": "Hopline：Cloudflare Workers / Pages 代理（Hopline-proxy.js）与订阅面板（Hopline-panel.js）；src/ 为源码，两个脚本为构建产物",
   "scripts": {
     "build": "node build.mjs",
     "obfuscate": "node obfuscate.mjs",
-    "check": "node build.mjs --check && node --check Hopline.js",
+    "check": "node build.mjs --check && node --check Hopline-proxy.js && node --check Hopline-panel.js",
     "test": "node build.mjs --check && node --test",
-    "lint": "npx --yes eslint@10.1.0 -c eslint.config.mjs Hopline.js src/panel/panel.js"
+    "lint": "npx --yes eslint@10.1.0 -c eslint.config.mjs Hopline-proxy.js Hopline-panel.js src/panel/panel.js"
   }
 }

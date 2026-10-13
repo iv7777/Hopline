@@ -2,17 +2,6 @@
 // 工具函数
 // ---------------------------------------------------------------------------
 const TE = new TextEncoder();
-const TD = new TextDecoder();
-
-// Base64 编码（出站 HTTP 代理认证用）
-function b64FromBytes(bytes) {
-  let bin = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(bin);
-}
 
 // MD5（纯 JS 实现，RFC 1321；WebCrypto 不支持 MD5）
 const MD5_S = [
@@ -64,16 +53,6 @@ function md5Bytes(bytes) {
   [a0, b0, c0, d0].forEach((v, i) => ov.setUint32(i * 4, v, true));
   return out;
 }
-function md5hex(str) {
-  return Array.from(md5Bytes(TE.encode(String(str)))).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-function uuidv4() {
-  if (crypto.randomUUID) return crypto.randomUUID();
-  const b = crypto.getRandomValues(new Uint8Array(16));
-  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
-  return [...b].map((x, i) => (i === 4 || i === 6 || i === 8 || i === 10 ? '-' : '') + x.toString(16).padStart(2, '0')).join('');
-}
 function isUUID(str) {
   return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(str || '');
 }
@@ -104,96 +83,26 @@ function isValidIp(str) {
   if (hasDbl && (groups.length < 1 || groups.length > 7)) return false;
   return groups.every(g => /^[0-9a-fA-F]{1,4}$/.test(g));
 }
-function formatIPv6(bytes) {
-  const parts = [];
-  for (let i = 0; i < 16; i += 2) parts.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
-  // 简单压缩：连续 0 组用 ::，仅压缩最长段
-  let bestStart = -1, bestLen = 0, curStart = -1, curLen = 0;
-  for (let i = 0; i < 8; i++) {
-    if (parts[i] === '0') {
-      if (curStart < 0) { curStart = i; curLen = 1; } else curLen++;
-      if (curLen > bestLen) { bestLen = curLen; bestStart = curStart; }
-    } else { curStart = -1; curLen = 0; }
-  }
-  if (bestLen >= 2) {
-    const head = parts.slice(0, bestStart).join(':');
-    const tail = parts.slice(bestStart + bestLen).join(':');
-    return (head ? head + '::' : '::') + tail;
-  }
-  return parts.join(':');
+// 带超时的 fetch（手动 AbortController，兼容所有运行时）；超时 / 网络错误返回 null
+function fetchTimeout(url, opts, ms) {
+  return new Promise((resolve) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    fetch(url, Object.assign({}, opts, { signal: ctrl.signal }))
+      .then(r => { clearTimeout(timer); resolve(r); })
+      .catch(() => { clearTimeout(timer); resolve(null); });
+  });
 }
-function cidrToRange(cidr) {
-  const [ip, bits] = cidr.split('/');
-  const b = ip.split('.').map(Number);
-  const base = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
-  const mask = bits >= 32 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
-  const start = (base & mask) >>> 0;   // >>> 0 保证无符号：位运算结果可能为负（如 162.158.0.0），比较/加减前必须归一
-  const end = (base | (~mask >>> 0)) >>> 0;
-  return [start, end];
-}
-// CIDR 掩码表预编译：初始化时一次性把 CF 地址段编译为无符号整数区间数组，IP 校验变纯整数比较（性能提升数十倍，应对免费版 10ms CPU 硬限）
-const CLOUDFLARE_RANGES = CLOUDFLARE_CIDRS.map(cidrToRange);
-// 出站代理地址解析：socks5:// / http(s):// / ss:// 或 host:port，可带 user:pass@
-function parseProxyAddress(addr) {
-  if (!addr) return null;
-  let type = 'socks5', rest = String(addr).trim();
-  const m = rest.match(/^(socks5|http|https|ss):\/\/(.+)$/i);
-  if (m) { type = m[1].toLowerCase(); rest = m[2]; }
-  if (type === 'ss') return parseSsProxy(rest);
-  let user = '', pass = '';
-  if (rest.includes('@')) {
-    // 以最后一个 @ 分隔凭据与主机：密码中未编码的 @ 不会把主机名截断
-    const at = rest.lastIndexOf('@');
-    const u = rest.slice(0, at), h = rest.slice(at + 1);
-    // 用户名/密码可能经 URL 编码（含 %40/@、%28/() 等特殊字符时），需解码后再用于认证，
-    // 否则 socks5 用户名密码 / HTTP Basic 认证会失败
-    const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
-    const idx = u.indexOf(':');
-    if (idx >= 0) { user = dec(u.slice(0, idx)); pass = dec(u.slice(idx + 1)); }
-    else user = dec(u);
-    rest = h;
-  }
-  const defaultPort = type === 'http' ? 80 : type === 'https' ? 443 : 1080;
-  const { host, port } = parseHostPort(rest, defaultPort);
-  return { type, host, port, user, pass };
-}
-
-// SS 出站解析：SIP002（ss://method:password@host:port#name 或 ss://BASE64(method:password)@host:port#name）
-// 及旧格式 ss://BASE64(method:password@host:port)（整段无 @）。密码支持 percent-encoding。
-function parseSsProxy(rest) {
-  let hostPort = rest, userinfo = '';
-  const hashIdx = rest.indexOf('#');
-  if (hashIdx >= 0) hostPort = rest.slice(0, hashIdx);
-  const atIdx = hostPort.lastIndexOf('@');
-  if (atIdx >= 0) { userinfo = hostPort.slice(0, atIdx); hostPort = hostPort.slice(atIdx + 1); }
-  else {
-    const dec = b64ToUtf8(hostPort);   // 旧格式：整段 BASE64(method:password@host:port)
-    if (dec && dec.includes('@')) {
-      const at2 = dec.lastIndexOf('@');
-      userinfo = dec.slice(0, at2); hostPort = dec.slice(at2 + 1);
-    }
-  }
-  let method = '', password = '';
-  if (userinfo) {
-    let ui = b64ToUtf8(userinfo) || userinfo;   // SIP002 userinfo 可为 BASE64(method:password) 或明文
-    try { ui = decodeURIComponent(ui); } catch (e) { /* 保持原样 */ }
-    const ci = ui.indexOf(':');
-    if (ci > 0) { method = ui.slice(0, ci); password = ui.slice(ci + 1); }
-    else method = ui;
-  }
-  const { host, port } = parseHostPort(hostPort, 8388);
-  return { type: 'ss', host, port, method, password };
-}
-function b64ToUtf8(s) {
-  try {
-    const bin = atob(String(s).replace(/-/g, '+').replace(/_/g, '/'));
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return new TextDecoder('utf-8').decode(bytes);
-  } catch (e) { return null; }
-}
+// 限制缓存表大小：超出时淘汰最先插入的项（Map 按插入顺序遍历），避免长期运行的实例内存无限增长
+function capMap(map, max) { while (map.size > max) map.delete(map.keys().next().value); }
 
 function json(obj, status, headers) {
   return new Response(JSON.stringify(obj), { status: status || 200, headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, headers || {}) });
 }
 
+// 路径不对（根路径、未知路由）时返回一个普通的 Hello World 页面作为伪装：
+// 看起来像个占位站点，既不暴露路径 / UUID，也不返回 404 引人注意
+function helloPage() {
+  return new Response('<!doctype html><html><head><meta charset="utf-8"><title>Hello World</title></head><body><h1>Hello World !</h1></body></html>',
+    { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}

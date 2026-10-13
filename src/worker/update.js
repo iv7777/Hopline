@@ -1,13 +1,8 @@
-const VERSION = '2.5.3';
-// 本文件是否为混淆产物：obfuscate.mjs 按原文精确替换为 true（混淆后仍是这个布尔值，只是字面量的编码方式不同）。
-// 据此决定更新检测拉取哪个文件、面板上怎么标注当前部署——保证拉取与当前运行的是同一种
-const IS_OBFUSCATED = false;
-
+const VERSION = '3.0.0';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
-// 版本基准与复制的代码都是仓库 main 分支根目录下与当前部署同类型的文件（Hopline.js 或 obf_Hopline.js，按 IS_OBFUSCATED）；
-// obf_Hopline.js 在 Hopline.js 更新后由 CI 另行提交，会比 Hopline.js 晚几十秒，这段时间内混淆部署检测不到新版本
+// 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，也不暴露版本）
 const UPDATE_REPO = 'iv7777/Hopline';
-const UPDATE_FILE = IS_OBFUSCATED ? 'obf_Hopline.js' : 'Hopline.js';
+const UPDATE_FILE = 'Hopline-panel.js';
 let UPDATE_CACHE = null; // { t, r } 60 秒缓存
 
 function parseVer(v){
@@ -21,8 +16,8 @@ function cmpVer(a, b){
   return 0;
 }
 function extractVersion(txt){
-  // 部署文件顶部横幅：/*!Hopline vX.Y.Z*/，混淆文件为 /*!Hopline vX.Y.Z obfuscated:medium*/（混淆后 const VERSION 的写法不再可靠）
-  const b = txt.match(/Hopline v(\d+\.\d+\.\d+)/);
+  // 部署文件顶部横幅：/*!Hopline-panel vX.Y.Z*/
+  const b = txt.match(/Hopline-panel v(\d+\.\d+\.\d+)/);
   if (b) return b[1];
   // 回退：未压缩源码里的 const VERSION = 'x.y.z ...'
   const m = txt.match(/const\s+VERSION\s*=\s*['"]([^'"]+)['"]/);
