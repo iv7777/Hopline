@@ -22,7 +22,7 @@
 import { connect } from 'cloudflare:sockets';
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
-// @include worker/version.js
+// @include worker/version-proxy.js
 // @include worker/utils.js
 // @include worker/cf-ranges.js
 // @include worker/protocol.js

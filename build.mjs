@@ -11,7 +11,7 @@
 //   1. 合并入口文件中的  // @include worker/xxx.js  （保持模块级顺序，保留注释与原始名称）
 //   2. /* @inline 文件 */ '' 占位符替换为 String.raw 模板字符串：登录页、面板页面（HTML / CSS / JS 合并并按语言各自去掉注释，
 //      保留 @HOPLINE_ 占位注释）和 Clash 配置模板
-//   3. 顶部加一行版本横幅 /*!Hopline-proxy vX.Y.Z*/ / /*!Hopline-panel vX.Y.Z*/（版本号取自 src/worker/version.js 的 VERSION，两者同号）
+//   3. 顶部加一行版本横幅 /*!Hopline-proxy vX.Y.Z*/ / /*!Hopline-panel vX.Y.Z*/（各取自自己的 src/worker/version-proxy.js / version-panel.js 里的 VERSION：两个脚本各自编号、各自升版本）
 //
 // 产物不经压缩/重命名：内容即 src/ 原样拼接。代理脚本如需混淆发布，见 obfuscate.mjs（面板脚本不提供混淆版）。
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
@@ -22,10 +22,9 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 const SRC = join(ROOT, 'src');
 // 两个产物：入口文件（src/ 下）→ 输出文件（仓库根目录）
 export const TARGETS = {
-  proxy: { entry: 'proxy-worker.js', out: 'Hopline-proxy.js', banner: 'Hopline-proxy' },
-  panel: { entry: 'panel-worker.js', out: 'Hopline-panel.js', banner: 'Hopline-panel' },
+  proxy: { entry: 'proxy-worker.js', out: 'Hopline-proxy.js', banner: 'Hopline-proxy', version: 'version-proxy.js' },
+  panel: { entry: 'panel-worker.js', out: 'Hopline-panel.js', banner: 'Hopline-panel', version: 'version-panel.js' },
 };
-const VERSION_FILE = join(SRC, 'worker', 'version.js');   // VERSION 常量所在文件（两个脚本都包含它，共用同一个版本号）
 const KEEP_COMMENT = /@HOPLINE_/;          // 内联面板代码时唯一保留的注释（运行时占位符）
 
 function read(path) {
@@ -131,16 +130,17 @@ export function assemble(kind = 'panel') {
   return out;
 }
 
-export function versionOf() {
-  const m = read(VERSION_FILE).match(/const\s+VERSION\s*=\s*['"]([^'"]+)['"]/);
-  if (!m) throw new Error('未在 src/worker/version.js 中找到 VERSION');
+export function versionOf(kind = 'panel') {
+  const file = join(SRC, 'worker', TARGETS[kind].version);
+  const m = read(file).match(/const\s+VERSION\s*=\s*['"]([^'"]+)['"]/);
+  if (!m) throw new Error(`未在 src/worker/${TARGETS[kind].version} 中找到 VERSION`);
   return m[1];
 }
 
 // 生成部署文件（CRLF，与仓库历史一致）：src/ 原样拼接，只加版本横幅，不做压缩/重命名
 export function build(kind = 'panel') {
   const src = assemble(kind);
-  const code = `/*!${TARGETS[kind].banner} v${versionOf()}*/\n${src}`.replace(/\n+$/, '');
+  const code = `/*!${TARGETS[kind].banner} v${versionOf(kind)}*/\n${src}`.replace(/\n+$/, '');
   return (code + '\n').replace(/\n/g, '\r\n');
 }
 

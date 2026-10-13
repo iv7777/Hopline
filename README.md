@@ -107,7 +107,7 @@
 
 ### 2.6 更新
 
-1. 取最新的脚本，**覆盖粘贴**到对应的 Worker 里并部署；环境变量与 KV 里的配置原样保留，无需重新设置。两个脚本之间只通过 `vless://` 链接联系，没有版本兼容问题，可以分别更新；代理脚本很少需要更新
+1. 取最新的脚本，**覆盖粘贴**到对应的 Worker 里并部署；环境变量与 KV 里的配置原样保留，无需重新设置。两个脚本**各自编号**（文件顶部横幅 `/*!Hopline-panel vX.Y.Z*/` 与 `/*!Hopline-proxy vX.Y.Z*/`），更新节奏不同，可以分别更新；它们之间只通过 `vless://` 链接联系，加上可选的服务绑定（面板按代理报告的能力 `control` / `storage` 判断功能是否可用，没有版本号上的硬性对应），所以没有版本兼容问题；代理脚本很少需要更新
 2. 面板里点击版本号可检测更新：读取仓库 `main` 分支的 `Hopline-panel.js` 比对版本号，有新版本时把它的内容复制到剪贴板（只检测面板脚本；代理脚本的版本通过 `PROXY` 服务绑定在「运行状态」里查看）。提示「仓库 main 分支上没有 Hopline-panel.js（HTTP 404）」说明这个文件还不在 `main` 上——新版本尚未合并发布，或仓库不是公开的（`raw.githubusercontent.com` 不带凭据，私有仓库一律 404）
 
 ### 2.7 从 2.x（一体版）升级
@@ -295,13 +295,13 @@
 |---|---|
 | `src/proxy-worker.js` | 代理入口：环境变量说明与 `// @include worker/xxx.js` 清单，构建时按顺序拼接成 `Hopline-proxy.js` |
 | `src/panel-worker.js` | 面板入口：同上，拼接成 `Hopline-panel.js` |
-| `src/worker/*.js` | 按主题拆分的逻辑（`version` 是两个脚本共用的版本号）。**代理专用**：`protocol`（VLESS 头、UDP DNS→DoH）、`outbound-proxies` / `relay`（出站与反代）、`proxy`（WS / XHTTP）、`proxy-config`（环境变量配置）、`proxy-router`（路由）；**面板专用**：`config-schema`（字段表 `CONFIG_SCHEMA`）、`config`（加载 / 保存）、`ip-sources` / `nodes`（优选来源与节点生成）、`formats`（各客户端格式）、`subscription`、`pages`（内嵌页面）、`router`（鉴权、路由、管理 API）、`update`（版本与检测更新）、`hashes`、`constants`；**两者共用**：`utils`、`cf-ranges`（Cloudflare 地址段）、`doh` |
+| `src/worker/*.js` | 按主题拆分的逻辑（`version-panel` / `version-proxy` 是两个脚本各自的版本号）。**代理专用**：`protocol`（VLESS 头、UDP DNS→DoH）、`outbound-proxies` / `relay`（出站与反代）、`proxy`（WS / XHTTP）、`proxy-config`（环境变量配置）、`proxy-router`（路由）；**面板专用**：`config-schema`（字段表 `CONFIG_SCHEMA`）、`config`（加载 / 保存）、`ip-sources` / `nodes`（优选来源与节点生成）、`formats`（各客户端格式）、`subscription`、`pages`（内嵌页面）、`router`（鉴权、路由、管理 API）、`update`（版本与检测更新）、`hashes`、`constants`；**两者共用**：`utils`、`cf-ranges`（Cloudflare 地址段）、`doh` |
 | `src/panel/panel.html` | 管理面板页面结构（`@include` 引入样式与脚本） |
 | `src/panel/panel.css` | 面板样式（日间 / 夜间主题） |
 | `src/panel/panel.js` | 面板前端脚本（由字段表驱动的表单回填、收集、校验与错误提示） |
 | `src/panel/login.html` | 登录页 |
 | `src/worker/clash-template.yaml` | Clash / Stash 订阅的配置模板（锚点、监听器、DNS、策略组与规则） |
-| `build.mjs` | 构建脚本：按入口文件的清单拼接 `src/worker/*.js`，把登录页、面板页面（HTML + CSS + JS 合并，按语言各自去注释）与 Clash 模板以 `String.raw` 模板字符串内联进面板脚本，顶部加版本横幅后原样输出（不压缩、不重命名）。两个脚本共用 `src/worker/update.js` 里的 `VERSION` |
+| `build.mjs` | 构建脚本：按入口文件的清单拼接 `src/worker/*.js`，把登录页、面板页面（HTML + CSS + JS 合并，按语言各自去注释）与 Clash 模板以 `String.raw` 模板字符串内联进面板脚本，顶部加版本横幅后原样输出（不压缩、不重命名）。两个脚本各自编号：横幅分别取自 `src/worker/version-panel.js` 与 `src/worker/version-proxy.js` 里的 `VERSION` |
 | `eslint.config.mjs` | 静态检查配置（`npm run lint`）：两个产物分别检查，任一脚本引用了另一个脚本才有的名字（`no-undef`）或留下用不到的代码（`no-unused-vars`）都会报错 |
 | `test/` | `node:test` 测试，`proxy.test.mjs`（代理）与 `panel.test.mjs`（面板），模拟 KV 与 Workers 运行时，无需安装依赖 |
 | `.github/workflows/ci.yml` | 每次推送运行：两个产物与 `src/` 同步检查 → 语法检查 → lint → 测试 |
@@ -320,7 +320,7 @@ npm run lint            # eslint 静态检查（通过 npx 获取，仓库本身
 
 > 请勿直接编辑 `Hopline-proxy.js` 与 `Hopline-panel.js`：CI 会检查它们是否与 `src/` 同步。
 >
-> **发版流程**：改动后在 `src/worker/update.js` 升 `VERSION` → `node build.mjs` → 提交（两个脚本一起）→ 合并到 `main`。面板页面与 Clash 模板都内嵌在脚本里，不再需要版本标签；只改了面板时代理脚本的内容不变，只需更新面板。
+> **发版流程**：改动了哪个脚本，就升哪个脚本的版本号（面板：`src/worker/version-panel.js`；代理：`src/worker/version-proxy.js`；两个都改了就都升，各自独立编号）→ `node build.mjs` → 提交（产物一起）→ 合并到 `main`。非里程碑的更新只升补丁号（第三位）。面板页面与 Clash 模板都内嵌在脚本里，不再需要版本标签；只改了面板时代理脚本的内容不变，代理不必更新，反之亦然。
 
 ---
 
@@ -334,6 +334,12 @@ npm run lint            # eslint 静态检查（通过 npx 获取，仓库本身
 
 ## 更新日志
 
+> 两个脚本从面板 V3.0.3 起各自编号，下面按脚本标注；V3.0.0 – V3.0.2 两个脚本是同一个版本号，条目对两者都适用。当前：面板 V3.0.3，代理 V3.0.2。
+
+### 面板 V3.0.3
+
+- **面板与代理的版本号分开**：更新节奏不同，各自编号、各自升版本（`src/worker/version-panel.js` / `src/worker/version-proxy.js`）。仪表盘「代理状态」现在只显示代理自己的版本（`在线 · 代理 vX.Y.Z`），不再拿它和面板版本比较，`/api/proxy-status` 也不再返回 `panelVersion`；功能是否可用按代理报告的 `control` / `storage` 判断。代理脚本本身没有变化，仍是 V3.0.2
+
 ### V3.0.2
 
 - **面板可以在线修改代理的设置**：代理脚本新增 RPC 入口 `ProxyControl`（在 `ProxyStatus` 的基础上多 `getSettings()` / `setSettings()` / `resetSettings()`），面板 Worker 的 `PROXY` 服务绑定选择这个入口后，新的「代理设置」页可以修改反代 / 落地 IP、出站代理、出站方式与地区反代（模式、首选 / 次选地区、自定义列表）共 7 项，每项都有来源提示（面板保存的 / 环境变量 / 默认），可「恢复为环境变量」
@@ -345,7 +351,7 @@ npm run lint            # eslint 静态检查（通过 npx 获取，仓库本身
 ### V3.0.1
 
 - **代理状态（服务绑定）**：代理脚本新增只读 RPC 入口 `ProxyStatus`（`status()`），面板 Worker 加一个名为 `PROXY` 的服务绑定（入口 `ProxyStatus`）后，仪表盘「运行状态」显示代理是否在线、版本（与面板版本不同时标注）、配置问题与非敏感的设置摘要，并可随时「检测代理」。该入口没有 HTTP 路由，不返回任何密钥，代理的公开响应里仍然没有版本号；不绑定则一切照旧。需要同一账号下的两个 Workers 部署
-- 两个脚本共用 `src/worker/version.js` 里的版本号
+- 版本号已拆分为两个：面板 `src/worker/version-panel.js`、代理 `src/worker/version-proxy.js`（见下面「面板 V3.0.3」）
 - **修复：检测更新提示「HTTP 404」不清楚**：该提示的原因是仓库 `main` 分支上没有 `Hopline-panel.js`（拆分版本尚未合并发布，或仓库不是公开的）。现在会明确说明这一点；合并发布到 `main` 后检测恢复正常
 - 混淆版代理脚本保留入口名 `ProxyStatus`（有测试覆盖）
 

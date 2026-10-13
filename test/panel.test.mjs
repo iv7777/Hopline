@@ -3,7 +3,7 @@
 // 用内存 Map 模拟 KV、桩替换外网 fetch。运行：npm test
 import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
-import { VERSION_FOR_TEST } from './helpers-version.mjs';
+import { PANEL_VERSION, PROXY_VERSION } from './helpers-version.mjs';
 
 import assert from 'node:assert/strict';
 
@@ -1115,7 +1115,7 @@ test('代理状态：绑定后显示在线与版本、非敏感设置摘要；�
     return (await (await call(env, `/${UUID}/api/proxy-status`, { cookie: await login(env) })).json()).data;
   };
   const up = await get({ status: async () => ({ ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 } }) });
-  assert.deepEqual(up, { bound: true, up: true, ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 }, panelVersion: VERSION_FOR_TEST });
+  assert.deepEqual(up, { bound: true, up: true, ok: true, version: '9.9.9', problems: [], control: false, storage: false, settings: { proxyIP: true, outboundProxy: 'socks5', outboundMode: '', relayMode: 'builtin', relayRegion: '', relayRegion2: '', relayCustom: 0 } });
   const bad = await get({ status: async () => ({ ok: false, version: '3.0.1', problems: ['请设置环境变量 UUID（节点用户 ID）。'] }) });
   assert.equal(bad.up, true); assert.equal(bad.ok, false); assert.deepEqual(bad.problems, ['请设置环境变量 UUID（节点用户 ID）。']);
   const down = await get({ status: async () => { throw new Error('The RPC receiver does not implement the method "status".'); } });
@@ -1131,14 +1131,14 @@ test('代理状态：绑定后显示在线与版本、非敏感设置摘要；�
   } finally { globalThis.setTimeout = realSetTimeout; }
 });
 
-test('面板页面有「代理状态」行与检测按钮；版本号两个脚本一致', async () => {
+test('面板页面有「代理状态」行与检测按钮；两个脚本的横幅版本号各自对应自己的版本文件', async () => {
   const env = baseEnv();
   const html = await (await call(env, `/${UUID}`, { cookie: await login(env) })).text();
   for (const id of ['stProxy', 'stProxyHint']) assert.ok(html.includes(`id="${id}"`), id);
   assert.ok(html.includes('onclick="checkProxy()"') && html.includes('function checkProxy('));
   const v = (f) => readFileSync(new URL(f, import.meta.url), 'utf8').match(/^\/\*!Hopline-\w+ v([\d.]+)\*\//)[1];
-  assert.equal(v('../Hopline-panel.js'), VERSION_FOR_TEST);
-  assert.equal(v('../Hopline-proxy.js'), VERSION_FOR_TEST);
+  assert.equal(v('../Hopline-panel.js'), PANEL_VERSION);
+  assert.equal(v('../Hopline-proxy.js'), PROXY_VERSION);
 });
 
 test('代理设置 API：需登录；没有服务绑定时给出明确提示；方法与请求体校验', async () => {

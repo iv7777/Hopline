@@ -128,7 +128,8 @@ test('服务绑定：面板通过 PROXY 绑定读到真实代理的在线状态�
   };
   const good = await status({ UUID: PROXY_UUID, PATH: PROXY_PATH, OUTBOUND_PROXY: 'http://user:pw@1.2.3.4:8080' });
   assert.equal(good.up, true); assert.equal(good.ok, true);
-  assert.equal(good.version, good.panelVersion, '两个脚本同一版本号');
+  assert.match(good.version, /^\d+\.\d+\.\d+$/, '代理自己的版本号');
+  assert.ok(!('panelVersion' in good), '面板与代理各自编号，状态里不再带面板版本');
   assert.equal(good.settings.outboundProxy, 'http');
   assert.ok(!JSON.stringify(good).includes('user:pw') && !JSON.stringify(good).includes(PROXY_UUID));
   const bad = await status({ PATH: PROXY_PATH });

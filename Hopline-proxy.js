@@ -23,7 +23,7 @@
 import { connect } from 'cloudflare:sockets';
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
-// 版本号：两个脚本共用（面板用于检测更新与显示；代理只通过服务绑定的 status() 报告）
+// 代理脚本（Hopline-proxy.js）的版本号：只通过服务绑定的 status() 报告（不会出现在任何公开响应里）。与面板脚本各自编号、各自升版本
 const VERSION = '3.0.2';
 // ---------------------------------------------------------------------------
 // 工具函数

@@ -1,4 +1,4 @@
-/*!Hopline-panel v3.0.2*/
+/*!Hopline-panel v3.0.3*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -18,8 +18,8 @@
 //    PROXY           指向代理 Worker 的服务绑定：入口 ProxyStatus = 只读（「运行状态」显示代理是否在线与版本）；
 //                    入口 ProxyControl = 另可在面板「代理设置」里在线修改代理的出站 / 地区反代设置（代理还需绑定 PROXY_KV）
 // ============================================================================
-// 版本号：两个脚本共用（面板用于检测更新与显示；代理只通过服务绑定的 status() 报告）
-const VERSION = '3.0.2';
+// 面板脚本（Hopline-panel.js）的版本号：用于检测更新与面板里显示。与代理脚本各自编号、各自升版本
+const VERSION = '3.0.3';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
 // 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
@@ -3262,9 +3262,7 @@ function checkProxy(){
       h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus 或 ProxyControl，且代理已更新到 3.0.2 或更高版本';
       return;
     }
-    var t = '在线 · v' + (d.version || '?');
-    if (d.panelVersion && d.version && d.version !== d.panelVersion) t += '（面板 v' + d.panelVersion + '）';
-    v.textContent = t;
+    v.textContent = '在线 · 代理 v' + (d.version || '?');
     v.className = 'v ' + (d.ok ? 'ok' : 'bad');
     h.textContent = d.ok ? proxySummary(d.settings) + (d.control ? ' · 可在线修改（入口 ProxyControl' + (d.storage ? '，已绑定 KV' : '，代理未绑定 PROXY_KV') + '）' : ' · 只读入口（要在线修改请把入口改为 ProxyControl）') : '代理配置有问题：' + (d.problems || []).join(' ');
   }).catch(function(){ v.textContent = '检测失败'; v.className = 'v bad'; });
@@ -4088,9 +4086,9 @@ async function proxyStatus(env) {
   if (!(env && env.PROXY)) return { bound: false };
   try {
     const r = await callProxy(env, 'status');
-    return { bound: true, up: true, ok: r.ok === true, version: String(r.version || ''), problems: Array.isArray(r.problems) ? r.problems.map(String) : [], control: r.control === true, storage: r.storage === true, settings: r.settings && typeof r.settings === 'object' ? r.settings : {}, panelVersion: VERSION };
+    return { bound: true, up: true, ok: r.ok === true, version: String(r.version || ''), problems: Array.isArray(r.problems) ? r.problems.map(String) : [], control: r.control === true, storage: r.storage === true, settings: r.settings && typeof r.settings === 'object' ? r.settings : {} };
   } catch (e) {
-    return { bound: true, up: false, error: String((e && e.message) || e), panelVersion: VERSION };
+    return { bound: true, up: false, error: String((e && e.message) || e) };
   }
 }
 // 在线修改代理设置：把面板的请求转给代理的 ProxyControl 入口；绑定的是只读入口 ProxyStatus 时代理会报「does not implement」

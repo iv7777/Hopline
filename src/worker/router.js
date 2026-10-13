@@ -170,9 +170,9 @@ async function proxyStatus(env) {
   if (!(env && env.PROXY)) return { bound: false };
   try {
     const r = await callProxy(env, 'status');
-    return { bound: true, up: true, ok: r.ok === true, version: String(r.version || ''), problems: Array.isArray(r.problems) ? r.problems.map(String) : [], control: r.control === true, storage: r.storage === true, settings: r.settings && typeof r.settings === 'object' ? r.settings : {}, panelVersion: VERSION };
+    return { bound: true, up: true, ok: r.ok === true, version: String(r.version || ''), problems: Array.isArray(r.problems) ? r.problems.map(String) : [], control: r.control === true, storage: r.storage === true, settings: r.settings && typeof r.settings === 'object' ? r.settings : {} };
   } catch (e) {
-    return { bound: true, up: false, error: String((e && e.message) || e), panelVersion: VERSION };
+    return { bound: true, up: false, error: String((e && e.message) || e) };
   }
 }
 // 在线修改代理设置：把面板的请求转给代理的 ProxyControl 入口；绑定的是只读入口 ProxyStatus 时代理会报「does not implement」

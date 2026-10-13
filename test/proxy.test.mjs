@@ -903,14 +903,14 @@ test('构建产物：代理脚本不含面板 / 登录 / 订阅 / 管理接口 /
 });
 
 // ---------------- 只读状态入口 ProxyStatus（服务绑定） ----------------
-import { VERSION_FOR_TEST } from './helpers-version.mjs';
+import { PROXY_VERSION } from './helpers-version.mjs';
 
 test('ProxyStatus.status()：在线与否、版本、配置问题与非敏感的设置摘要；不返回 UUID / 路径 / 反代地址 / 出站代理的主机与密码', async () => {
   assert.equal(typeof proxyModule.ProxyStatus, 'function');
   const env = baseEnv({ PATH: 'secret-node-path', PROXYIP: 'relay.private.example:8443', OUTBOUND_PROXY: 'socks5://alice:hunter2@10.9.8.7:1080', OUTBOUND_MODE: 'only', RELAY_MODE: 'custom', RELAY_CUSTOM: 'a.example\nb.example' });
   const st = await new proxyModule.ProxyStatus({}, env).status();
   assert.equal(st.ok, true);
-  assert.equal(st.version, VERSION_FOR_TEST);
+  assert.equal(st.version, PROXY_VERSION);
   assert.deepEqual(st.problems, []);
   assert.deepEqual(st.settings, { proxyIP: true, outboundProxy: 'socks5', outboundMode: 'only', relayMode: 'custom', relayRegion: '', relayRegion2: '', relayCustom: 2 });
   const text = JSON.stringify(st);
@@ -921,7 +921,7 @@ test('ProxyStatus.status()：在线与否、版本、配置问题与非敏感的
   // 配置有问题时仍在线，但 ok 为 false 并列出原因
   const bad = await new proxyModule.ProxyStatus({}, {}).status();
   assert.equal(bad.ok, false);
-  assert.equal(bad.version, VERSION_FOR_TEST);
+  assert.equal(bad.version, PROXY_VERSION);
   assert.equal(bad.problems.length, 2);
 });
 
@@ -934,7 +934,7 @@ test('状态只能通过服务绑定读取：没有任何 HTTP 路由能拿到�
       const body = await res.text();
       assert.equal(res.status, 200, path);
       assert.match(body, /Hello World/, path);
-      assert.ok(!body.includes(VERSION_FOR_TEST), path);
+      assert.ok(!body.includes(PROXY_VERSION), path);
     }
   }
   assert.deepEqual(Object.keys(proxyModule).sort(), ['ProxyControl', 'ProxyStatus', 'default'], '模块只导出默认入口与两个 RPC 入口');
@@ -946,7 +946,7 @@ test('混淆版代理脚本保留入口名 ProxyStatus / ProxyControl（服务�
   const kv = memKv();
   const st = await new obf.ProxyControl({}, baseEnv({ PROXY_KV: kv })).status();
   assert.equal(st.ok, true);
-  assert.equal(st.version, VERSION_FOR_TEST);
+  assert.equal(st.version, PROXY_VERSION);
   assert.equal(st.control, true);
   assert.equal((await new obf.ProxyControl({}, baseEnv({ PROXY_KV: kv })).setSettings({ outboundMode: 'no' })).ok, true);
   assert.deepEqual(JSON.parse(kv.m.get('settings')), { outboundMode: 'no' });

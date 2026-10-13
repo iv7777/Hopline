@@ -347,9 +347,7 @@ function checkProxy(){
       h.textContent = (d.error || '') + '。请确认服务绑定的变量名为 PROXY、入口为 ProxyStatus 或 ProxyControl，且代理已更新到 3.0.2 或更高版本';
       return;
     }
-    var t = '在线 · v' + (d.version || '?');
-    if (d.panelVersion && d.version && d.version !== d.panelVersion) t += '（面板 v' + d.panelVersion + '）';
-    v.textContent = t;
+    v.textContent = '在线 · 代理 v' + (d.version || '?');
     v.className = 'v ' + (d.ok ? 'ok' : 'bad');
     h.textContent = d.ok ? proxySummary(d.settings) + (d.control ? ' · 可在线修改（入口 ProxyControl' + (d.storage ? '，已绑定 KV' : '，代理未绑定 PROXY_KV') + '）' : ' · 只读入口（要在线修改请把入口改为 ProxyControl）') : '代理配置有问题：' + (d.problems || []).join(' ');
   }).catch(function(){ v.textContent = '检测失败'; v.className = 'v bad'; });
