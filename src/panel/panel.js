@@ -191,7 +191,6 @@ function loadAll(){
   }).catch(function(){});
   checkProxy();
   loadProxySettings();
-  loadProxyEntry();
   api('config').then(function(r){
     if (r && r.ok){
       CFG = r.data;
@@ -217,13 +216,11 @@ function setConn(ok){
   p.className = 'pill ' + (ok ? '' : 'off');
   $('connText').textContent = ok ? '运行中' : '无法连接';
 }
-/* ===== 代理设置：通过签名 HTTPS 接口在线修改代理的 7 项出站 / 地区反代设置（保存在代理自己的 KV，不属于面板配置） ===== */
-var PROXY_FIELDS = { 'edgeIP': 's-proxyIP', 'hopAddr': 's-outbound', 'hopMode': 's-outmode', 'alt.mode': 'rl-mode', 'alt.region': 'rl-region', 'alt.region2': 'rl-region2', 'alt.custom': 'rl-custom' };
-var PROXY_ENV_NAMES = { 'edgeIP': 'EDGEIP', 'hopAddr': 'HOP_ADDR', 'hopMode': 'HOP_MODE', 'alt.mode': 'ALT_MODE', 'alt.region': 'ALT_REGION', 'alt.region2': 'ALT_REGION2', 'alt.custom': 'ALT_CUSTOM' };
-var RELAY_ZH = { HK: '香港', US: '美国', SG: '新加坡', JP: '日本', KR: '韩国', DE: '德国', SE: '瑞典', NL: '荷兰', FI: '芬兰', GB: '英国' };
+/* ===== 代理设置：落地 / 出站 / 备用线路保存在面板里（每个代理一份），保存时整份下发给代理；备用线路表所有代理共用 ===== */
+var PROXY_FIELDS = { 'edgeIP': 's-proxyIP', 'hop': 's-outbound', 'hopMode': 's-outmode', 'altMode': 'rl-mode', 'altCustom': 'rl-custom' };
+var PROXY_DEFAULTS = { edgeIP: '', hop: '', hopMode: '', altMode: 'auto', altCustom: '' };
 var PXSEL = '';   // 「代理设置」页正在修改的代理 id（空 = 第一个）
-function pxq(){ return PXSEL ? '?id=' + encodeURIComponent(PXSEL) : ''; }
-function onProxyWhich(){ PXSEL = $('px-which').value; loadProxySettings(); }
+function onProxyWhich(){ PXSEL = $('px-which').value; renderProxySettings(); }
 function proxyNote(text, kind){
   var n = $('px-note');
   n.textContent = text;
@@ -236,12 +233,13 @@ function setProxyFormEnabled(on){
 }
 function clearProxyErrors(){
   Object.keys(PROXY_FIELDS).forEach(function(k){ clearFieldError($(PROXY_FIELDS[k])); });
+  clearFieldError($('rt-text'));
 }
 function showProxyErrors(errors){
   clearProxyErrors();
   var unplaced = [], first = null;
   (errors || []).forEach(function(e){
-    var el = PROXY_FIELDS[e.field] ? $(PROXY_FIELDS[e.field]) : null;
+    var el = PROXY_FIELDS[e.field] ? $(PROXY_FIELDS[e.field]) : (e.field === 'text' ? $('rt-text') : null);
     if (!el){ unplaced.push(e.msg); return; }
     el.classList.add('invalid');
     if (el._errTip) el._errTip.textContent += '；' + e.msg;
@@ -252,30 +250,34 @@ function showProxyErrors(errors){
   return unplaced;
 }
 function onRelayMode(){
-  var m = $('rl-mode').value;
-  $('rl-builtin-box').style.display = (m === 'builtin') ? '' : 'none';
-  $('rl-custom-box').style.display = (m === 'custom') ? '' : 'none';
+  $('rl-custom-box').style.display = ($('rl-mode').value === 'custom') ? '' : 'none';
 }
-function fillProxy(d){
-
+var ALT_TAGS = [], ALT_DEFAULT_TEXT = '';
+function pxCurrent(){
+  var cur = null;
+  PXLIST.forEach(function(p){ if (p.id === PXSEL) cur = p; });
+  return cur;
+}
+// 用面板里保存的这个代理的设置填表
+function renderProxySettings(){
+  var p = pxCurrent();
   clearProxyErrors();
-  [['rl-region', 'alt.region', '自动（按 Worker 机房）'], ['rl-region2', 'alt.region2', '自动（默认的另一地区）']].forEach(function(c){
-    var el = $(c[0]);
-    el.innerHTML = '';
-    var opts = c[1] === 'alt.region2' ? ['', 'none'].concat(d.regions || []) : [''].concat(d.regions || []);
-    opts.forEach(function(o){
-      var op = document.createElement('option');
-      op.value = o;
-      op.textContent = o === '' ? c[2] : (o === 'none' ? '不使用' : (RELAY_ZH[o] ? o + ' ' + RELAY_ZH[o] : o));
-      el.appendChild(op);
-    });
-  });
-  Object.keys(PROXY_FIELDS).forEach(function(k){ $(PROXY_FIELDS[k]).value = (d.settings && d.settings[k] != null) ? d.settings[k] : ''; });
-  document.querySelectorAll('[data-src]').forEach(function(h){
-    var k = h.getAttribute('data-src'), s = d.source && d.source[k];
-    h.textContent = s === 'kv' ? '当前值来自这里保存的设置（覆盖了环境变量）' : (s === 'env' ? '当前值来自代理的环境变量 ' + PROXY_ENV_NAMES[k] : '未设置，使用默认值');
-  });
+  if (!p){
+    setProxyFormEnabled(false);
+    Object.keys(PROXY_FIELDS).forEach(function(k){ $(PROXY_FIELDS[k]).value = PROXY_DEFAULTS[k]; });
+    onRelayMode();
+    proxyNote('还没有代理：先到「面板设置 → 代理」添加一个。', 'err');
+    return;
+  }
+  setProxyFormEnabled(true);
+  Object.keys(PROXY_FIELDS).forEach(function(k){ $(PROXY_FIELDS[k]).value = p[k] != null ? p[k] : PROXY_DEFAULTS[k]; });
   onRelayMode();
+  updateProxyNote(p);
+  $('rl-tags').textContent = ALT_TAGS.length ? '线路表里现有的标签：' + ALT_TAGS.join('、') + '（表里没有的标签会被跳过）' : '线路表是空的：请先在下方填写备用线路表';
+}
+function updateProxyNote(p){
+  var st = PXSTAT[p.id];
+  proxyNote('正在修改「' + p.name + '」（' + p.host + '）的设置。' + (st ? (st.up ? (st.inSync ? '代理上的状态与面板一致。' : '代理上的状态与这里不一致：保存并下发，或到「面板设置 → 代理」点「连接并同步」。') : '当前连不上代理：' + (st.error || '') + '；仍可先保存，之后点「连接并同步」。') : ''), st && st.up && !st.inSync ? 'err' : '');
 }
 function collectProxy(){
   var out = {};
@@ -285,32 +287,33 @@ function collectProxy(){
 function loadProxySettings(){
   proxyNote('读取中…');
   setProxyFormEnabled(false);
-  return api('proxy-settings' + pxq()).then(function(r){
-    if (!r || !r.ok || !r.data){
-      proxyNote((r && r.msg) || '读取失败', 'err');
-      return;
+  api('alt-routes').then(function(r){
+    if (r && r.ok && r.data){
+      ALT_DEFAULT_TEXT = r.data.defaultText || '';
+      ALT_TAGS = r.data.tags || [];
+      $('rt-text').value = r.data.text;
+      $('rt-save').disabled = false;
+      if (r.data.error){ $('rt-save').disabled = true; toast('备用线路表读取失败（KV 暂时无法读取），暂时不能保存', 'err'); }
     }
-    fillProxy(r.data);
-    if (!r.data.storage){
-      proxyNote('代理没有绑定 KV（变量名 NODE_KV）：无法保存 UUID 与这些设置，代理也无法对外提供服务。给代理 Worker 绑定一个单独的 KV 命名空间后点「面板设置 → 代理 → 连接并同步」。', 'err');
-      setProxyFormEnabled(false);
-      return;
-    }
-    proxyNote(r.data.error === 'unavailable' ? '代理的 KV 暂时无法读取：下面显示的可能不是最新的设置，保存会被拒绝，稍后重新读取。' : (r.data.error === 'corrupt' ? '代理 KV 里保存的设置已损坏，已忽略；保存一次即可修复。' : '已连接代理，可以在线修改。'), r.data.error ? 'err' : '');
-    setProxyFormEnabled(r.data.error !== 'unavailable');
-  }).catch(function(){ proxyNote('无法连接服务器', 'err'); });
+  }).catch(function(){}).then(function(){ return loadProxyEntry(undefined, true); });
+}
+function proxySaveDone(r, okMsg){
+  var d = r.data || {};
+  var t = (d.sync ? pxSyncText(d.sync) : '') || okMsg;
+  var bad = d.sync && !d.sync.ok;
+  toast(bad ? t : okMsg + (d.sync ? '：' + t : ''), bad ? 'err' : 'ok');
+  loadProxyEntry(d.proxy ? d.proxy.id : undefined, true).then(pxRefreshAll);
 }
 function saveProxySettings(){
+  var p = pxCurrent();
+  if (!p) return;
   var btn = $('px-save');
   btn.disabled = true;
-  api('proxy-settings' + pxq(), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(collectProxy()) })
+  clearProxyErrors();
+  api('proxies/' + p.id, { method: 'POST', headers: JSON_H, body: JSON.stringify(collectProxy()) })
     .then(function(r){
-      if (r && r.ok && r.data){
-        fillProxy(r.data);
-        toast('已保存到代理：约 1 分钟内生效', 'ok');
-        proxyNote('已保存：' + new Date().toLocaleTimeString() + '，代理约 1 分钟内生效。');
-        checkProxy();
-      } else {
+      if (r && r.ok && r.data) proxySaveDone(r, '已保存');
+      else {
         var unplaced = showProxyErrors(r && r.errors);
         toast((unplaced.length ? unplaced.join('；') : (r && r.msg)) || '保存失败', 'err');
       }
@@ -319,21 +322,50 @@ function saveProxySettings(){
     .then(function(){ btn.disabled = false; });
 }
 function resetProxySettings(){
-  if (!confirm('确定恢复？将清除这里保存的全部覆盖项，代理回到环境变量 + 默认值。')) return;
-  api('proxy-reset' + pxq(), { method: 'POST' }).then(function(r){
-    if (r && r.ok && r.data){ fillProxy(r.data); toast('已恢复为环境变量设置：代理约 1 分钟内生效', 'ok'); checkProxy(); }
+  var p = pxCurrent();
+  if (!p || !confirm('确定恢复默认？落地 IP、出站代理清空，出站方式与备用线路回到默认（自动选择）。')) return;
+  api('proxies/' + p.id, { method: 'POST', headers: JSON_H, body: JSON.stringify(PROXY_DEFAULTS) }).then(function(r){
+    if (r && r.ok && r.data) proxySaveDone(r, '已恢复默认');
     else toast((r && r.msg) || '恢复失败', 'err');
   }).catch(function(){ toast('恢复失败：无法连接服务器', 'err'); });
 }
+function defaultAltRoutes(){
+  if (ALT_DEFAULT_TEXT) $('rt-text').value = ALT_DEFAULT_TEXT;
+}
+function saveAltRoutes(){
+  var btn = $('rt-save');
+  btn.disabled = true;
+  clearFieldError($('rt-text'));
+  api('alt-routes', { method: 'POST', headers: JSON_H, body: JSON.stringify({ text: $('rt-text').value }) }).then(function(r){
+    if (!(r && r.ok)){
+      var unplaced = showProxyErrors(r && r.errors);
+      toast((unplaced.length ? unplaced.join('；') : (r && r.msg)) || '保存失败', 'err');
+      return;
+    }
+    ALT_TAGS = (r.data && r.data.tags) || [];
+    return syncAllProxies('线路表已保存');
+  }).catch(function(){ toast('保存失败：无法连接服务器', 'err'); }).then(function(){ btn.disabled = false; });
+}
+// 把面板里的状态整份下发给全部代理
+function syncAllProxies(prefix){
+  return api('proxy-sync-all', { method: 'POST' }).then(function(r){
+    if (!(r && r.ok && r.data)){ toast((r && r.msg) || '同步失败', 'err'); return; }
+    var res = r.data.results || [], bad = res.filter(function(x){ return !x.ok; });
+    if (!res.length) toast((prefix ? prefix + '，' : '') + '没有代理可同步', '');
+    else if (!bad.length) toast((prefix ? prefix + '，' : '') + '已同步 ' + res.length + ' 个代理', 'ok');
+    else toast((prefix ? prefix + '，' : '') + bad.map(function(x){ return x.name + '：' + (x.error || '失败'); }).join('；'), 'err');
+    loadProxyEntry(undefined, true).then(pxRefreshAll);
+  }).catch(function(){ toast('同步失败：无法连接服务器', 'err'); });
+}
 
 /* ===== 代理状态：面板 → 代理的签名 HTTPS 接口（status） ===== */
-function proxySummary(s){
-  s = s || {};
+function proxySummary(p){
   var a = [];
-  a.push('出站代理：' + (s.hopAddr || '无'));
-  if (s.hopMode) a.push('出站方式：' + s.hopMode);
-  a.push('反代 / 落地 IP：' + (s.edgeIP ? '已设置' : '无'));
-  a.push('地区反代：' + (s.altMode || 'builtin') + (s.altMode === 'custom' ? '（' + (s.altCustom || 0) + ' 个）' : ''));
+  var m = p && p.hop ? p.hop.match(/^([A-Za-z0-9]+):\/\//) : null;
+  a.push('出站代理：' + (p && p.hop ? (m ? m[1].toLowerCase() : 'socks5') : '无'));
+  if (p && p.hopMode) a.push('出站方式：' + p.hopMode);
+  a.push('落地 IP：' + (p && p.edgeIP ? '已设置' : '无'));
+  a.push('备用线路：' + (p && p.altMode === 'off' ? '关闭' : (p && p.altMode === 'custom' ? '自定义' : '自动')));
   return a.join(' · ');
 }
 var PXSTAT = {};   // id → 最近一次的代理状态
@@ -342,7 +374,7 @@ function pxStatusInfo(d){
   if (!d.up) return { text: '无法连接：' + (d.error || ''), ok: false };
   var tags = [];
   if (!d.provisioned) tags.push('尚未下发 UUID');
-  else if (!d.uuidMatch) tags.push('UUID 与面板不一致');
+  else if (!d.inSync) tags.push('与面板的设置不一致，点「连接并同步」');
   if (!d.enabled) tags.push('代理已停用');
   if (!d.storage) tags.push('代理未绑定 NODE_KV');
   if (!d.ok) tags.push('配置有问题：' + (d.problems || []).join(' '));
@@ -357,6 +389,8 @@ function checkProxy(){
     PXSTAT = {};
     list.forEach(function(d){ PXSTAT[d.id] = d; });
     pxApplyStatus();
+    var cur = pxCurrent();
+    if (cur) updateProxyNote(cur);
     if (!list.length){
       v.textContent = '未添加';
       h.textContent = '到「面板设置 → 代理」添加代理（域名、节点路径、密钥），面板会自动生成 UUID 并下发';
@@ -369,7 +403,9 @@ function checkProxy(){
       var line = document.createElement('div');
       line.className = 'hint';
       line.style.margin = '6px 0 0';
-      line.textContent = d.name + (d.enabledHere ? '' : '（面板已停用）') + '：' + info.text + (d.up && d.ok ? ' · ' + proxySummary(d.settings) : '');
+      var rec = null;
+      PXLIST.forEach(function(p){ if (p.id === d.id) rec = p; });
+      line.textContent = d.name + (d.enabledHere ? '' : '（面板已停用）') + '：' + info.text + (d.up && d.ok && rec ? ' · ' + proxySummary(rec) : '');
       l.appendChild(line);
     });
     v.textContent = list.length === 1 ? (good ? '在线' : '有问题') : (good + ' / ' + list.length + ' 正常');
@@ -727,7 +763,6 @@ function pxRefreshAll(){
   // 代理变更后，刷新顶部提示、仪表盘状态与「代理设置」视图
   api('config').then(function(r){ if (r && r.ok && r.data){ if (CFG) CFG.endpointMissing = r.data.endpointMissing; renderEndpoint(); } }).catch(function(){});
   checkProxy();
-  loadProxySettings();
 }
 function pxSyncText(sync){
   if (!sync) return '';
@@ -751,6 +786,7 @@ function loadProxyEntry(selectId, keepNote){
     if (!PXLIST.some(function(p){ return p.id === PXSEL; })) PXSEL = PXLIST.length ? PXLIST[0].id : '';
     sel.value = PXSEL;
     $('px-whichbox').style.display = PXLIST.length > 1 ? '' : 'none';
+    renderProxySettings();
     if (keepNote) return;
     if (r.data.error){ pxConn('代理列表读取失败（' + r.data.error + '）：为避免覆盖已有数据，暂时不能保存。', 'err'); return; }
     pxConn(PXLIST.length ? '已添加 ' + PXLIST.length + ' 个代理，订阅会合并其中启用的。点列表里的代理编辑，或「添加代理」。' : '还没有代理：填写下面的域名、节点路径和密钥，点「保存并连接」。');

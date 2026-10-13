@@ -297,7 +297,7 @@ async function handleRequest(request, env, state) {
     }
 
     // 代理管理（增删改 / 同步 / 启停 / 状态 / 在线设置）：面板通过签名的 HTTPS 请求调用代理的控制接口，见 proxies-api.js
-    if (apiName === 'proxies' || apiName === 'proxy-status' || apiName === 'proxy-settings' || apiName === 'proxy-reset') return handleProxiesApi(apiName, request, env, cfg, segs, url);
+    if (apiName === 'proxies' || apiName === 'proxy-status' || apiName === 'proxy-sync-all' || apiName === 'alt-routes') return handleProxiesApi(apiName, request, env, cfg, segs, url);
 
     if (apiName === 'logout') {
       if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);

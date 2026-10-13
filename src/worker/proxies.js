@@ -1,13 +1,20 @@
 // ---------------------------------------------------------------------------
-// 代理列表：面板 KV 里的 proxies（一个 JSON 数组），每项 { id, name, host, nodePath, uuid, key, enabled }
+// 代理列表：面板 KV 里的 proxies（一个 JSON 数组），每项 { id, name, host, nodePath, uuid, key, enabled, prev, prevUntil, edgeIP, hop, hopMode, altMode, altCustom }
 // ---------------------------------------------------------------------------
-// 面板是 UUID 的权威：由面板生成并下发给代理（见 proxy-client.js 的 syncProxy）。密钥只写不读：接口不回传，备份不导出。
+// 面板是代理全部状态的唯一权威：UUID（含轮换后限时保留的旧 UUID：prev / prevUntil）、启用开关与运行设置
+// （edgeIP 落地 IP、hop 出站代理地址、hopMode 出站方式、altMode / altCustom 备用线路的选用方式）都存在这里，
+// 整份下发给代理（buildState → 控制接口 setState）。密钥只写不读：接口不回传，备份不导出。
+const UUID_GRACE_MS = 10 * 60 * 1000;   // 更换 UUID 后，旧 UUID 在代理上再保留 10 分钟
 // 订阅合并所有可用的代理（见 readyProxies）；接口 /api/proxies 与面板的代理列表按多个代理设计。
 const PROXIES_KEY = 'proxies';
 const PROXIES_MAX = 8;
 
 function publicProxy(p) {
-  return { id: p.id, name: p.name, host: p.host, nodePath: p.nodePath, uuid: p.uuid, keySet: !!p.key, enabled: p.enabled };
+  return {
+    id: p.id, name: p.name, host: p.host, nodePath: p.nodePath, uuid: p.uuid, keySet: !!p.key, enabled: p.enabled,
+    prevUntil: p.prev && p.prevUntil > Date.now() ? p.prevUntil : 0,
+    edgeIP: p.edgeIP, hop: p.hop, hopMode: p.hopMode, altMode: p.altMode, altCustom: p.altCustom,
+  };
 }
 function cleanProxyRecord(r) {
   if (!r || typeof r !== 'object') return null;
@@ -17,6 +24,9 @@ function cleanProxyRecord(r) {
     id, name: String(r.name || '').slice(0, 40) || id,
     host: String(r.host || '').toLowerCase(), nodePath: String(r.nodePath || ''),
     uuid: isUUID(r.uuid) ? String(r.uuid).toLowerCase() : '', key: typeof r.key === 'string' ? r.key : '', enabled: r.enabled !== false,
+    prev: isUUID(r.prev) ? String(r.prev).toLowerCase() : '', prevUntil: Number(r.prevUntil) > 0 ? Number(r.prevUntil) : 0,
+    edgeIP: typeof r.edgeIP === 'string' ? r.edgeIP : '', hop: typeof r.hop === 'string' ? r.hop : '', hopMode: r.hopMode === 'only' ? 'only' : '',
+    altMode: r.altMode === 'custom' || r.altMode === 'off' ? r.altMode : 'auto', altCustom: typeof r.altCustom === 'string' ? r.altCustom : '',
   };
 }
 // 读入面板配置时附带代理列表：cfg.proxies 全部，cfg.proxy 第一个启用的（面板接口没指定 id 时的默认代理）；读取失败记在 cfg._proxiesError（此时拒绝保存）
@@ -71,9 +81,33 @@ function sanitizeProxyInput(input, { partial } = {}) {
     else value.key = v;
   } else if (!partial) err('key', '请填写密钥（与代理的环境变量 NODE_KEY 相同；可以点「生成密钥」）');
   if (has('enabled')) { if (typeof input.enabled !== 'boolean') err('enabled', '必须为开或关'); else value.enabled = input.enabled; }
+  // 运行设置（落地 IP / 出站代理 / 出站方式 / 备用线路）：字符串原样保存（出站代理校验通过后才保存），下发时再解析
+  if (has('edgeIP')) { const r = checkEdgeIP(input.edgeIP); if (r.error) err('edgeIP', r.error); else value.edgeIP = r.value; }
+  if (has('hop')) { const v = String(input.hop == null ? '' : input.hop).trim(); const r = parseHopInput(v); if (r.error) err('hop', r.error); else value.hop = v; }
+  if (has('hopMode')) { if (input.hopMode !== '' && input.hopMode !== 'only') err('hopMode', '出站方式不支持「' + String(input.hopMode).slice(0, 20) + '」'); else value.hopMode = input.hopMode; }
+  if (has('altMode')) { if (!['auto', 'custom', 'off'].includes(input.altMode)) err('altMode', '备用线路方式不支持「' + String(input.altMode).slice(0, 20) + '」'); else value.altMode = input.altMode; }
+  if (has('altCustom')) { const r = parseAltPick(input.altCustom); if (r.error) err('altCustom', r.error); else value.altCustom = r.pick.join(','); }
   return { value, errors };
 }
+// 合并后的整条记录的交叉校验（单项校验过不了的组合）：返回 [{ field, msg }]
+function crossCheckProxy(r) {
+  const errors = [];
+  if (r.altMode === 'custom' && !r.altCustom) errors.push({ field: 'altCustom', msg: '已选择自定义顺序，请填写要用的线路标签（或改回自动 / 关闭）' });
+  if (r.hopMode === 'only' && !r.hop) errors.push({ field: 'hop', msg: '出站方式选了「仅走出站代理」，请先填写出站代理' });
+  return errors;
+}
 function newProxyId() { return b64uOfBytes(crypto.getRandomValues(new Uint8Array(6))); }
+
+// 代理应有的完整状态（整份下发）：键的顺序固定，JSON 文本因此稳定，代理返回的 stateHash 可以与面板自己算的比较。
+// table 是备用线路表（parseAltRoutes 的结果）；已经过期的旧 UUID 仍然列在里面（代理自己会忽略），避免状态哈希因时间流逝而变化，
+// 下一次同步时由 syncProxy 清掉
+function buildState(p, table) {
+  const uuids = [[p.uuid, 0]];
+  if (p.prev && p.prevUntil) uuids.push([p.prev, p.prevUntil]);
+  const hop = p.hop ? parseHopInput(p.hop).hop : null;
+  const pick = p.altMode === 'off' ? [] : p.altMode === 'custom' ? parseAltPick(p.altCustom).pick : ALT_PICK_DEFAULT;
+  return { uuids, enabled: p.enabled, edgeIP: p.edgeIP || '', hop, hopMode: p.hopMode || '', altTable: table || {}, altPick: pick };
+}
 
 // 订阅会下发的代理：启用、且域名 / 节点路径 / UUID 都已齐全（多个时订阅合并它们的节点）
 function readyProxies(cfg) {

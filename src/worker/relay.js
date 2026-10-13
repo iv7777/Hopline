@@ -2,42 +2,13 @@
 // 出站兜底：直连与自定义反代均失败后使用，透明代理模式发送去掉 VLESS 头部的原始
 // TLS 数据，由对端按 SNI 路由到目标
 // ---------------------------------------------------------------------------
-// 内置地区备用线路域名池（社区提供，解析为非 Cloudflare IP；以 base64 保存）
-// 当前内容（改动下面的 base64 时可参照，键为地区标签，值为域名）：
-//   HK: proxyip.hk.cmliussss.net
-//   US: proxyip.us.cmliussss.net
-//   SG: proxyip.sg.cmliussss.net
-//   JP: proxyip.jp.cmliussss.net
-//   KR: proxyip.kr.cmliussss.net
-//   DE: proxyip.de.cmliussss.net
-//   SE: proxyip.se.cmliussss.net
-//   NL: proxyip.nl.cmliussss.net
-//   FI: proxyip.fi.cmliussss.net
-//   GB: proxyip.gb.cmliussss.net
-//   Oracle: proxyip.oracle.cmliussss.net
-//   DigitalOcean: proxyip.digitalocean.cmliussss.net
-//   Vultr: proxyip.vultr.cmliussss.net
-//   Multacom: proxyip.multacom.cmliussss.net
-const ALT_DOMAINS = JSON.parse(atob('eyJISyI6InByb3h5aXAuaGsuY21saXVzc3NzLm5ldCIsIlVTIjoicHJveHlpcC51cy5jbWxpdXNzc3MubmV0IiwiU0ciOiJwcm94eWlwLnNnLmNtbGl1c3Nzcy5uZXQiLCJKUCI6InByb3h5aXAuanAuY21saXVzc3NzLm5ldCIsIktSIjoicHJveHlpcC5rci5jbWxpdXNzc3MubmV0IiwiREUiOiJwcm94eWlwLmRlLmNtbGl1c3Nzcy5uZXQiLCJTRSI6InByb3h5aXAuc2UuY21saXVzc3NzLm5ldCIsIk5MIjoicHJveHlpcC5ubC5jbWxpdXNzc3MubmV0IiwiRkkiOiJwcm94eWlwLmZpLmNtbGl1c3Nzcy5uZXQiLCJHQiI6InByb3h5aXAuZ2IuY21saXVzc3NzLm5ldCIsIk9yYWNsZSI6InByb3h5aXAub3JhY2xlLmNtbGl1c3Nzcy5uZXQiLCJEaWdpdGFsT2NlYW4iOiJwcm94eWlwLmRpZ2l0YWxvY2Vhbi5jbWxpdXNzc3MubmV0IiwiVnVsdHIiOiJwcm94eWlwLnZ1bHRyLmNtbGl1c3Nzcy5uZXQiLCJNdWx0YWNvbSI6InByb3h5aXAubXVsdGFjb20uY21saXVzc3NzLm5ldCJ9'));   // 备用线路域名表（base64，启动时解码一次）
-// 根据 Worker 所在机房 colo（IATA 代码）选择最近的中继地区
-function selectAltRegion(colo) {
-  const c = (colo || '').toUpperCase();
-  // 亚洲
-  if (c.startsWith('HKG') || c.startsWith('HK')) return 'HK';
-  if (c.startsWith('SIN') || c.startsWith('SG')) return 'SG';
-  if (c.startsWith('NRT') || c.startsWith('KIX') || c.startsWith('TYO') || c.startsWith('OSA') || c.startsWith('JP')) return 'JP';
-  if (c.startsWith('ICN') || c.startsWith('SEL') || c.startsWith('KR')) return 'KR';
-  if (/^(HKG|SIN|NRT|KIX|ICN|TYO|OSA|SEL|HK|SG|JP|KR|SJC)/.test(c)) return 'HK';
-  // 欧洲
-  if (c.startsWith('FRA') || c.startsWith('BER') || c.startsWith('MUC') || c.startsWith('DUS') || c.startsWith('HAM') || c.startsWith('STR') || c.startsWith('DE')) return 'DE';
-  if (c.startsWith('ARN') || c.startsWith('SE')) return 'SE';
-  if (c.startsWith('AMS') || c.startsWith('NL')) return 'NL';
-  if (c.startsWith('HEL') || c.startsWith('FI')) return 'FI';
-  if (c.startsWith('LHR') || c.startsWith('MAN') || c.startsWith('GB') || c.startsWith('UK')) return 'GB';
-  if (/^(FRA|ARN|AMS|HEL|LHR|MAN|CDG|MAD|VIE|ZRH|MXP|PRG|WAW|BER|MUC|DUS|HAM|STR|DE|SE|NL|FI|GB|UK|FR|ES|AT|CH|IT|CZ|PL)/.test(c)) return 'DE';
-  // 北美及其他默认 US
-  return 'US';
-}
+// Worker 所在机房（IATA 代码）→ 最近的地区标签（表里没有的机房按 US）。地区标签对应面板下发的备用线路表里的标签
+const COLO_REGIONS = {
+  HK: 'HKG', SG: 'SIN', JP: 'NRT KIX TYO OSA', KR: 'ICN SEL', SE: 'ARN', NL: 'AMS', FI: 'HEL', GB: 'LHR MAN',
+  DE: 'FRA BER MUC DUS HAM STR CDG MAD VIE ZRH MXP PRG WAW',
+};
+const COLO_TO_REGION = new Map(Object.entries(COLO_REGIONS).flatMap(([r, codes]) => codes.split(' ').map(c => [c, r])));
+function selectAltRegion(colo) { return COLO_TO_REGION.get(String(colo || '').toUpperCase().slice(0, 3)) || 'US'; }
 
 // EDGEIP 反代 IP 解析缓存（TTL 5 分钟：域名 → DoH TXT/A 解析结果）
 const EDGEIP_CACHE = new Map();
@@ -210,43 +181,32 @@ function payloadKindOf(bytes) {
   return (bytes[0] === 0x16 && bytes[1] === 0x03) ? 'tls' : 'nontls';
 }
 
-// 按面板「内置地区反代」设置得出要竞速的反代：[{ host, port, take }]（take = 取该域名解析结果的前几个 IP）
-//   off     → 空（不使用地区反代）
-//   custom  → 自定义列表（最多 3 个，第一个取 2 个 IP，其余各 1 个）
-//   builtin → 首选地区（relay.region，留空按机房自动选）取 2 个 IP + 次选地区（relay.region2，留空取默认的另一地区，'none' 不用）取 1 个 IP
+// 按面板下发的备用线路得出要竞速的线路：[{ host, port, txt, take }]（take = 取该域名解析结果的前几个 IP）。
+// altPick 是按优先顺序排列的标签（auto = 按 Worker 机房选最近的地区），altTable 是 标签 → { host, port, txt }；
+// 取前 ALT_MAX 个不重复的线路，第一个取 2 个 IP，其余各 1 个；altPick 为空 = 不使用备用线路
 function altPlan(cfg, colo) {
-  const rl = cfg.alt || {};
-  const mode = rl.mode || 'builtin';
-  if (mode === 'off') return [];
-  if (mode === 'custom') {
-    return String(rl.custom || '').split('\n').map(s => s.trim()).filter(Boolean).slice(0, ALT_CUSTOM_MAX).map((entry, i) => {
-      const { host, port } = parseHostPort(entry, 443);
-      return { host, port, take: i === 0 ? 2 : 1 };
-    });
+  const out = [], seen = new Set();
+  for (const tag of cfg.altPick || []) {
+    const e = cfg.altTable && cfg.altTable[tag === 'auto' ? selectAltRegion(colo) : tag];
+    if (!e) continue;
+    const key = e.host + ':' + (e.port || 443);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ host: e.host, port: e.port || 443, txt: e.txt === true, take: out.length ? 1 : 2 });
+    if (out.length >= ALT_MAX) break;
   }
-  const primary = ALT_DOMAINS[rl.region] ? rl.region : selectAltRegion(colo);
-  const plan = [{ host: ALT_DOMAINS[primary], port: 443, take: 2, txt: false }];   // 内置域名只有 A 记录
-  if (rl.region2 !== 'none') {
-    const second = (ALT_DOMAINS[rl.region2] && rl.region2 !== primary) ? rl.region2 : Object.keys(ALT_DOMAINS).find(r => r !== primary);
-    plan.push({ host: ALT_DOMAINS[second], port: 443, take: 1, txt: false });
-  }
-  return plan;
+  return out;
 }
 
 // 打开到目标的出站连接（自定义反代 / 出站代理 / 直连 / 地区反代）
 // 反代均为透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标。
-// 出站模式语义：only = 仅走出站代理（失败用地区反代兜底，地区反代设为 off 时不兜底）；'' 默认 = 出站代理优先，失败后直连 ∥ 反代；
-// no = 直连 ∥ 反代优先，都不通时最后用出站代理
+// 出站模式语义：only = 仅走出站代理（失败用备用线路兜底，没有备用线路时不兜底）；'' 默认 = 出站代理优先，失败后直连 ∥ 备用线路
 async function openUpstream(parsed, cfg, colo, payloadKind) {
-  const hop = parseHopAddress(cfg.hopAddr);
+  const hop = cfg.hop || null;
   const mode = cfg.hopMode || '';
   const allowSniAlt = payloadKind !== 'nontls';
 
-  const viaHop = hop ? (hop.type === 'http' || hop.type === 'https'
-    ? (t) => connectViaHtHop(hop, t)
-    : hop.type === 'ss'
-      ? (t) => connectViaAead(hop, t)
-      : (t) => connectViaS5(hop, t)) : null;
+  const viaHop = hop ? (hop.type === 'socks5' ? (t) => connectViaS5(hop, t) : (t) => connectViaHtHop(hop, t)) : null;
 
   let lastErr;
   const attempt = async (fn) => { try { const r = await fn(); if (r) return r; } catch (e) { lastErr = e; } return null; };
@@ -268,7 +228,7 @@ async function openUpstream(parsed, cfg, colo, payloadKind) {
     if (!allowSniAlt) return [];
     return altPlan(cfg, colo).map((p) => async () => {
       let ts = [];
-      try { ts = await resolveEdgeIPs(p.host, p.port, { txt: p.txt !== false }); } catch (e) { return null; }
+      try { ts = await resolveEdgeIPs(p.host, p.port, { txt: p.txt }); } catch (e) { return null; }
       if (!ts.length) return null;
       return await raceConnect(ts.slice(0, p.take).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT))));
     });
@@ -300,13 +260,10 @@ async function openUpstream(parsed, cfg, colo, payloadKind) {
     const r = await pickBest(); if (r) return r;   // 未配置出站代理：按直连处理
     return fail();
   }
-  if (mode === '' && hopJob) {
+  if (hopJob) {   // 默认：出站代理优先，失败后直连 ∥ 备用线路
     const r = await hopJob(); if (r) return r;
-    const r2 = await pickBest(); if (r2) return r2;
-    return fail();
   }
   const r = await pickBest(); if (r) return r;
-  if (hopJob) { const r2 = await hopJob(); if (r2) return r2; }
   return fail();
 }
 

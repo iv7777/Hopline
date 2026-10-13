@@ -24,6 +24,8 @@
 // @include worker/hmac.js
 // @include worker/doh.js
 // @include worker/config.js
+// @include worker/hop.js
+// @include worker/routes.js
 // @include worker/proxy-client.js
 // @include worker/proxies.js
 // @include worker/proxies-api.js

@@ -210,56 +210,55 @@
       </div>
     </section>
 
-    <!-- ===== 视图：代理设置（通过签名 HTTPS 接口在线修改代理的出站 / 地区反代设置） ===== -->
-    <section class="view" data-view="proxy" data-title="代理设置" data-sub="在线修改代理脚本的落地、出站与地区反代设置（面板用密钥签名后通过 HTTPS 发给代理，不经过订阅）">
+    <!-- ===== 视图：代理设置（落地 / 出站 / 备用线路：保存在面板里，整份下发给代理） ===== -->
+    <section class="view" data-view="proxy" data-title="代理设置" data-sub="代理的落地、出站与备用线路设置，以及所有代理共用的备用线路表（保存在面板里，面板用密钥签名后下发给代理）">
       <div class="card">
         <h3><span class="tick"></span>状态</h3>
         <div class="note-box" id="px-note" style="margin:0">读取中…</div>
         <div class="field" id="px-whichbox" style="display:none;margin:12px 0 0"><label>要修改的代理</label><select id="px-which" onchange="onProxyWhich()"></select></div>
         <div class="inrow" style="margin-top:12px">
           <button class="btn" id="px-reload" onclick="loadProxySettings()">重新读取</button>
-          <button class="btn primary" id="px-save" onclick="saveProxySettings()">保存到代理</button>
-          <button class="btn danger" id="px-reset" onclick="resetProxySettings()">恢复为环境变量</button>
+          <button class="btn primary" id="px-save" onclick="saveProxySettings()">保存并下发</button>
+          <button class="btn danger" id="px-reset" onclick="resetProxySettings()">恢复默认</button>
         </div>
-        <p class="hint" style="margin-top:10px">这里的设置只保存在代理自己的 KV（变量名 NODE_KV）里，面板不保存；保存后代理约 1 分钟内生效（KV 同步与缓存）。优先级：这里的设置 &gt; 代理的环境变量 &gt; 默认值；与环境变量相同的值不会存入 KV。节点路径（PATH）与密钥（NODE_KEY）只能在代理的环境变量里改，改完后到「面板设置 → 代理」同步更新；UUID 由面板管理。「恢复为环境变量」会清除这里保存的全部覆盖项。</p>
+        <p class="hint" style="margin-top:10px">这里的设置保存在面板里（和代理的域名、密钥一起），保存时整份下发给代理，代理约 1 分钟内生效（KV 同步与缓存）；之后哪怕代理的 KV 被清空，点「连接并同步」也能原样恢复。有多个代理时，每个代理各有一份设置。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>落地与出站</h3>
-        <div class="field"><label>反代 / 落地 IP（填写后作为固定出口优先使用；留空则直连失败后由地区反代兜底（见下方「内置地区反代」），格式 host 或 host:port）</label><input type="text" id="s-proxyIP" placeholder="留空则直连失败后走地区反代" autocomplete="off"><div class="hint src" data-src="edgeIP"></div></div>
-        <div class="field"><label>出站代理（可选）</label><input type="text" id="s-outbound" placeholder="socks5://user:pass@1.2.3.4:1080 或 ss://chacha20-ietf-poly1305:密码@1.2.3.4:8388" autocomplete="off"><div class="hint src" data-src="hopAddr"></div></div>
-        <p class="hint">支持 socks5://（可带 user:pass@）、http(s)://、ss:// 或 host:port（默认按 socks5，端口 1080）。SS 加密支持 aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305。未填写出站代理时，三种出站方式都按直连处理。</p>
+        <div class="field"><label>反代 / 落地 IP（填写后作为固定出口优先使用；留空则直连失败后由备用线路兜底，格式 host 或 host:port）</label><input type="text" id="s-proxyIP" placeholder="留空则直连失败后走备用线路" autocomplete="off"></div>
+        <div class="field"><label>出站代理（可选）</label><input type="text" id="s-outbound" placeholder="socks5://user:pass@1.2.3.4:1080 或 http://1.2.3.4:8080" autocomplete="off"></div>
+        <p class="hint">支持 socks5://（可带 user:pass@）、http(s)://，或 host:port（默认按 socks5，端口 1080）；不再支持 Shadowsocks。用户名与密码保存在面板的 KV 里，并随状态下发到代理的 KV。</p>
         <div class="field" style="margin-bottom:0"><label>出站方式</label>
           <select id="s-outmode">
-            <option value="">默认（先走代理，失败后直连 / 地区反代）</option>
-            <option value="no">直连 / 地区反代优先，都不通再走代理（no）</option>
-            <option value="only">仅走代理，失败后只用地区反代、不直连（only）</option>
+            <option value="">默认（先走出站代理，失败后直连 / 备用线路）</option>
+            <option value="only">仅走出站代理，失败后只用备用线路、不直连（only）</option>
           </select>
-          <div class="hint src" data-src="hopMode"></div>
+        </div>
+        <p class="hint" style="margin-top:10px">未填写出站代理时，两种出站方式都按直连处理。</p>
+      </div>
+      <div class="card">
+        <h3><span class="tick"></span>备用线路（这个代理）</h3>
+        <p class="hint" style="margin-top:0">直连不通（例如目标站同在 Cloudflare 上）时，代理会把 TLS 流量交给备用线路按 SNI 转发，并与直连并发竞速。线路是第三方服务器，能看到目标域名与连接元数据；不想经第三方时选「关闭」。非 TLS 流量不会走备用线路。线路表见下方。</p>
+        <div class="field"><label>选用方式</label>
+          <select id="rl-mode" onchange="onRelayMode()">
+            <option value="auto">自动（按 Worker 所在机房选最近的地区，再补 HK、US）</option>
+            <option value="custom">自定义顺序（只用我列出的线路标签）</option>
+            <option value="off">关闭（只直连 / 出站代理）</option>
+          </select>
+        </div>
+        <div class="field" id="rl-custom-box" style="margin-bottom:0">
+          <label>线路标签（按优先顺序，逗号分隔，最多 8 个；auto = 按机房自动选最近地区；第一条取 2 个 IP，其余各取 1 个，最多用 3 条）</label>
+          <input type="text" id="rl-custom" placeholder="auto,HK,US" autocomplete="off">
+          <div class="hint" id="rl-tags"></div>
         </div>
       </div>
       <div class="card">
-        <h3><span class="tick"></span>内置地区反代</h3>
-        <p class="hint" style="margin-top:0">直连不通（例如目标站同在 Cloudflare 上）时，代理会把 TLS 流量交给地区反代按 SNI 转发，并与直连并发竞速。反代是第三方服务器，能看到目标域名与连接元数据；不想经第三方时选「关闭」，或改用自己的反代。非 TLS 流量不会走地区反代。</p>
-        <div class="field"><label>地区反代模式</label>
-          <select id="rl-mode" onchange="onRelayMode()">
-            <option value="builtin">内置（proxyip.*.cmliussss.net，按 Worker 机房自动选地区）</option>
-            <option value="custom">仅使用我的反代列表</option>
-            <option value="off">关闭（只直连 / 出站代理）</option>
-          </select>
-          <div class="hint src" data-src="alt.mode"></div>
-        </div>
-        <div id="rl-builtin-box">
-          <div class="inrow">
-            <div class="field" style="flex:1;margin-bottom:0"><label>首选地区（取 2 个 IP）</label><select id="rl-region"></select><div class="hint src" data-src="alt.region"></div></div>
-            <div class="field" style="flex:1;margin-bottom:0"><label>次选地区（取 1 个 IP）</label><select id="rl-region2"></select><div class="hint src" data-src="alt.region2"></div></div>
-          </div>
-          <div class="hint">首选留空 = 按 Worker 所在机房自动选择；次选留空 = 默认的另一地区（首选为 HK 时用 US，否则用 HK），选「不使用」则只用首选地区。</div>
-        </div>
-        <div class="field" id="rl-custom-box" style="margin-bottom:0">
-          <label>自定义反代列表（每行一个 host 或 host:port，最多 3 个，IPv6 需加方括号）</label>
-          <textarea id="rl-custom" rows="3" placeholder="proxyip.example.com&#10;203.0.113.10:443" autocomplete="off"></textarea>
-          <div class="hint src" data-src="alt.custom"></div>
-          <div class="hint">域名按 TXT / A 记录解析（与「反代 / 落地 IP」相同，缓存 5 分钟）；多个条目并发竞速。「反代 / 落地 IP」仍然优先于这里。</div>
+        <h3><span class="tick"></span>备用线路表（所有代理共用）</h3>
+        <p class="hint" style="margin-top:0">每行「标签 域名[:端口] [txt]」，# 开头是注释。标签 <code>auto</code> 保留给自动选择；<code>HK / US / SG / JP / KR / DE / SE / NL / FI / GB</code> 是自动选择会用到的地区标签。末尾写 <code>txt</code> = 解析时先查该域名的 TXT 记录（TXT 里放 IP 列表时用），默认只查 A 记录。保存后会立即下发给所有代理。</p>
+        <div class="field" style="margin-bottom:0"><textarea id="rt-text" rows="18" spellcheck="false" autocomplete="off" style="font-family:ui-monospace,Consolas,monospace;font-size:12.5px"></textarea></div>
+        <div class="inrow" style="margin-top:12px">
+          <button class="btn primary" id="rt-save" onclick="saveAltRoutes()">保存并下发给全部代理</button>
+          <button class="btn" onclick="defaultAltRoutes()">载入默认表</button>
         </div>
       </div>
     </section>
@@ -271,7 +270,7 @@
         <p class="hint" style="margin-top:0;margin-bottom:12px">订阅里的节点指向哪里：可以添加多个代理，订阅会<b>合并所有启用的代理</b>（每个代理各出一套节点，多个时节点名带「·代理名」后缀，总数仍受 500 的上限，平均分给各代理）。点列表里的代理进行编辑。每个代理填写代理脚本（Hopline-proxy.js）所在的域名、它的环境变量 PATH（节点路径）和 NODE_KEY（密钥）。面板用密钥签名后通过 HTTPS 联系代理：<b>UUID 由面板生成并下发给代理</b>（存在代理的 NODE_KV 里），不需要手工填写。密钥只写入、不回显；留空保持不变。</p>
         <div class="note-box" id="px-conn" style="margin:0 0 12px">读取中…</div>
         <div id="px-list"></div>
-        <div class="inrow" style="margin:0 0 14px"><button class="btn sm" onclick="newProxyEntry()">＋ 添加代理</button></div>
+        <div class="inrow" style="margin:0 0 14px"><button class="btn sm" onclick="newProxyEntry()">＋ 添加代理</button><button class="btn sm" onclick="syncAllProxies()">同步全部代理</button></div>
         <div class="field"><label>名称（可选）</label><input type="text" id="a-pname" placeholder="代理 1" autocomplete="off"></div>
         <div class="field"><label>代理域名（节点 SNI / Host，如 node.example.com；须是代理 Worker 的自定义域名）</label><input type="text" id="a-host" placeholder="node.example.com" autocomplete="off"></div>
         <div class="field"><label>节点路径（须与代理脚本的环境变量 PATH 相同）</label><input type="text" id="a-nodepath" placeholder="mynode" autocomplete="off"></div>

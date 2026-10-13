@@ -28,7 +28,10 @@ const worker = proxyModule.default;
 const UUID = '11111111-2222-4333-8444-555555555555';
 const KEY = 'test-node-key-0123456789-abcdef';
 // 代理的环境变量只有 PATH 与 NODE_KEY；UUID 由面板下发、保存在 NODE_KV 的 state 里（这里直接预置）；路径取 UUID 的值，使 /<UUID> 即节点入口
-const baseEnv = (extra = {}) => ({ PATH: UUID, NODE_KEY: KEY, NODE_KV: memKv({ state: { uuid: UUID } }), ...extra });
+// 状态（UUID、启用、落地 / 出站 / 备用线路）整份来自面板：测试里默认是「一个 UUID + 内置地区线路表 + 默认顺序 auto,HK,US」，用 set 覆盖其中的项
+const REGION_TABLE = Object.fromEntries(['HK', 'US', 'SG', 'JP', 'KR', 'DE', 'SE', 'NL', 'FI', 'GB'].map(r => [r, { host: `proxyip.${r.toLowerCase()}.cmliussss.net` }]));
+const stateWith = (set = {}) => ({ uuids: [[UUID, 0]], enabled: true, edgeIP: '', hop: null, hopMode: '', altTable: REGION_TABLE, altPick: ['auto', 'HK', 'US'], ...set });
+const baseEnv = (extra = {}) => { const { set, ...rest } = extra; return { PATH: UUID, NODE_KEY: KEY, NODE_KV: memKv({ state: stateWith(set) }), ...rest }; };
 
 // ---------------- 优选 IP 来源开关：HostMonit / uouin / 自定义 API ----------------
 import { createHash } from 'node:crypto';
@@ -197,15 +200,15 @@ test('目标为 Cloudflare IP：不发注定失败的直连，直接走反代；
   });
 });
 
-test('内置地区反代域名只查 A 记录（这些域名没有 TXT），自定义反代仍查 TXT', async () => {
+test('备用线路默认只查 A 记录；线路表里标了 txt 的才先查 TXT', async () => {
   fakeNet({ '198.51.100.31': { delay: 5 }, '198.51.100.32': { delay: 5 }, 'tx.example': { delay: 'fail' } });
   const dns = [];
   const stub = dohStub({ 'cloudflare-dns.com': { answers: {
     'proxyip.jp.cmliussss.net|A': ['198.51.100.31'], 'proxyip.sg.cmliussss.net|A': ['198.51.100.32'], 'my-alt.example.net|A': ['198.51.100.31'] } } }, dns);
-  await withFetch(stub, () => connectVia(baseEnv({ ALT_MODE: 'builtin', ALT_REGION: 'JP', ALT_REGION2: 'SG' }), 'tx.example'));
+  await withFetch(stub, () => connectVia(baseEnv({ set: { altPick: ['JP', 'SG'] } }), 'tx.example'));
   await until(() => dns.filter(d => /cmliussss/.test(d.name)).length >= 2);
   assert.deepEqual(dns.filter(d => /cmliussss/.test(d.name)).map(d => d.type), ['A', 'A']);
-  await withFetch(stub, () => connectVia(baseEnv({ ALT_MODE: 'custom', ALT_CUSTOM: 'my-alt.example.net' }), 'tx.example'));
+  await withFetch(stub, () => connectVia(baseEnv({ set: { altTable: { 'my-alt': { host: 'my-alt.example.net', txt: true } }, altPick: ['my-alt'] } }), 'tx.example'));
   await until(() => dns.filter(d => d.name === 'my-alt.example.net').length >= 2);
   assert.deepEqual(dns.filter(d => d.name === 'my-alt.example.net').map(d => d.type).sort(), ['A', 'TXT']);
 });
@@ -323,15 +326,15 @@ const ipv6Bytes = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]; 
 
 const vlessReqV6 = (port) => new Uint8Array([0, ...uuidBytes, 0, 1, port >> 8, port & 255, 3, ...ipv6Bytes, ...TLS_HELLO]);
 
-test('出站代理：密码含未编码 @ 时主机名解析正确；S5 对 IPv6 目标使用 ATYP=4；HTTP CONNECT 给 IPv6 加方括号', async () => {
+test('出站代理：S5 带用户名密码认证、对 IPv6 目标使用 ATYP=4；HTTP CONNECT 给 IPv6 加方括号', async () => {
   const feed = async (sock, bytes) => { await until(() => sock.push); sock.push(new Uint8Array(bytes)); };
-  // SOCKS5：socks5://us:p@ss@10.0.0.1:1080
+  // SOCKS5：用户名 us、密码 p@ss（面板已把地址解析好，代理收到的是结构化的数据）
   let log = fakeNet({ '10.0.0.1': { delay: 5 } });
-  let env = baseEnv({ HOP_ADDR: 'socks5://us:p@ss@10.0.0.1:1080', HOP_MODE: 'only' });
+  let env = baseEnv({ set: { hop: { type: 'socks5', host: '10.0.0.1', port: 1080, user: 'us', pass: 'p@ss' }, hopMode: 'only' } });
   let ws = await openWs(env);
   ws.emit('message', { data: vlessReqV6(443).buffer });   // 握手需要下面喂数据才会完成：不能 await
   await until(() => log.length && log[0].written.length);
-  assert.equal(log[0].hostname, '10.0.0.1', '以最后一个 @ 分隔凭据与主机');
+  assert.equal(log[0].hostname, '10.0.0.1');
   assert.equal(log[0].port, 1080);
   await feed(log[0], [5, 2]);                                   // 服务器选择用户名密码认证
   await until(() => log[0].written.length >= 2);
@@ -344,7 +347,7 @@ test('出站代理：密码含未编码 @ 时主机名解析正确；S5 对 IPv6
   assert.deepEqual(req.slice(20), [1, 187]);
   // HTTP CONNECT
   log = fakeNet({ '10.0.0.2': { delay: 5 } });
-  env = baseEnv({ HOP_ADDR: 'http://10.0.0.2:8080', HOP_MODE: 'only' });
+  env = baseEnv({ set: { hop: { type: 'http', host: '10.0.0.2', port: 8080 }, hopMode: 'only' } });
   ws = await openWs(env);
   ws.emit('message', { data: vlessReqV6(443).buffer });
   await until(() => log.length && log[0].written.length);
@@ -431,7 +434,7 @@ const connectVia = async (env, host) => {
 test('反代 / 落地域名解析：每种记录只发 1 个 DoH 请求（Cloudflare 优先）；结果缓存复用，但不跨请求共享进行中的解析', async () => {
   const log = fakeNet({ '198.51.100.5': { delay: 5 } });
   const dns = [];
-  const env = baseEnv({ EDGEIP: 'dedupe.example.com' });
+  const env = baseEnv({ set: { edgeIP: 'dedupe.example.com' } });
   await withFetch(dohStub({ 'cloudflare-dns.com': { delay: 40, answers: { 'dedupe.example.com|A': ['198.51.100.5'] } } }, dns), async () => {
     const sockets = [];
     for (let i = 0; i < 4; i++) sockets.push(await openWs(env));
@@ -453,14 +456,14 @@ test('反代域名解析：首选 DoH 失败时才换下一个端点；全部失
   fakeNet({ '198.51.100.6': { delay: 5 }, 'neg.example.com': { delay: 5 } });
   // 首选端点 500 → 第二个端点接手，第三个不被访问
   let dns = [];
-  let env = baseEnv({ EDGEIP: 'fallback.example.com' });
+  let env = baseEnv({ set: { edgeIP: 'fallback.example.com' } });
   await withFetch(dohStub({ 'dns.alidns.com': { answers: { 'fallback.example.com|A': ['198.51.100.6'] } } }, dns), () => connectVia(env, 't.example'));
   let hosts = dns.filter(d => d.name === 'fallback.example.com').map(d => d.host);
   assert.deepEqual([...new Set(hosts)].sort(), ['cloudflare-dns.com', 'dns.alidns.com']);
   assert.ok(!hosts.includes('doh.pub'));
   // 全部失败：第一次尝试所有端点，第二次连接直接用缓存的「无结果」
   dns = [];
-  env = baseEnv({ EDGEIP: 'neg.example.com' });
+  env = baseEnv({ set: { edgeIP: 'neg.example.com' } });
   await withFetch(dohStub({}, dns), () => connectVia(env, 't.example'));
   const first = dns.filter(d => d.name === 'neg.example.com').length;
   assert.ok(first >= 6, `第一次查询了所有端点（${first}）`);
@@ -499,7 +502,7 @@ import { assemble } from '../build.mjs';
 const internals = (() => {
   const src = assemble('proxy')
     .replace(/^import .*$/gm, '').replace('export default {', 'const __default = {').replace(/^export class /gm, 'class ');
-  return new Function('connect', src + '\n;return { md5Bytes, sha1Bytes, hmacSha1, hkdfSha1, poly1305, chacha20Poly1305Seal, chacha20Poly1305Open, parseVssProtoHeader, isValidIp, parseHopAddress, altPlan, ALT_DOMAINS, nodeConfig, pumpReadable, routeTag, uuidTag };')(() => { throw new Error('no sockets'); });
+  return new Function('connect', src + '\n;return { parseVssProtoHeader, isValidIp, altPlan, selectAltRegion, nodeConfig, checkState, pumpReadable, routeTag, shortHash };')(() => { throw new Error('no sockets'); });
 })();
 
 const hex = (u8) => Buffer.from(u8).toString('hex');
@@ -549,48 +552,6 @@ const lens = [0, 1, 3, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 1000];   // �
 
 const msgOf = (n) => 'x'.repeat(n);
 
-test('MD5 / SHA-1 / HMAC-SHA1 / HKDF-SHA1 与 node:crypto 结果一致（含 RFC 已知答案与填充边界）', () => {
-  const md5hex = (m) => hex(internals.md5Bytes(new TextEncoder().encode(m)));
-  assert.equal(md5hex(''), 'd41d8cd98f00b204e9800998ecf8427e');
-  assert.equal(md5hex('abc'), '900150983cd24fb0d6963f7d28e17f72');
-  assert.equal(hex(internals.sha1Bytes(new TextEncoder().encode('abc'))), 'a9993e364706816aba3e25717850c26c9cd0d89d');
-  for (const n of lens) {
-    const m = msgOf(n), bytes = new TextEncoder().encode(m);
-    assert.equal(md5hex(m), createHash('md5').update(m).digest('hex'), `md5 len ${n}`);
-    assert.equal(hex(internals.sha1Bytes(bytes)), createHash('sha1').update(m).digest('hex'), `sha1 len ${n}`);
-  }
-  const key = randomBytes(100), data = randomBytes(77);   // 密钥超过一个分组：先哈希
-  assert.equal(hex(internals.hmacSha1(key, data)), createHmac('sha1', key).update(data).digest('hex'));
-  const ikm = randomBytes(32), salt = randomBytes(16);
-  for (const keyLen of [16, 32]) {
-    assert.equal(hex(internals.hkdfSha1(ikm, salt, keyLen)), Buffer.from(hkdfSync('sha1', ikm, salt, 'ss-subkey', keyLen)).toString('hex'), `hkdf ${keyLen}`);
-  }
-});
-
-test('Poly1305 / ChaCha20-Poly1305 通过 RFC 8439 已知答案，并与 node:crypto 互通、拒绝被篡改的数据', () => {
-  // RFC 8439 §2.5.2 Poly1305
-  const tag = internals.poly1305(fromHexStr('85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b'), new TextEncoder().encode('Cryptographic Forum Research Group'));
-  assert.equal(hex(tag), 'a8061dc1305136c6c22b8baf0c0127a9');
-  // RFC 8439 §2.8.2 AEAD
-  const key = fromHexStr('808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f');
-  const nonce = fromHexStr('070000004041424344454647');
-  const aad = fromHexStr('50515253c0c1c2c3c4c5c6c7');
-  const pt = new TextEncoder().encode("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.");
-  const sealed = internals.chacha20Poly1305Seal(key, nonce, pt, aad);
-  assert.equal(hex(sealed.slice(-16)), '1ae10b594f09e26a7e902ecbd0600691');
-  assert.equal(hex(sealed.slice(0, 16)), 'd31a8d34648e60db7b86afbc53ef7ec2');
-  assert.equal(Buffer.from(internals.chacha20Poly1305Open(key, nonce, sealed, aad)).toString(), Buffer.from(pt).toString());
-  // 与 node 互通（随机数据、多种长度）
-  for (const n of [0, 1, 15, 16, 17, 64, 65, 200, 1000]) {
-    const k = randomBytes(32), nc = randomBytes(12), p = randomBytes(n);
-    const c = createCipheriv('chacha20-poly1305', k, nc, { authTagLength: 16 });
-    const expected = Buffer.concat([c.update(p), c.final(), c.getAuthTag()]);
-    assert.equal(hex(internals.chacha20Poly1305Seal(k, nc, p)), expected.toString('hex'), `seal len ${n}`);
-  }
-  const bad = Uint8Array.from(sealed); bad[3] ^= 1;
-  assert.equal(internals.chacha20Poly1305Open(key, nonce, bad, aad), null, '篡改后认证失败');
-});
-
 test('协议头解析：任意截断只会报「头部过短」；乱码只会抛普通 Error（不出现 RangeError / TypeError）', () => {
   const cfg = { uuids: [UUID] };
   const vless = [vlessReq('example.com', 443), vlessReqV6(443), new Uint8Array([0, ...uuidBytes, 3, 7, 7, 7, 1, 0, 80, 1, 1, 2, 3, 4])];
@@ -607,87 +568,6 @@ test('协议头解析：任意截断只会报「头部过短」；乱码只会�
   }
 });
 
-// ---------------- Shadowsocks AEAD 出站：对照 node:crypto 实现的参考服务端 ----------------
-// 参考实现完全按 SS AEAD 规范独立编写（EVP_BytesToKey、salt=密钥长度、HKDF-SHA1 子密钥、小端 nonce 计数、≤0x3FFF 分块、
-// 数据流以目标地址头开头），用来验证 worker 的 ss:// 出站客户端能与真实服务端互通
-const ssMethods = { 'aes-128-gcm': { cipher: 'aes-128-gcm', keyLen: 16 }, 'aes-256-gcm': { cipher: 'aes-256-gcm', keyLen: 32 }, 'chacha20-ietf-poly1305': { cipher: 'chacha20-poly1305', keyLen: 32 } };
-
-function ssRefKey(password, keyLen) {
-  let key = Buffer.alloc(0), prev = Buffer.alloc(0);
-  while (key.length < keyLen) { prev = createHash('md5').update(Buffer.concat([prev, Buffer.from(password)])).digest(); key = Buffer.concat([key, prev]); }
-  return key.subarray(0, keyLen);
-}
-
-function ssRefStream(method, password, salt) {
-  const m = ssMethods[method];
-  const sub = Buffer.from(hkdfSync('sha1', ssRefKey(password, m.keyLen), salt, 'ss-subkey', m.keyLen));
-  let counter = 0n;
-  const nonce = () => { const n = Buffer.alloc(12); n.writeBigUInt64LE(counter++); return n; };   // 小端计数器
-  return {
-    seal(pt) { const c = createCipheriv(m.cipher, sub, nonce(), { authTagLength: 16 }); return Buffer.concat([c.update(pt), c.final(), c.getAuthTag()]); },
-    open(ct) { const d = createDecipheriv(m.cipher, sub, nonce(), { authTagLength: 16 }); d.setAuthTag(ct.subarray(-16)); return Buffer.concat([d.update(ct.subarray(0, -16)), d.final()]); },
-  };
-}
-
-// 从客户端写入的字节流解出全部明文（遇到不完整的块停止）
-function ssRefDecodeClient(method, password, bytes) {
-  const keyLen = ssMethods[method].keyLen;
-  const buf = Buffer.concat(bytes.map(b => Buffer.from(b)));
-  if (buf.length < keyLen) return { plain: Buffer.alloc(0), maxChunk: 0 };
-  const dec = ssRefStream(method, password, buf.subarray(0, keyLen));
-  let off = keyLen, maxChunk = 0; const out = [];
-  while (off + 18 <= buf.length) {
-    const len = dec.open(buf.subarray(off, off + 18)).readUInt16BE(0);
-    if (len > 0x3fff || off + 18 + len + 16 > buf.length) break;
-    out.push(dec.open(buf.subarray(off + 18, off + 18 + len + 16)));
-    off += 18 + len + 16; maxChunk = Math.max(maxChunk, len);
-  }
-  return { plain: Buffer.concat(out), maxChunk };
-}
-for (const method of Object.keys(ssMethods)) {
-  test(`Shadowsocks 出站（${method}）：与按规范实现的参考服务端互通——目标地址头、分块、小端 nonce、双向数据`, async () => {
-    const password = 'p@ss word!';
-    const targets = [
-      ['example.com', Buffer.from([3, 11, ...Buffer.from('example.com'), 1, 187])],
-    ];
-    for (const [host, expectHeader] of targets) {
-      const log = fakeNet({ '10.0.0.9': { delay: 5 } });
-      const env = baseEnv({ HOP_ADDR: `ss://${method}:${encodeURIComponent(password)}@10.0.0.9:8388`, HOP_MODE: 'only' });
-      const ws = await openWs(env);
-      const big = new Uint8Array(40000).map((_, i) => i & 255); big.set(TLS_HELLO);   // 超过单块上限：必须拆块
-      await ws.emit('message', { data: vlessReq(host, 443, [...big]).buffer });
-      await until(() => log.length && ssRefDecodeClient(method, password, log[0].written).plain.length >= expectHeader.length + big.length);
-      const { plain, maxChunk } = ssRefDecodeClient(method, password, log[0].written);
-      assert.deepEqual([...plain.subarray(0, expectHeader.length)], [...expectHeader], '数据流以目标地址头开始');
-      assert.deepEqual([...plain.subarray(expectHeader.length)], [...big], '转发的数据完整');
-      assert.ok(maxChunk <= 0x3fff, `单块 ${maxChunk} 字节不超过 0x3FFF`);
-      assert.equal(log[0].written[0].length >= ssMethods[method].keyLen, true);
-      // 服务端回包：salt + 多个块（nonce 逐块递增），客户端解密后转给 WebSocket
-      const serverSalt = randomBytes(ssMethods[method].keyLen);
-      const enc = ssRefStream(method, password, serverSalt);
-      const chunk = (pt) => Buffer.concat([enc.seal(Buffer.from([pt.length >> 8, pt.length & 255])), enc.seal(Buffer.from(pt))]);
-      log[0].push(Buffer.concat([serverSalt, chunk([9, 9, 9]), chunk([7, 7])]));
-      const down = () => ws.sent.slice(1).flatMap(x => [...x]);   // 下行小块可能被合并成一条消息：按字节比较
-      await until(() => down().length >= 5);
-      assert.deepEqual(down(), [9, 9, 9, 7, 7]);
-    }
-  });
-}
-
-test('Shadowsocks 出站：IPv4 / IPv6 目标使用对应的地址类型；密码派生与 EVP_BytesToKey 一致', async () => {
-  const method = 'aes-256-gcm', password = 'secret';
-  const run = async (req, header) => {
-    const log = fakeNet({ '10.0.0.9': { delay: 5 } });
-    const env = baseEnv({ HOP_ADDR: `ss://${method}:${password}@10.0.0.9:8388`, HOP_MODE: 'only' });
-    const ws = await openWs(env);
-    await ws.emit('message', { data: req.buffer });
-    await until(() => log.length && ssRefDecodeClient(method, password, log[0].written).plain.length >= header.length);
-    assert.deepEqual([...ssRefDecodeClient(method, password, log[0].written).plain.subarray(0, header.length)], [...header]);
-  };
-  await run(new Uint8Array([0, ...uuidBytes, 0, 1, 1, 187, 1, 1, 2, 3, 4, ...TLS_HELLO]), [1, 1, 2, 3, 4, 1, 187]);
-  await run(vlessReqV6(443), [4, ...ipv6Bytes, 1, 187]);
-});
-
 // ---------------- 可配置：优选域名 / 内置地区反代 ----------------
 const cfDoh = (map, log = []) => async (url) => {   // 简易 DoH：map[域名] = [A 记录]，其余无记录
   const u = new URL(url); const name = u.searchParams.get('name'), type = { 1: 'A', 28: 'AAAA' }[u.searchParams.get('type')] || u.searchParams.get('type');
@@ -696,36 +576,42 @@ const cfDoh = (map, log = []) => async (url) => {   // 简易 DoH：map[域名] 
   return new Response(JSON.stringify({ Status: 0, Answer: ips.map(data => ({ type: 1, data })) }));
 };
 
-test('地区反代计划：默认按机房自动选地区；可固定首选 / 次选；none 只用首选；custom 取前 3 个；off 为空', () => {
-  const plan = (relay, colo) => internals.altPlan({ alt: relay }, colo).map(p => `${p.host}:${p.port}x${p.take}`);
-  const R = internals.ALT_DOMAINS;
-  assert.deepEqual(plan(undefined, 'NRT'), [`${R.JP}:443x2`, `${R.HK}:443x1`], '默认：机房对应地区 + 默认的另一地区');
-  assert.deepEqual(plan({ mode: 'builtin' }, 'HKG'), [`${R.HK}:443x2`, `${R.US}:443x1`], '首选为 HK 时次选用 US');
-  assert.deepEqual(plan({ mode: 'builtin', region: 'DE', region2: 'NL' }, 'NRT'), [`${R.DE}:443x2`, `${R.NL}:443x1`]);
-  assert.deepEqual(plan({ mode: 'builtin', region: 'DE', region2: 'none' }, 'NRT'), [`${R.DE}:443x2`]);
-  assert.deepEqual(plan({ mode: 'builtin', region: 'DE', region2: 'DE' }, 'NRT'), [`${R.DE}:443x2`, `${R.HK}:443x1`], '次选与首选相同：回到默认的另一地区');
-  assert.deepEqual(plan({ mode: 'builtin', region: 'bogus' }, 'NRT'), [`${R.JP}:443x2`, `${R.HK}:443x1`], '无效地区回退自动');
-  assert.deepEqual(plan({ mode: 'custom', custom: 'a.example.com\nb.example.com:8443\n203.0.113.9\nd.example.com' }, 'NRT'),
-    ['a.example.com:443x2', 'b.example.com:8443x1', '203.0.113.9:443x1']);
-  assert.deepEqual(plan({ mode: 'off' }, 'NRT'), []);
+test('备用线路计划：auto 按机房选最近的地区；按 altPick 的顺序取前 3 个不重复的线路，第一条取 2 个 IP，其余各 1 个；表里没有的标签跳过；altPick 为空 = 不使用', () => {
+  const plan = (st, colo) => internals.altPlan(st, colo).map(p => `${p.host}:${p.port}x${p.take}`);
+  const R = (r) => REGION_TABLE[r].host;
+  const def = { altTable: REGION_TABLE, altPick: ['auto', 'HK', 'US'] };
+  assert.deepEqual(plan(def, 'NRT'), [`${R('JP')}:443x2`, `${R('HK')}:443x1`, `${R('US')}:443x1`], '机房对应的地区 + HK + US');
+  assert.deepEqual(plan(def, 'HKG'), [`${R('HK')}:443x2`, `${R('US')}:443x1`], 'auto 与 HK 重复：只留一个');
+  assert.deepEqual(plan(def, 'LAX'), [`${R('US')}:443x2`, `${R('HK')}:443x1`], '北美机房（表里没有的机房一律按 US）');
+  assert.deepEqual(plan(def, undefined), [`${R('US')}:443x2`, `${R('HK')}:443x1`]);
+  assert.deepEqual(plan({ ...def, altPick: ['DE', 'NL'] }, 'NRT'), [`${R('DE')}:443x2`, `${R('NL')}:443x1`], '固定顺序不受机房影响');
+  assert.deepEqual(plan({ ...def, altPick: ['DE', 'nope', 'DE', 'SE'] }, 'NRT'), [`${R('DE')}:443x2`, `${R('SE')}:443x1`], '表里没有的标签与重复的线路被跳过');
+  const mine = { altTable: { a: { host: 'a.example.com' }, b: { host: 'b.example.com', port: 8443 }, c: { host: '203.0.113.9' }, d: { host: 'd.example.com' }, same: { host: 'a.example.com' } }, altPick: ['a', 'same', 'b', 'c', 'd'] };
+  assert.deepEqual(plan(mine, 'NRT'), ['a.example.com:443x2', 'b.example.com:8443x1', '203.0.113.9:443x1'], '最多 3 条，同一条线路不重复');
+  assert.deepEqual(plan({ ...def, altPick: [] }, 'NRT'), []);
+  assert.deepEqual(plan({ altTable: {}, altPick: ['auto', 'HK'] }, 'NRT'), [], '线路表是空的：没有备用线路');
+  // 机房 → 地区
+  for (const [colo, region] of [['HKG', 'HK'], ['sin', 'SG'], ['NRT', 'JP'], ['KIX', 'JP'], ['ICN', 'KR'], ['FRA', 'DE'], ['CDG', 'DE'], ['ARN', 'SE'], ['AMS', 'NL'], ['HEL', 'FI'], ['LHR', 'GB'], ['LAX', 'US'], ['SJC', 'US'], ['', 'US'], [undefined, 'US']]) {
+    assert.equal(internals.selectAltRegion(colo), region, String(colo));
+  }
 });
 
-test('地区反代模式：off 时不解析也不连接任何地区反代；custom 只连自己的反代；固定地区只解析该地区', async () => {
-  // off：目标直连失败后不尝试任何反代，连接被关闭
+test('备用线路：altPick 为空时不解析也不连接任何线路；自定义线路只连自己的；固定地区只解析该地区', async () => {
+  // 空：目标直连失败后不尝试任何备用线路，连接被关闭
   let log = fakeNet({});
   let dns = [];
-  let env = baseEnv({ ALT_MODE: 'off' });
+  let env = baseEnv({ set: { altPick: [] } });
   await withFetch(cfDoh({}, dns), async () => {
     const ws = await openWs(env);
     await ws.emit('message', { data: vlessReq('off-test.example', 443, TLS_HELLO).buffer });
     assert.equal(ws.closed.code, 1011);
   });
   assert.deepEqual(log.map(s => s.hostname), ['off-test.example'], '只尝试了直连');
-  assert.equal(dns.filter(d => d.name.startsWith('proxyip.')).length, 0, '没有解析任何内置反代域名');
-  // custom：直连挂起（目标在 Cloudflare 上）→ 自定义反代接管，内置反代不被碰
+  assert.equal(dns.filter(d => d.name.startsWith('proxyip.')).length, 0, '没有解析任何线路域名');
+  // 自定义线路：直连挂起（目标在 Cloudflare 上）→ 自己的线路接管，地区线路不被碰
   log = fakeNet({ 'cf-custom.example': { delay: 'hang' }, '203.0.113.31': { delay: 10 }, '203.0.113.30': { delay: 40 } });
   dns = [];
-  env = baseEnv({ ALT_MODE: 'custom', ALT_CUSTOM: 'my-alt.example.com\n203.0.113.30:8443' });
+  env = baseEnv({ set: { altTable: { mine: { host: 'my-alt.example.com' }, ip: { host: '203.0.113.30', port: 8443 } }, altPick: ['mine', 'ip'] } });
   await withFetch(cfDoh({ 'my-alt.example.com': ['203.0.113.31'] }, dns), async () => {
     const ws = await openWs(env);
     await ws.emit('message', { data: vlessReq('cf-custom.example', 443, TLS_HELLO).buffer });
@@ -735,11 +621,11 @@ test('地区反代模式：off 时不解析也不连接任何地区反代；cust
   assert.equal(used.hostname, '203.0.113.31');
   assert.deepEqual([...used.written[0]], TLS_HELLO);
   assert.equal(log.find(s => s.hostname === '203.0.113.30').port, 8443, 'IP:端口 原样连接');
-  assert.equal(dns.filter(d => d.name.startsWith('proxyip.')).length, 0, '自定义模式不解析内置反代');
-  // 固定地区：首选 SE、次选不使用 → 只解析 SE
+  assert.equal(dns.filter(d => d.name.startsWith('proxyip.')).length, 0, '没有解析地区线路');
+  // 固定地区：只用 SE → 只解析 SE
   log = fakeNet({ 'cf-se.example': { delay: 'hang' }, '203.0.113.50': { delay: 10 } });
   dns = [];
-  env = baseEnv({ ALT_MODE: 'builtin', ALT_REGION: 'SE', ALT_REGION2: 'none' });
+  env = baseEnv({ set: { altPick: ['SE'] } });
   await withFetch(cfDoh({ 'proxyip.se.cmliussss.net': ['203.0.113.50'] }, dns), async () => {
     const ws = await openWs(env);
     await ws.emit('message', { data: vlessReq('cf-se.example', 443, TLS_HELLO).buffer });
@@ -828,33 +714,15 @@ test('WS：同一帧内一次性到达的大量数据帧（建连完成前）按
 import { readFileSync } from 'node:fs';
 import { PROXY_VERSION } from './helpers-version.mjs';
 
-test('环境变量：PATH 首尾斜杠自动去掉；没有 UUID 环境变量；其余设置缺省时与原先面板里的默认值一致', () => {
-  const cfg = internals.nodeConfig({ PATH: '/mynode/', NODE_KEY: KEY, UUID });
+test('环境变量：PATH 首尾斜杠自动去掉；UUID 与所有设置都不再来自环境变量（旧的变量被忽略）', () => {
+  const cfg = internals.nodeConfig({ PATH: '/mynode/', NODE_KEY: KEY, UUID, EDGEIP: 'x.example', HOP_ADDR: 'socks5://1.2.3.4:1', HOP_MODE: 'only', ALT_MODE: 'off' });
   assert.equal(cfg.path, 'mynode');
   assert.equal(cfg.key, KEY);
-  assert.deepEqual(cfg.uuids, [], 'UUID 环境变量不再被读取，UUID 只来自面板下发的 KV 状态');
   assert.deepEqual(cfg._problems, []);
-  assert.equal(cfg.edgeIP, '');
-  assert.equal(cfg.hopAddr, '');
-  assert.equal(cfg.hopMode, '');
-  assert.deepEqual(cfg.alt, { mode: 'builtin', region: '', region2: '', custom: '' });
-});
-
-test('环境变量：出站 / 地区反代设置按原先的取值校验，无效值回落默认；自定义反代最多 3 个、支持换行与逗号分隔', () => {
-  const c = (extra) => internals.nodeConfig({ NODE_KEY: KEY, PATH: 'p', ...extra });
-  assert.equal(c({ EDGEIP: ' proxy.example.com:8443 ' }).edgeIP, 'proxy.example.com:8443');
-  assert.equal(c({ HOP_ADDR: 'socks5://u:p@1.2.3.4:1080' }).hopAddr, 'socks5://u:p@1.2.3.4:1080');
-  assert.equal(c({ HOP_MODE: 'only' }).hopMode, 'only');
-  assert.equal(c({ HOP_MODE: 'NO' }).hopMode, 'no');
-  assert.equal(c({ HOP_MODE: 'bogus' }).hopMode, '');
-  assert.equal(c({ ALT_MODE: 'off' }).alt.mode, 'off');
-  assert.equal(c({ ALT_MODE: 'custom' }).alt.mode, 'custom');
-  assert.equal(c({ ALT_MODE: 'nonsense' }).alt.mode, 'builtin');
-  assert.equal(c({ ALT_REGION: 'jp', ALT_REGION2: 'NONE' }).alt.region, 'JP', '地区名不区分大小写');
-  assert.equal(c({ ALT_REGION: 'jp', ALT_REGION2: 'NONE' }).alt.region2, 'none');
-  assert.equal(c({ ALT_REGION: 'digitalocean' }).alt.region, 'DigitalOcean');
-  assert.equal(c({ ALT_REGION: 'Atlantis' }).alt.region, '');
-  assert.equal(c({ ALT_CUSTOM: 'a.example.com, b.example.com:8443\nc.example.com;d.example.com' }).alt.custom, 'a.example.com\nb.example.com:8443\nc.example.com');
+  assert.deepEqual(cfg.uuids, []);
+  assert.equal(cfg.enabled, true);
+  assert.equal(cfg.edgeIP, ''); assert.equal(cfg.hop, null); assert.equal(cfg.hopMode, '');
+  assert.deepEqual(cfg.altTable, {}); assert.deepEqual(cfg.altPick, [], '没有面板下发的线路表时没有备用线路');
 });
 
 test('必填环境变量：PATH / NODE_KEY 缺失或非法时所有请求返回 503 设置说明', async () => {
@@ -897,15 +765,15 @@ test('路由：只有节点路径上的 WebSocket / XHTTP 进入代理，其余�
   assert.equal(post.headers.get('content-type'), 'application/octet-stream');
 });
 
-test('构建产物：代理脚本不含面板 / 登录 / 订阅 / 管理接口 / 面板 KV / 更新检测的任何代码，也不导出任何 RPC 入口', () => {
+test('构建产物：代理脚本不含面板 / 登录 / 订阅 / 面板 KV / 更新检测的代码，没有 Shadowsocks 与内置的第三方线路域名，也不导出任何 RPC 入口', () => {
   const code = readFileSync(new URL('../Hopline-proxy.js', import.meta.url), 'utf8');
-  for (const needle of ['hopline_auth', '/api/', 'CONFIG_KV', 'loginHTML', 'generateSubscription', 'raw.githubusercontent.com', 'clash-template', 'PBKDF2', 'ADMIN', 'WorkerEntrypoint', 'cloudflare:workers']) {
-    assert.ok(!code.includes(needle), needle);
+  for (const needle of ['hopline_auth', '/api/', 'CONFIG_KV', 'loginHTML', 'generateSubscription', 'raw.githubusercontent.com', 'clash-template', 'PBKDF2', 'ADMIN', 'WorkerEntrypoint', 'cloudflare:workers', 'cmliussss', 'chacha', 'md5Bytes', 'hkdf']) {
+    assert.ok(!code.toLowerCase().includes(needle.toLowerCase()), needle);
   }
   assert.deepEqual(Object.keys(proxyModule), ['default']);
 });
 
-// ---------------- 面板下发的状态（UUID / 启停）与签名控制接口 ----------------
+// ---------------- 面板整份下发的状态与签名控制接口 ----------------
 function memKv(init = {}) {
   const m = new Map(Object.entries(init).map(([k, v]) => [k, typeof v === 'string' ? v : JSON.stringify(v)]));
   const kv = { m, gets: 0, puts: 0, down: false,
@@ -917,10 +785,10 @@ function memKv(init = {}) {
 const hm = (key, msg) => createHmac('sha256', key).update(msg).digest('base64url');
 const TAG = hm(KEY, 'route').slice(0, 16);
 let nonceSeq = 0;
-// 发一条控制请求；o 可覆盖 key / ts / n / s / tag / path / method / body 来构造各种错误请求
+// 发一条控制请求；args 是对象（会序列化）或已经是文本；o 可覆盖 key / ts / n / s / tag / path / method / body 来构造各种错误请求
 async function ctl(env, op, args = {}, o = {}) {
   const key = o.key ?? KEY, ts = o.ts ?? Date.now(), n = o.n ?? ('nonce-' + (++nonceSeq) + '-abcdefgh');
-  const a = JSON.stringify(args);
+  const a = typeof args === 'string' ? args : JSON.stringify(args);
   const s = o.s ?? hm(key, `${ts}.${n}.${op}.${a}`);
   const path = o.path ?? `/${env.PATH}/${o.tag ?? TAG}`;
   const body = o.body ?? JSON.stringify({ ts, n, op, a, s });
@@ -935,12 +803,12 @@ async function call(env, op, args = {}) {
   assert.equal(j.s, hm(KEY, `${j.ts}.${n}.${j.d}`), '回应带有绑定请求随机串的签名');
   return JSON.parse(j.d);
 }
-const stateOf = (kv) => JSON.parse(kv.m.get('state'));
+const rawState = (kv) => kv.m.get('state');
 const isHello = async (res) => { assert.equal(res.status, 200); assert.match(await res.text(), /Hello World/); };
+const shortHashOf = (text) => createHash('sha256').update(text).digest('hex').slice(0, 8);
 
 test('控制接口：任何不合规的请求都和其它路径一样返回 Hello World（方法、签名、密钥、时间偏差、重放、路径标记、畸形请求体）', async () => {
   const env = baseEnv({ PATH: 'mynode' });
-  // 合规请求先通过一次
   assert.equal((await call(env, 'status')).ok, true);
   const n1 = 'replay-nonce-0001';
   const first = await ctl(env, 'status', {}, { n: n1 });
@@ -959,34 +827,37 @@ test('控制接口：任何不合规的请求都和其它路径一样返回 Hell
   await isHello((await ctl(env, 'status', {}, { body: 'x'.repeat(20000) })).res);
   // 被篡改的参数（签名针对原参数）
   const ts = Date.now(), n = 'tamper-nonce-0001';
-  const sig = hm(KEY, `${ts}.${n}.setIdentity.${JSON.stringify({ uuid: UUID })}`);
-  await isHello((await ctl(env, 'setIdentity', { uuid: 'ffffffff-2222-4333-8444-555555555555' }, { ts, n, s: sig })).res);
+  const good = JSON.stringify(stateWith());
+  const sig = hm(KEY, `${ts}.${n}.setState.${good}`);
+  await isHello((await ctl(env, 'setState', JSON.stringify(stateWith({ enabled: false })), { ts, n, s: sig })).res);
   assert.equal(env.NODE_KV.puts, 0, '被拒绝的请求没有写入任何东西');
   // 签名正确但操作未知：仍然是已认证的回应（只告诉持有密钥的一方）
   assert.equal((await call(env, 'nope')).ok, false);
+  assert.equal((await call(env, 'getSettings')).ok, false, '旧的操作都不存在了');
 });
 
-test('控制接口 status：在线、版本、是否已下发 UUID / 启用；不返回 UUID、路径、密钥、反代地址与出站代理的主机和密码', async () => {
-  const env = baseEnv({ PATH: 'secret-node-path', EDGEIP: 'alt.private.example:8443', HOP_ADDR: 'socks5://alice:hunter2@10.9.8.7:1080', HOP_MODE: 'only', ALT_MODE: 'custom', ALT_CUSTOM: 'a.example\nb.example' });
+test('控制接口 status：在线、版本、是否已下发 UUID / 启用、状态哈希；不返回 UUID、路径、密钥与任何设置内容', async () => {
+  const set = { edgeIP: 'alt.private.example:8443', hop: { type: 'socks5', host: '10.9.8.7', port: 1080, user: 'alice', pass: 'hunter2' }, hopMode: 'only' };
+  const env = baseEnv({ PATH: 'secret-node-path', set });
   const st = await call(env, 'status');
+  assert.deepEqual(Object.keys(st).sort(), ['enabled', 'kvError', 'ok', 'problems', 'provisioned', 'stateHash', 'storage', 'version']);
   assert.equal(st.ok, true);
   assert.equal(st.version, PROXY_VERSION);
   assert.deepEqual(st.problems, []);
   assert.equal(st.storage, true); assert.equal(st.provisioned, true); assert.equal(st.enabled, true);
-  assert.equal(st.uuidTag, await internals.uuidTag(UUID));
-  assert.deepEqual(st.settings, { edgeIP: true, hopAddr: 'socks5', hopMode: 'only', altMode: 'custom', altRegion: '', altRegion2: '', altCustom: 2 });
+  assert.equal(st.stateHash, shortHashOf(rawState(env.NODE_KV)));
   const text = JSON.stringify(st);
-  for (const secret of [UUID, 'secret-node-path', KEY, 'alt.private.example', 'alice', 'hunter2', '10.9.8.7', 'a.example']) assert.ok(!text.includes(secret), secret);
+  for (const secret of [UUID, 'secret-node-path', KEY, 'alt.private.example', 'alice', 'hunter2', '10.9.8.7']) assert.ok(!text.includes(secret), secret);
   // 没有 KV：照常在线，但 storage:false、尚未下发
   const noKv = { PATH: 'secret-node-path', NODE_KEY: KEY };
   const s2 = await call(noKv, 'status');
-  assert.equal(s2.storage, false); assert.equal(s2.provisioned, false);
+  assert.equal(s2.storage, false); assert.equal(s2.provisioned, false); assert.equal(s2.stateHash, '');
   // 公开响应里没有版本号
   const pub = await worker.fetch(new Request('https://node.example.com/'), env, {});
   assert.ok(!(await pub.text()).includes(PROXY_VERSION));
 });
 
-test('未下发 UUID（或没有 NODE_KV）的代理：节点路径与其它路径一样只是 Hello World，WebSocket 与 XHTTP 都不进入', async () => {
+test('未下发状态（或没有 NODE_KV）的代理：节点路径与其它路径一样只是 Hello World，WebSocket 与 XHTTP 都不进入', async () => {
   fakeNet({ 'x.example': { delay: 5 } });
   for (const env of [{ PATH: 'mynode', NODE_KEY: KEY }, { PATH: 'mynode', NODE_KEY: KEY, NODE_KV: memKv() }]) {
     const ws = await worker.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {});
@@ -995,195 +866,145 @@ test('未下发 UUID（或没有 NODE_KV）的代理：节点路径与其它路�
   }
 });
 
-test('下发 UUID：setIdentity 写入 KV，节点立即可用；格式错误被拒；getIdentity 供面板接管；状态里只有 UUID 的短标记', async () => {
+test('setState：整份覆盖，KV 里保存的就是面板发来的 JSON 原文，返回的哈希与面板自己算的一致；节点立即可用', async () => {
   const kv = memKv();
   const env = baseEnv({ PATH: 'mynode', NODE_KV: kv });
-  assert.equal((await call(env, 'getIdentity')).ok, false, '还没有 UUID');
-  assert.equal((await call(env, 'setIdentity', { uuid: 'not-a-uuid' })).ok, false);
-  assert.equal(kv.puts, 0);
-  const r = await call(env, 'setIdentity', { uuid: UUID.toUpperCase() });
-  assert.equal(r.ok, true); assert.equal(r.uuidTag, await internals.uuidTag(UUID)); assert.equal(r.graceMs, 0);
-  assert.equal(stateOf(kv).uuid, UUID, '小写保存');
-  assert.deepEqual(await call(env, 'getIdentity'), { ok: true, uuid: UUID });
-  fakeNet({ 'id.example': { delay: 5 } });
+  assert.equal((await call(env, 'status')).provisioned, false);
+  const raw = JSON.stringify(stateWith({ edgeIP: 'e.example.com', hop: { type: 'http', host: 'h.example.com', port: 8080, user: 'u', pass: 'p' }, hopMode: 'only' }));
+  const r = await call(env, 'setState', raw);
+  assert.deepEqual(r, { ok: true, stateHash: shortHashOf(raw) });
+  assert.equal(rawState(kv), raw, '原文保存，不做任何改写');
+  const st = await call(env, 'status');
+  assert.equal(st.provisioned, true); assert.equal(st.stateHash, shortHashOf(raw));
+  // 换成没有出站代理的状态后，节点按它出站
+  assert.equal((await call(env, 'setState', JSON.stringify(stateWith()))).ok, true);
   const log = fakeNet({ 'id.example': { delay: 5 } });
   const ws = await worker.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {});
   assert.equal(ws.status, 101);
   await lastServer.emit('message', { data: vlessReq('id.example', 443, TLS_HELLO).buffer });
   await until(() => log.some(s => s.written.length));
+  // 再下发一份：整份覆盖（没有合并）
+  const raw2 = JSON.stringify(stateWith({ edgeIP: '', hop: null }));
+  assert.equal((await call(env, 'setState', raw2)).ok, true);
+  assert.equal(rawState(kv), raw2);
 });
 
-test('更换 UUID：新的立即可用，旧的在 10 分钟宽限期内仍可用，过期后被拒绝；非轮换的覆盖不留旧值', async () => {
-  const kv = memKv({ state: { uuid: UUID } });
+test('setState 校验：类型、长度、未知字段、非法的主机 / 端口 / UUID / 标签都被拒绝并说明原因，不写 KV；没有 NODE_KV 时明确拒绝', async () => {
+  const kv = memKv();
   const env = baseEnv({ PATH: 'mynode', NODE_KV: kv });
+  const ok = stateWith();
+  const bad = [
+    [{ bogus: 1 }, /未知字段/], [{ uuids: [] .concat([['not-a-uuid', 0]]) }, /uuids/], [{ uuids: [[UUID, -1]] }, /uuids/], [{ uuids: Array(5).fill([UUID, 0]) }, /uuids/],
+    [{ enabled: 'yes' }, /enabled/], [{ edgeIP: 'bad host' }, /edgeIP/], [{ edgeIP: 'x.example:99999' }, /edgeIP/], [{ edgeIP: 5 }, /edgeIP/],
+    [{ hopMode: 'no' }, /hopMode/], [{ hop: { type: 'ss', host: 'h.example', port: 1 } }, /hop/], [{ hop: { type: 'socks5', host: 'bad host', port: 1 } }, /hop/],
+    [{ hop: { type: 'socks5', host: 'h.example', port: 0 } }, /hop/], [{ hop: 'socks5://h' }, /hop/], [{ hop: { type: 'http', host: 'h.example', port: 80, user: 5 } }, /hop/],
+    [{ altTable: { 'bad tag': { host: 'a.example' } } }, /altTable/], [{ altTable: { a: { host: 'bad host' } } }, /altTable/], [{ altTable: { a: { host: 'a.example', port: 70000 } } }, /altTable/],
+    [{ altTable: { a: { host: 'a.example', txt: 'y' } } }, /altTable/], [{ altTable: [] }, /altTable/], [{ altPick: ['bad tag'] }, /altPick/], [{ altPick: Array(9).fill('a') }, /altPick/], [{ altPick: 'auto' }, /altPick/],
+  ];
+  for (const [patch, re] of bad) {
+    const r = await call(env, 'setState', JSON.stringify({ ...ok, ...patch }));
+    assert.equal(r.ok, false, JSON.stringify(patch));
+    assert.match(r.error, re, JSON.stringify(patch));
+  }
+  assert.equal((await call(env, 'setState', '{not json')).ok, false);
+  assert.equal((await call(env, 'setState', '[]')).ok, false);
+  const missing = { ...ok }; delete missing.altPick;
+  assert.equal((await call(env, 'setState', JSON.stringify(missing))).ok, false, '缺字段');
+  assert.equal(kv.puts, 0, '校验失败不写 KV');
+  const noKv = { PATH: 'mynode', NODE_KEY: KEY };
+  const r = await call(noKv, 'setState', JSON.stringify(ok));
+  assert.equal(r.ok, false); assert.match(r.error, /NODE_KV/);
+});
+
+test('更换 UUID 的宽限期：状态里带失效时间的旧 UUID 在期内可用、过期后被拒绝，新的 UUID 一直可用', async () => {
   const NEW = 'aaaaaaaa-2222-4333-8444-555555555555';
-  const withUuid = (u) => { const r = vlessReq('grace.example', 443, TLS_HELLO); r.set(u.replace(/-/g, '').match(/../g).map(h => parseInt(h, 16)), 1); return r; };
   const realNow = Date.now; let t = realNow(); Date.now = () => t;
   try {
-    const rot = await call(env, 'setIdentity', { uuid: NEW, rotate: true });
-    assert.equal(rot.ok, true); assert.equal(rot.graceMs, 600000);
-    assert.equal(stateOf(kv).prev, UUID);
+    const kv = memKv({ state: stateWith({ uuids: [[NEW, 0], [UUID, t + 10 * 60 * 1000]] }) });
+    const env = baseEnv({ PATH: 'mynode', NODE_KV: kv });
+    const withUuid = (u) => { const r = vlessReq('grace.example', 443, TLS_HELLO); r.set(u.replace(/-/g, '').match(/../g).map(h => parseInt(h, 16)), 1); return r; };
     const tryConnect = async (u) => {
       const log = fakeNet({ 'grace.example': { delay: 5 } });
       const res = await worker.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {});
       assert.equal(res.status, 101);
-      const ws = lastServer;
-      await ws.emit('message', { data: withUuid(u).buffer });
+      await lastServer.emit('message', { data: withUuid(u).buffer });
       await new Promise(r => setTimeout(r, 40));
       return log.some(s => s.written.length);
     };
     assert.equal(await tryConnect(NEW), true, '新 UUID');
     assert.equal(await tryConnect(UUID), true, '宽限期内的旧 UUID');
     t += 10 * 60 * 1000 + 1000;
-    t += 25 * 1000;
     assert.equal(await tryConnect(NEW), true);
-    assert.equal(await tryConnect(UUID), false, '宽限期过后旧 UUID 被拒绝');
-    // 非轮换的覆盖：不保留旧 UUID
-    const again = await call(env, 'setIdentity', { uuid: UUID });
-    assert.equal(again.graceMs, 0);
-    assert.equal(stateOf(kv).prev, '');
+    assert.equal(await tryConnect(UUID), false, '宽限期过后旧 UUID 被拒绝（不需要面板再下发任何东西）');
   } finally { Date.now = realNow; }
 });
 
-test('停用：面板通过 setEnabled 让代理对外只显示 Hello World（WebSocket / XHTTP 都不进入），控制接口不受影响；启用后恢复', async () => {
-  const kv = memKv({ state: { uuid: UUID } });
+test('停用：面板下发 enabled:false 后代理对外只显示 Hello World（WebSocket / XHTTP 都不进入），控制接口不受影响；启用后恢复', async () => {
+  const kv = memKv({ state: stateWith() });
   const env = baseEnv({ PATH: 'mynode', NODE_KV: kv });
   const log = fakeNet({ 'off.example': { delay: 5 } });
   const wsReq = () => worker.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {});
   assert.equal((await wsReq()).status, 101);
-  assert.equal((await call(env, 'setEnabled', { enabled: 'no' })).ok, false, '必须是布尔值');
-  assert.deepEqual(await call(env, 'setEnabled', { enabled: false }), { ok: true, enabled: false });
-  assert.equal(stateOf(kv).enabled, false);
-  assert.equal(stateOf(kv).uuid, UUID, '停用不丢 UUID');
+  assert.equal((await call(env, 'setState', JSON.stringify(stateWith({ enabled: false })))).ok, true);
   // 同一 isolate 内立即生效（写入后缓存已更新）
   await isHello(await wsReq());
   await isHello(await xhttpPost(env, '/mynode', vlessReq('off.example', 443, TLS_HELLO)));
   assert.equal(log.length, 0, '没有发起任何出站连接');
   const st = await call(env, 'status');
-  assert.equal(st.enabled, false); assert.equal(st.ok, true);
-  assert.deepEqual(await call(env, 'setEnabled', { enabled: true }), { ok: true, enabled: true });
+  assert.equal(st.enabled, false); assert.equal(st.ok, true); assert.equal(st.provisioned, true);
+  assert.equal((await call(env, 'setState', JSON.stringify(stateWith()))).ok, true);
   assert.equal((await wsReq()).status, 101);
   const post = await xhttpPost(env, '/mynode', vlessReq('off.example', 443, TLS_HELLO));
   assert.equal(post.headers.get('content-type'), 'application/octet-stream');
 });
 
-test('控制接口 getSettings：生效值、环境变量值与每项来源；没有 KV 时 storage:false，写操作被明确拒绝', async () => {
-  const noKv = { PATH: 'p', NODE_KEY: KEY, EDGEIP: 'env-alt.example:8443', ALT_MODE: 'off' };
-  const g = await call(noKv, 'getSettings');
-  assert.equal(g.ok, true); assert.equal(g.storage, false);
-  assert.equal(g.settings.edgeIP, 'env-alt.example:8443'); assert.equal(g.settings['alt.mode'], 'off');
-  assert.deepEqual(g.source, { edgeIP: 'env', hopAddr: 'default', hopMode: 'default', 'alt.mode': 'env', 'alt.region': 'default', 'alt.region2': 'default', 'alt.custom': 'default' });
-  assert.ok(g.regions.includes('HK') && g.regions.includes('Multacom'));
-  for (const [op, args] of [['setSettings', { edgeIP: 'x.example' }], ['resetSettings', {}], ['setIdentity', { uuid: UUID }], ['setEnabled', { enabled: false }]]) {
-    const r = await call(noKv, op, args);
-    assert.equal(r.ok, false, op); assert.match(r.error, /NODE_KV/, op);
-  }
-});
-
-test('setSettings：校验后保存到 KV 的 state.set，生效值 = KV > 环境变量 > 默认；与环境变量相同的值不落盘；UUID 与启用开关不受影响', async () => {
-  const kv = memKv({ state: { uuid: UUID, enabled: false } });
-  const env = baseEnv({ NODE_KV: kv, EDGEIP: 'env-alt.example', HOP_ADDR: 'socks5://u:p@1.2.3.4:1080' });
-  const r = await call(env, 'setSettings', {
-    edgeIP: ' mine.example:8443 ', hopAddr: 'socks5://u:p@1.2.3.4:1080', hopMode: 'only',
-    'alt.mode': 'custom', 'alt.custom': 'A.Example.com, [2001:db8::1]:8443\nb.example.com:443', bogus: 'x',
-  });
-  assert.equal(r.ok, true, JSON.stringify(r));
-  assert.deepEqual(r.ignored, ['bogus']);
-  assert.deepEqual(stateOf(kv).set, { edgeIP: 'mine.example:8443', hopMode: 'only', 'alt.mode': 'custom', 'alt.custom': 'a.example.com\n[2001:db8::1]:8443\nb.example.com' }, '与环境变量相同的出站代理没有落盘');
-  assert.equal(stateOf(kv).uuid, UUID); assert.equal(stateOf(kv).enabled, false);
-  assert.equal(r.settings.hopAddr, 'socks5://u:p@1.2.3.4:1080');
-  assert.equal(r.storage, true);
-  assert.equal(r.source.edgeIP, 'kv'); assert.equal(r.source.hopAddr, 'env'); assert.equal(r.source['alt.region'], 'default');
-  // 之后环境变量变化立即生效（KV 里没有它的快照）
-  const later = baseEnv({ NODE_KV: kv, EDGEIP: 'env-alt.example', HOP_ADDR: 'socks5://u:p@9.9.9.9:1080' });
-  assert.equal((await call(later, 'getSettings')).settings.hopAddr, 'socks5://u:p@9.9.9.9:1080');
-  // 改回与环境变量相同：该项从 KV 里移除
-  const back = await call(env, 'setSettings', { edgeIP: 'env-alt.example' });
-  assert.equal(back.ok, true);
-  assert.equal('edgeIP' in stateOf(kv).set, false);
-  assert.equal(back.source.edgeIP, 'env');
-});
-
-test('setSettings 校验：每项给出字段级错误，整批都不保存；自定义模式必须有反代列表；UUID / PATH / NODE_KEY 不是可修改的设置', async () => {
-  const kv = memKv({ state: { uuid: UUID } });
-  const env = baseEnv({ NODE_KV: kv });
-  const bad = [
-    [{ edgeIP: 'bad host' }, 'edgeIP'], [{ edgeIP: 'a/b' }, 'edgeIP'], [{ edgeIP: 'x.example:99999' }, 'edgeIP'],
-    [{ hopAddr: 'ss://rc4:pw@1.2.3.4:8388' }, 'hopAddr'], [{ hopAddr: 'ss://aes-256-gcm@1.2.3.4:8388' }, 'hopAddr'],
-    [{ hopAddr: 'socks5://has space@1.2.3.4:1' }, 'hopAddr'], [{ hopMode: 'sideways' }, 'hopMode'],
-    [{ 'alt.mode': 'sideways' }, 'alt.mode'], [{ 'alt.region': 'Atlantis' }, 'alt.region'], [{ 'alt.region2': 'Atlantis' }, 'alt.region2'],
-    [{ 'alt.custom': 'a.example.com\nb.example.com\nc.example.com\nd.example.com' }, 'alt.custom'], [{ 'alt.custom': 'bad host' }, 'alt.custom'],
-    [{ 'alt.custom': 'x.example.com:70000' }, 'alt.custom'], [{ 'alt.mode': 'custom' }, 'alt.custom'], [{ edgeIP: 123 }, 'edgeIP'],
-  ];
-  for (const [patch, field] of bad) {
-    const r = await call(env, 'setSettings', patch);
-    assert.equal(r.ok, false, JSON.stringify(patch));
-    assert.ok(r.errors.some(e => e.field === field), JSON.stringify(patch) + ' → ' + JSON.stringify(r.errors));
-  }
-  const mixed = await call(env, 'setSettings', { hopMode: 'no', edgeIP: 'bad host' });
-  assert.equal(mixed.ok, false);
-  assert.equal(kv.puts, 0, '校验失败不写 KV');
-  assert.equal((await call(env, 'setSettings', null)).ok, false);
-  const id = await call(env, 'setSettings', { UUID: 'x', PATH: 'y', NODE_KEY: 'k', uuid: 'z', hopMode: 'no' });
-  assert.equal(id.ok, true);
-  assert.deepEqual(id.ignored.sort(), ['NODE_KEY', 'PATH', 'UUID', 'uuid']);
-  assert.deepEqual(stateOf(kv).set, { hopMode: 'no' });
-  assert.equal(stateOf(kv).uuid, UUID);
-});
-
-test('KV 状态：损坏时忽略并允许保存来修复；读取失败时拒绝保存、不覆盖已有状态；resetSettings 只清除设置覆盖项', async () => {
+test('KV 状态：损坏的内容被忽略（视为未下发，节点只显示 Hello World）并可被重新下发覆盖；读取失败时沿用上次读到的状态，写入失败明确报错', async () => {
   const kv = memKv({ state: '{not json' });
-  const env = baseEnv({ NODE_KV: kv, ALT_MODE: 'off' });
-  const g = await call(env, 'getSettings');
-  assert.equal(g.error, 'corrupt'); assert.equal(g.settings['alt.mode'], 'off', '损坏的状态被忽略，用环境变量');
-  assert.equal((await call(env, 'status')).provisioned, false, '损坏时视为尚未下发');
-  assert.equal((await call(env, 'setSettings', { hopMode: 'no' })).ok, true, '损坏时允许保存（修复）');
-  assert.deepEqual(stateOf(kv).set, { hopMode: 'no' });
-  // 无效项在读取时被丢弃，其它项保留
-  const kv2 = memKv({ state: { uuid: UUID, set: { hopMode: 'sideways', edgeIP: 'ok.example', bogus: 1 } } });
-  const g2 = await call(baseEnv({ NODE_KV: kv2 }), 'getSettings');
-  assert.equal(g2.settings.edgeIP, 'ok.example'); assert.equal(g2.settings.hopMode, '');
-  // 读取失败：拒绝所有写操作
-  const kv3 = memKv({ state: { uuid: UUID, set: { edgeIP: 'keep.example' } } });
+  const env = baseEnv({ PATH: 'mynode', NODE_KV: kv });
+  const st = await call(env, 'status');
+  assert.equal(st.kvError, 'corrupt'); assert.equal(st.provisioned, false); assert.equal(st.stateHash, '');
+  await isHello(await worker.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {}));
+  assert.equal((await call(env, 'setState', JSON.stringify(stateWith()))).ok, true, '重新下发即可修复');
+  assert.equal((await call(env, 'status')).kvError, '');
+  // 内容合法 JSON 但字段不对：同样按损坏处理
+  const kv2 = memKv({ state: { uuids: 'x' } });
+  assert.equal((await call(baseEnv({ PATH: 'mynode', NODE_KV: kv2 }), 'status')).kvError, 'corrupt');
+  // 读取失败：沿用上一次读到的状态
+  const kv3 = memKv({ state: stateWith() });
+  const env3 = baseEnv({ PATH: 'mynode', NODE_KV: kv3 });
+  assert.equal((await call(env3, 'status')).provisioned, true);
   kv3.down = true;
-  const env3 = baseEnv({ NODE_KV: kv3 });
-  for (const [op, args] of [['setSettings', { edgeIP: 'new.example' }], ['setIdentity', { uuid: 'bbbbbbbb-2222-4333-8444-555555555555' }], ['setEnabled', { enabled: false }], ['resetSettings', {}]]) {
-    const refused = await call(env3, op, args);
-    assert.equal(refused.ok, false, op); assert.match(refused.error, /KV 暂时无法读取/, op);
-  }
-  assert.equal(kv3.puts, 0);
-  assert.equal((await call(env3, 'getIdentity')).ok, false);
-  // reset：只清设置，UUID 与启用开关保留
-  const kv4 = memKv({ state: { uuid: UUID, enabled: false, set: { edgeIP: 'x.example' } } });
-  const env4 = baseEnv({ NODE_KV: kv4, EDGEIP: 'env.example' });
-  const rs = await call(env4, 'resetSettings');
-  assert.equal(rs.ok, true); assert.equal(rs.settings.edgeIP, 'env.example');
-  assert.deepEqual(stateOf(kv4), { uuid: UUID, prev: '', prevUntil: 0, enabled: false, set: {} });
-  assert.equal((await call(env4, 'getSettings')).settings.edgeIP, 'env.example');
+  const realNow = Date.now; Date.now = () => realNow() + 25 * 1000;   // 缓存过期，触发重新读取
+  try {
+    const down = await call(env3, 'status');
+    assert.equal(down.kvError, 'unavailable'); assert.equal(down.provisioned, true, '沿用上次的状态');
+  } finally { Date.now = realNow; }
+  const w = await call(env3, 'setState', JSON.stringify(stateWith({ enabled: false })));
+  assert.equal(w.ok, false); assert.match(w.error, /KV 写入失败/);
 });
 
-test('混淆版代理脚本：只导出默认入口，控制接口、UUID 下发与节点连接同样可用', async () => {
+test('混淆版代理脚本：只导出默认入口，控制接口、状态下发与节点连接同样可用', async () => {
   const obf = await import('../obf_Hopline-proxy.js?obf-test');
   assert.deepEqual(Object.keys(obf), ['default']);
   const kv = memKv();
   const env = baseEnv({ PATH: 'mynode', NODE_KV: kv });
   const send = async (op, args = {}) => {
-    const ts = Date.now(), n = 'obf-' + op + '-nonce-' + (++nonceSeq), a = JSON.stringify(args);
+    const ts = Date.now(), n = 'obf-' + op + '-nonce-' + (++nonceSeq), a = typeof args === 'string' ? args : JSON.stringify(args);
     const res = await obf.default.fetch(new Request(`https://node.example.com/mynode/${TAG}`, { method: 'POST', body: JSON.stringify({ ts, n, op, a, s: hm(KEY, `${ts}.${n}.${op}.${a}`) }) }), env, {});
     return JSON.parse((await res.json()).d);
   };
   const st = await send('status');
   assert.equal(st.ok, true); assert.equal(st.version, PROXY_VERSION); assert.equal(st.provisioned, false);
   await isHello(await obf.default.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {}));
-  assert.equal((await send('setIdentity', { uuid: UUID })).ok, true);
-  assert.equal((await send('setSettings', { hopMode: 'no' })).ok, true);
-  assert.deepEqual(stateOf(kv).set, { hopMode: 'no' });
+  const raw = JSON.stringify(stateWith({ hopMode: 'only', hop: { type: 'socks5', host: '10.0.0.1', port: 1080 } }));
+  assert.equal((await send('setState', raw)).ok, true);
+  assert.equal(rawState(kv), raw);
   const ws = await obf.default.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {});
   assert.equal(ws.status, 101);
 });
 
-test('在线设置真正生效：节点路径上的连接按 KV 里的设置出站；KV 读取有缓存、伪装页请求不读 KV；KV 故障时沿用上次的设置', async () => {
-  const kv = memKv({ state: { uuid: UUID, set: { 'alt.mode': 'off' } } });
+test('面板下发的状态真正生效：节点路径上的连接按状态出站；KV 读取有缓存、伪装页请求不读 KV；KV 故障时沿用上次的状态', async () => {
+  const kv = memKv({ state: stateWith({ altPick: [] }) });
   const env = baseEnv({ NODE_KV: kv });
   const realNow = Date.now;
   let t = realNow();
@@ -1192,7 +1013,7 @@ test('在线设置真正生效：节点路径上的连接按 KV 里的设置出�
     // 伪装页 / 其它路径：不读 KV
     for (const path of ['/', '/other', '/login']) await worker.fetch(new Request('https://node.example.com' + path), env, {});
     assert.equal(kv.gets, 0, '没有节点路径上的连接就不读 KV');
-    // relay off：直连失败后不尝试任何反代
+    // 没有备用线路：直连失败后不尝试任何线路
     let log = fakeNet({});
     const dns = [];
     await withFetch(cfDoh({}, dns), async () => {
@@ -1202,10 +1023,10 @@ test('在线设置真正生效：节点路径上的连接按 KV 里的设置出�
         assert.equal(ws.closed.code, 1011);
       }
     });
-    assert.equal(dns.filter(d => d.name.startsWith('proxyip.')).length, 0, 'KV 里的 alt.mode=off 生效：没有解析内置反代');
+    assert.equal(dns.filter(d => d.name.startsWith('proxyip.')).length, 0, '状态里 altPick 为空：没有解析任何线路');
     assert.equal(kv.gets, 1, '3 个连接只读了一次 KV（isolate 内存缓存）');
-    // 改成自定义反代，缓存过期后新设置生效
-    kv.m.set('state', JSON.stringify({ uuid: UUID, set: { 'alt.mode': 'custom', 'alt.custom': 'kv-alt.example.com' } }));
+    // 改成自定义线路，缓存过期后新状态生效
+    kv.m.set('state', JSON.stringify(stateWith({ altTable: { mine: { host: 'kv-alt.example.com' } }, altPick: ['mine'] })));
     t += 25 * 1000;
     log = fakeNet({ 'kv-cf.example': { delay: 'hang' }, '203.0.113.77': { delay: 10 } });
     await withFetch(cfDoh({ 'kv-alt.example.com': ['203.0.113.77'] }, []), async () => {
@@ -1213,7 +1034,7 @@ test('在线设置真正生效：节点路径上的连接按 KV 里的设置出�
       await ws.emit('message', { data: vlessReq('kv-cf.example', 443, TLS_HELLO).buffer });
       await until(() => log.some(s => s.written.length));
     });
-    assert.equal(log.find(s => s.written.length).hostname, '203.0.113.77', '缓存过期后读到新设置');
+    assert.equal(log.find(s => s.written.length).hostname, '203.0.113.77', '缓存过期后读到新状态');
     assert.equal(kv.gets, 2);
     // KV 故障：沿用上次读到的状态（含 UUID），连接不受影响
     kv.down = true;
@@ -1224,20 +1045,20 @@ test('在线设置真正生效：节点路径上的连接按 KV 里的设置出�
       await ws.emit('message', { data: vlessReq('kv-cf.example', 443, TLS_HELLO).buffer });
       await until(() => log.some(s => s.written.length));
     });
-    assert.equal(log.find(s => s.written.length).hostname, '203.0.113.77', 'KV 读取失败时沿用上次的设置');
+    assert.equal(log.find(s => s.written.length).hostname, '203.0.113.77', 'KV 读取失败时沿用上次的状态');
   } finally { Date.now = realNow; }
-  // 通过控制接口保存后，同一 isolate 立即生效（不等缓存过期）
-  const kv2 = memKv({ state: { uuid: UUID } });
+  // 通过控制接口下发后，同一 isolate 立即生效（不等缓存过期）
+  const kv2 = memKv({ state: stateWith() });
   const env2 = baseEnv({ NODE_KV: kv2 });
   fakeNet({});
   const dns2 = [];
   await withFetch(cfDoh({}, dns2), async () => {
     const before = await openWs(env2);
     await before.emit('message', { data: vlessReq('save-live.example', 443, TLS_HELLO).buffer });
-    await call(env2, 'setSettings', { 'alt.mode': 'off' });
+    await call(env2, 'setState', JSON.stringify(stateWith({ altPick: [] })));
     dns2.length = 0;
     const after = await openWs(env2);
     await after.emit('message', { data: vlessReq('save-live.example', 443, TLS_HELLO).buffer });
   });
-  assert.equal(dns2.filter(d => d.name.startsWith('proxyip.')).length, 0, '保存后新连接不再用内置反代');
+  assert.equal(dns2.filter(d => d.name.startsWith('proxyip.')).length, 0, '下发后新连接不再用备用线路');
 });

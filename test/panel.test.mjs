@@ -63,7 +63,10 @@ const mountProxy = (host, { PATH = 'np', NODE_KEY = KEY, state, NODE_KV } = {}) 
   MOUNTED.set(host, m);
   return m;
 };
-const proxyState = (m) => JSON.parse(m.env.NODE_KV.m.get('state'));
+// 代理上保存的状态（面板整份下发的）；uuid / prev 是方便断言的派生值
+const proxyState = (m) => { const st = JSON.parse(m.env.NODE_KV.m.get('state')); return Object.assign(st, { uuid: st.uuids[0] ? st.uuids[0][0] : '', prev: st.uuids[1] ? st.uuids[1][0] : '' }); };
+// 预置在代理 KV 里的一份合法状态（只带 UUID，其余为空：与面板应下发的不一致）
+const ps = (uuid, extra = {}) => ({ uuids: [[uuid, 0]], enabled: true, edgeIP: '', hop: null, hopMode: '', altTable: {}, altPick: [], ...extra });
 const storedProxies = (env) => JSON.parse(env.CONFIG_KV.m.get('proxies'));
 const stored = (env) => JSON.parse(env.CONFIG_KV.m.get('config'));
 
@@ -211,16 +214,17 @@ test('代理列表 API：需登录；新增时校验字段、自动连接代理�
   assert.ok(links.every(l => l.startsWith(`vless://${px.uuid}@`) && /[?&]sni=p\.example\.com(&|#)/.test(l) && /path=%2Fnp(%3F|&)/.test(l)), '链接用代理的 UUID / 域名 / 节点路径');
 });
 
-test('代理同步：面板没有 UUID 而代理已有则接管（不换新）；UUID 对不上则重新下发；代理连不上 / 密钥不对 / 同区 Worker（1042）都给出可读的原因，记录仍保存', async () => {
+test('代理同步：面板的状态整份下发（没有 UUID 就生成，代理上已有别的状态就覆盖，不接管）；已经一致时什么都不做；代理连不上 / 密钥不对 / 同区 Worker（1042）都给出可读的原因，记录仍保存', async () => {
   const env = baseEnv({ CONFIG_KV: kv({ proxies: [] }) });
   const cookie = await login(env);
   const api = (path, init) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
-  // 代理上已有 UUID：接管
-  const m1 = mountProxy('adopt.example.com', { state: { uuid: UUID2 } });
+  // 代理上已有别的状态：面板生成自己的 UUID 并整份覆盖
+  const m1 = mountProxy('adopt.example.com', { state: ps(UUID2) });
   const a = await (await api('proxies', { method: 'POST', body: { host: 'adopt.example.com', nodePath: 'np', key: KEY } })).json();
-  assert.equal(a.data.proxy.uuid, UUID2); assert.ok(a.data.sync.actions.some(x => /接管/.test(x)));
-  assert.equal(proxyState(m1).uuid, UUID2, '代理上的 UUID 没有被换掉');
-  // 面板的 UUID 与代理对不上：重新下发
+  assert.notEqual(a.data.proxy.uuid, UUID2); assert.ok(a.data.sync.actions.some(x => /已生成 UUID/.test(x)) && a.data.sync.actions.some(x => /重新下发/.test(x)));
+  assert.equal(proxyState(m1).uuid, a.data.proxy.uuid, '面板的 UUID 覆盖了代理上原来的');
+  assert.equal(a.data.sync.status.inSync, true);
+  // 面板里改 UUID：重新下发
   const id = a.data.proxy.id;
   const set = await (await api(`proxies/${id}`, { method: 'POST', body: { uuid: UUID.toUpperCase() } })).json();
   assert.equal(set.data.proxy.uuid, UUID); assert.ok(set.data.sync.actions.some(x => /重新下发/.test(x)));
@@ -228,7 +232,14 @@ test('代理同步：面板没有 UUID 而代理已有则接管（不换新）�
   // 再同步一次：已经一致，什么都不用做
   const again = await (await api(`proxies/${id}/sync`, { method: 'POST' })).json();
   assert.equal(again.data.sync.ok, true); assert.deepEqual(again.data.sync.actions, []);
-  // 更新时留空密钥 = 保持不变；填新密钥 = 更换
+  // 代理上的状态被改动 / 清空：同步后恢复成面板的
+  m1.env.NODE_KV.m.set('state', JSON.stringify(ps(UUID2)));
+  m1.env.NODE_KV = plainKv({ state: ps(UUID2) });
+  const fix = await (await api(`proxies/${id}/sync`, { method: 'POST' })).json();
+  assert.ok(fix.data.sync.actions.some(x => /重新下发/.test(x))); assert.equal(proxyState(m1).uuid, UUID);
+  m1.env.NODE_KV = plainKv();
+  const fix2 = await (await api(`proxies/${id}/sync`, { method: 'POST' })).json();
+  assert.ok(fix2.data.sync.actions.some(x => /UUID 与设置下发给代理/.test(x))); assert.equal(proxyState(m1).uuid, UUID, '代理的 KV 被清空后，面板可以原样恢复');
   assert.equal(storedProxies(env)[0].key, KEY);
   // 失败原因（记录仍然保存）
   const down = mountProxy('down.example.com'); down.down = true;
@@ -250,7 +261,7 @@ test('代理同步：面板没有 UUID 而代理已有则接管（不换新）�
 });
 
 test('停用 / 启用：面板立刻不再下发该代理（订阅 400 提示），并通知代理只显示 Hello World；启用恢复；代理不可达时面板照样停用并给出提醒', async () => {
-  const m = mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
+  const m = mountProxy('node.example.com', { PATH: UUID, state: ps(UUID) });
   const env = baseEnv({ CONFIG_KV: kv({ config: customCfg() }) });
   const cookie = await login(env);
   const api = (path, init) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
@@ -278,11 +289,11 @@ test('停用 / 启用：面板立刻不再下发该代理（订阅 400 提示）
   assert.equal(storedProxies(env)[0].enabled, false);
   m.down = false;
   const sync = await (await api(`proxies/${id}/sync`, { method: 'POST' })).json();
-  assert.ok(sync.data.sync.actions.some(x => /停用/.test(x))); assert.equal(proxyState(m).enabled, false, '连接并同步补上代理端的状态');
+  assert.ok(sync.data.sync.actions.some(x => /重新下发/.test(x))); assert.equal(proxyState(m).enabled, false, '连接并同步补上代理端的状态');
 });
 
 test('更换 UUID：新 UUID 下发并写入面板，旧的在代理上保留宽限期；订阅用新的；代理失败时面板的 UUID 不变', async () => {
-  const m = mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
+  const m = mountProxy('node.example.com', { PATH: UUID, state: ps(UUID) });
   const env = baseEnv({ CONFIG_KV: kv({ config: customCfg() }) });
   const cookie = await login(env);
   const rot = await (await call(env, `/${UUID}/api/proxies/${PROXY.id}/rotate`, { method: 'POST', cookie })).json();
@@ -291,6 +302,9 @@ test('更换 UUID：新 UUID 下发并写入面板，旧的在代理上保留宽
   assert.notEqual(fresh, UUID); assert.equal(rot.data.graceMs, 600000);
   assert.equal(storedProxies(env)[0].uuid, fresh);
   assert.equal(proxyState(m).uuid, fresh); assert.equal(proxyState(m).prev, UUID);
+  const grace = proxyState(m).uuids[1][1];
+  assert.ok(grace > Date.now() + 9 * 60 * 1000 && grace <= Date.now() + 10 * 60 * 1000, '旧 UUID 带 10 分钟的失效时间');
+  assert.equal(storedProxies(env)[0].prev, UUID); assert.equal(storedProxies(env)[0].prevUntil, grace);
   const links = await withFetch(nodesFetch, async () => (await (await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).text()).split('\n').filter(l => /^vless:\/\//.test(l)));
   assert.ok(links.length > 0 && links.every(l => l.startsWith(`vless://${fresh}@`)));
   m.down = true;
@@ -300,7 +314,7 @@ test('更换 UUID：新 UUID 下发并写入面板，旧的在代理上保留宽
 });
 
 test('删除与保存保护：删除只动面板的记录；代理上限；未绑定 KV / 代理列表读取失败时拒绝写入', async () => {
-  const m = mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
+  const m = mountProxy('node.example.com', { PATH: UUID, state: ps(UUID) });
   const env = baseEnv();
   const cookie = await login(env);
   const api = (path, init) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
@@ -332,21 +346,25 @@ test('删除与保存保护：删除只动面板的记录；代理上限；未�
   assert.equal(cw.status, 503); assert.equal(corrupt.CONFIG_KV.m.get('proxies'), '{not json');
 });
 
-test('代理状态 /api/proxy-status：需登录；没有代理时 configured:false；在线时给版本、UUID 是否一致、启用状态与非敏感摘要；连不上 / 密钥不对 / 超时都不会让面板报错', async () => {
+test('代理状态 /api/proxy-status：需登录；没有代理时 configured:false；在线时给版本、启用状态与是否与面板一致（inSync）；连不上 / 密钥不对 / 签名不对 / 超时都不会让面板报错', async () => {
   const none = baseEnv({ CONFIG_KV: kv({ proxies: [] }) });
   assert.equal((await call(none, `/${UUID}/api/proxy-status`)).status, 403, '未登录');
   assert.deepEqual(await (await call(none, `/${UUID}/api/proxy-status`, { cookie: await login(none) })).json(), { ok: true, data: { configured: false } });
-  const get = async (env) => (await (await call(env, `/${UUID}/api/proxy-status`, { cookie: await login(env) })).json()).data;
   const env = baseEnv();
-  const m = mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
-  const up = await get(env);
-  assert.deepEqual(up, { configured: true, id: PROXY.id, name: '代理 1', enabledHere: true, up: true, ok: true, version: PROXY_VERSION, problems: [], storage: true, kvError: '', provisioned: true, enabled: true, uuidMatch: true,
-    settings: { edgeIP: false, hopAddr: '', hopMode: '', altMode: 'builtin', altRegion: '', altRegion2: '', altCustom: 0 } });
-  assert.ok(!JSON.stringify(up).includes(KEY) && !JSON.stringify(up).includes(UUID));
-  m.env.NODE_KV = plainKv({ state: { uuid: UUID2 } });
-  assert.equal((await get(env)).uuidMatch, false, '代理上的 UUID 与面板的不一致');
+  const cookie = await login(env);
+  const get = async (e = env, c = cookie) => (await (await call(e, `/${UUID}/api/proxy-status`, { cookie: c })).json()).data;
+  const m = mountProxy('node.example.com', { PATH: UUID, state: ps(UUID) });
+  const before = await get();
+  assert.deepEqual(before, { configured: true, id: PROXY.id, name: '代理 1', enabledHere: true, up: true, ok: true, version: PROXY_VERSION, problems: [], storage: true, kvError: '', provisioned: true, enabled: true, inSync: false });
+  assert.ok(!JSON.stringify(before).includes(KEY) && !JSON.stringify(before).includes(UUID));
+  assert.equal((await (await call(env, `/${UUID}/api/proxies/${PROXY.id}/sync`, { method: 'POST', cookie })).json()).data.sync.ok, true);
+  assert.equal((await get()).inSync, true, '同步后与面板一致');
+  m.env.NODE_KV = plainKv({ state: ps(UUID2) });
+  assert.equal((await get()).inSync, false, '代理上的状态被改动');
+  const rec = await get(baseEnv({ CONFIG_KV: kv({ proxies: [{ ...PROXY, edgeIP: 'x.example.com' }] }) }));
+  assert.equal(rec.inSync, false, '面板里改了设置、还没下发');
   m.down = true;
-  const down = await get(env);
+  const down = await get();
   assert.equal(down.up, false); assert.match(down.error, /无法连接代理/);
   m.down = false;
   const wrong = await get(baseEnv({ CONFIG_KV: kv({ proxies: [{ ...PROXY, key: 'another-key-0123456789-abcdefgh' }] }) }));
@@ -354,54 +372,115 @@ test('代理状态 /api/proxy-status：需登录；没有代理时 configured:fa
   const nokey = await get(baseEnv({ CONFIG_KV: kv({ proxies: [{ ...PROXY, key: '' }] }) }));
   assert.equal(nokey.up, false); assert.match(nokey.error, /密钥/);
   const forged = mountProxy('node.example.com', { PATH: UUID }); forged.reply = () => new Response(JSON.stringify({ ts: Date.now(), d: JSON.stringify({ ok: true, version: '9.9.9' }), s: 'forged' }));
-  const f = await get(env);
+  const f = await get();
   assert.equal(f.up, false); assert.match(f.error, /签名不对/);
   const hung = mountProxy('node.example.com', { PATH: UUID }); hung.hang = true;
   const realSetTimeout = globalThis.setTimeout;
   globalThis.setTimeout = (fn, ms, ...a) => realSetTimeout(fn, ms === 6000 ? 5 : ms, ...a);
   try {
-    const h = await get(env);
+    const h = await get();
     assert.equal(h.up, false); assert.match(h.error, /调用超时/);
   } finally { globalThis.setTimeout = realSetTimeout; }
 });
 
-test('代理设置 API：需登录；没有代理时给出明确提示；读取 / 保存 / 恢复都经签名 HTTPS 转给代理；代理的校验错误原样回给面板（400 + 字段级错误）；连不上时 502', async () => {
-  const none = baseEnv({ CONFIG_KV: kv({ proxies: [] }) });
-  const base = `/${UUID}/api/proxy-settings`;
-  for (const [path, method] of [[base, 'GET'], [base, 'POST'], [`/${UUID}/api/proxy-reset`, 'POST']]) assert.equal((await call(none, path, { method, body: method === 'POST' ? {} : undefined })).status, 403, path + ' 未登录');
-  const nc = await login(none);
-  const g0 = await call(none, base, { cookie: nc });
-  assert.equal(g0.status, 400); assert.match((await g0.json()).msg, /还没有代理/);
-  assert.equal((await call(none, `/${UUID}/api/proxy-reset`, { method: 'POST', cookie: nc })).status, 400);
-  const m = mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
+test('代理设置：保存在面板的代理记录里（落地 IP / 出站代理 / 出站方式 / 备用线路选用），保存即整份下发；字段级校验；多个代理各有一份；连不上时仍保存并提示', async () => {
+  const m = mountProxy('node.example.com', { PATH: UUID, state: ps(UUID) });
   const env = baseEnv();
   const cookie = await login(env);
   const api = (path, init = {}) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
-  assert.equal((await api('proxy-settings', { method: 'PUT' })).status, 405);
-  assert.equal((await api('proxy-settings', { method: 'POST', body: '{bad' })).status, 400);
-  assert.equal((await api('proxy-settings', { method: 'POST', body: '[1]' })).status, 400);
-  assert.equal((await api('proxy-reset')).status, 405, 'proxy-reset 只接受 POST');
-  const g = await (await api('proxy-settings')).json();
-  assert.equal(g.ok, true); assert.equal(g.data.storage, true); assert.ok(g.data.regions.includes('HK'));
-  const s = await (await api('proxy-settings', { method: 'POST', body: { hopMode: 'only', 'alt.mode': 'off' } })).json();
-  assert.equal(s.ok, true); assert.equal(s.data.settings.hopMode, 'only');
-  assert.deepEqual(proxyState(m).set, { hopMode: 'only', 'alt.mode': 'off' }, '设置保存在代理自己的 KV 里');
-  assert.equal(proxyState(m).uuid, UUID);
-  const e = await api('proxy-settings', { method: 'POST', body: { hopMode: 'bad' } });
-  assert.equal(e.status, 400);
-  const ej = await e.json();
-  assert.equal(ej.ok, false); assert.equal(ej.errors[0].field, 'hopMode'); assert.match(ej.msg, /出站方式/);
-  assert.equal((await (await api('proxy-reset', { method: 'POST' })).json()).ok, true);
-  assert.deepEqual(proxyState(m).set, {});
+  const upd = (body) => api(`proxies/${PROXY.id}`, { method: 'POST', body });
+  const r = await (await upd({ edgeIP: ' e.example.com:8443 ', hop: 'socks5://u:p@ss@10.0.0.1:1080', hopMode: 'only', altMode: 'custom', altCustom: 'DE, nope ,NL' })).json();
+  assert.equal(r.ok, true, JSON.stringify(r)); assert.equal(r.data.sync.ok, true);
+  assert.deepEqual([r.data.proxy.edgeIP, r.data.proxy.hop, r.data.proxy.hopMode, r.data.proxy.altMode, r.data.proxy.altCustom], ['e.example.com:8443', 'socks5://u:p@ss@10.0.0.1:1080', 'only', 'custom', 'DE,nope,NL']);
+  const st = proxyState(m);
+  assert.equal(st.edgeIP, 'e.example.com:8443');
+  assert.deepEqual(st.hop, { type: 'socks5', host: '10.0.0.1', port: 1080, user: 'u', pass: 'p@ss' }, '最后一个 @ 分隔凭据与主机，面板把地址解析好再下发');
+  assert.equal(st.hopMode, 'only'); assert.deepEqual(st.altPick, ['DE', 'nope', 'NL']);
+  assert.equal(Object.keys(st.altTable).length, 14); assert.deepEqual(st.altTable.HK, { host: 'proxyip.hk.cmliussss.net' });
+  assert.equal(st.uuid, UUID, '设置与 UUID 一起整份下发');
+  // 其它写法：http / https / 无协议 / URL 编码的密码；默认的线路选用 / 关闭
+  const hops = [['http://10.0.0.2:8080', { type: 'http', host: '10.0.0.2', port: 8080 }], ['https://h.example.com', { type: 'https', host: 'h.example.com', port: 443 }],
+    ['10.0.0.3', { type: 'socks5', host: '10.0.0.3', port: 1080 }], ['socks5://us%40er:pa%3Ass@[2001:db8::1]:1081', { type: 'socks5', host: '2001:db8::1', port: 1081, user: 'us@er', pass: 'pa:ss' }], ['', null]];
+  for (const [hop, want] of hops) { assert.equal((await (await upd({ hop, hopMode: '' })).json()).ok, true, hop); assert.deepEqual(proxyState(m).hop, want, hop); }
+  await upd({ altMode: 'auto' }); assert.deepEqual(proxyState(m).altPick, ['auto', 'HK', 'US']);
+  await upd({ altMode: 'off' }); assert.deepEqual(proxyState(m).altPick, []);
+  // 校验：每项给出字段级错误，整批都不保存
+  const before = JSON.stringify(storedProxies(env));
+  for (const [patch, field, re] of [
+    [{ edgeIP: 'bad host' }, 'edgeIP', /格式为 host/], [{ edgeIP: 'bad_host.example' }, 'edgeIP', /域名或 IP/], [{ edgeIP: 'x.example:99999' }, 'edgeIP', /端口/], [{ hop: 'ss://aes-256-gcm:pw@1.2.3.4:8388' }, 'hop', /Shadowsocks/],
+    [{ hop: 'ftp://1.2.3.4' }, 'hop', /不支持的出站代理类型/], [{ hop: 'socks5://bad host:1' }, 'hop', /空格/], [{ hop: 'socks5://1.2.3.4:99999' }, 'hop', /端口/], [{ hop: 'socks5://' }, 'hop', /./],
+    [{ hopMode: 'no' }, 'hopMode', /出站方式/], [{ hopMode: 'only' }, 'hop', /请先填写出站代理/], [{ altMode: 'sideways' }, 'altMode', /备用线路方式/],
+    [{ altMode: 'custom', altCustom: '' }, 'altCustom', /请填写要用的线路标签/], [{ altCustom: 'bad tag!' }, 'altCustom', /不是有效的标签/], [{ altCustom: 'a,b,c,d,e,f,g,h,i' }, 'altCustom', /最多 8 项/],
+  ]) {
+    const res = await upd(patch);
+    assert.equal(res.status, 400, JSON.stringify(patch));
+    const j = await res.json();
+    assert.ok(j.errors.some(e => e.field === field && re.test(e.msg)), JSON.stringify(patch) + ' → ' + JSON.stringify(j.errors));
+  }
+  assert.equal(JSON.stringify(storedProxies(env)), before, '校验失败不改任何东西');
+  // 代理连不上：设置仍保存在面板里，同步结果给出原因
   m.down = true;
-  const r = await api('proxy-settings');
-  assert.equal(r.status, 502); assert.match((await r.json()).msg, /无法连接代理/);
-  // 多个代理时用 ?id= 指定
+  const lost = await (await upd({ edgeIP: 'saved-offline.example.com' })).json();
+  assert.equal(lost.ok, true); assert.equal(lost.data.sync.ok, false); assert.match(lost.data.sync.error, /无法连接代理/);
+  assert.equal(storedProxies(env)[0].edgeIP, 'saved-offline.example.com');
+  m.down = false;
+  assert.equal((await (await api(`proxies/${PROXY.id}/sync`, { method: 'POST' })).json()).data.sync.ok, true);
+  assert.equal(proxyState(m).edgeIP, 'saved-offline.example.com', '恢复后点同步即下发');
+  // 旧的接口已经不存在
+  assert.equal((await api('proxy-settings')).status === 200 && (await (await api('proxy-settings')).json()).ok === true, false);
+  // 多个代理：各改各的
   const two = baseEnv({ CONFIG_KV: kv({ proxies: [PROXY, { ...PROXY, id: 'px-test-2', host: 'second.example.com' }] }) });
-  const m2 = mountProxy('second.example.com', { PATH: UUID, state: { uuid: UUID } });
+  const m2 = mountProxy('second.example.com', { PATH: UUID, state: ps(UUID) });
   const c2 = await login(two);
-  assert.equal((await call(two, `/${UUID}/api/proxy-settings?id=px-test-2`, { method: 'POST', cookie: c2, body: { hopMode: 'no' } })).status, 200);
-  assert.deepEqual(proxyState(m2).set, { hopMode: 'no' });
+  assert.equal((await call(two, `/${UUID}/api/proxies/px-test-2`, { method: 'POST', cookie: c2, body: { hop: 'http://10.9.9.9:3128', hopMode: 'only' } })).status, 200);
+  assert.deepEqual(proxyState(m2).hop, { type: 'http', host: '10.9.9.9', port: 3128 }); assert.equal(proxyState(m2).hopMode, 'only');
+  assert.equal(proxyState(m).hopMode, '', '另一个代理不受影响');
+});
+
+test('备用线路表：需登录；默认表是纯文本；保存前逐行校验；保存后「同步全部代理」把整张表下发给每个代理；线路表读不到时不下发', async () => {
+  const env = baseEnv({ CONFIG_KV: kv({ proxies: [PROXY, { ...PROXY, id: 'px-test-2', host: 'second.example.com' }] }) });
+  for (const [path, method] of [['alt-routes', 'GET'], ['alt-routes', 'POST'], ['proxy-sync-all', 'POST']]) assert.equal((await call(env, `/${UUID}/api/${path}`, { method })).status, 403, path + ' 未登录');
+  const cookie = await login(env);
+  const api = (path, init = {}) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
+  const g = await (await api('alt-routes')).json();
+  assert.match(g.data.text, /^# 备用线路表/m); assert.match(g.data.text, /^HK proxyip\.hk\.cmliussss\.net$/m);
+  assert.equal(g.data.tags.length, 14); assert.equal(g.data.text, g.data.defaultText);
+  // 校验（逐行）
+  for (const [text, re] of [['HK', /第 1 行：格式为/], ['auto a.example.com', /不能叫 auto/], ['a a.example.com\na b.example.com', /第 2 行：标签「a」重复/], ['a bad host', /格式为/],
+    ['a x.example.com:70000', /端口/], ['a 1.2.3.4 zzz', /格式为/], ['bad!tag a.example.com', /标签只能是/], [Array.from({ length: 33 }, (_, i) => `t${i} a${i}.example.com`).join('\n'), /最多 32 条/]]) {
+    const r = await api('alt-routes', { method: 'POST', body: { text } });
+    assert.equal(r.status, 400, text.slice(0, 30)); assert.match((await r.json()).msg, re, text.slice(0, 30));
+  }
+  assert.equal((await api('alt-routes', { method: 'POST', body: { nope: 1 } })).status, 400);
+  assert.equal(env.CONFIG_KV.m.has('routes'), false, '校验失败不写 KV');
+  // 保存新表（含端口、txt、注释、IPv6），再同步全部代理
+  const text = '# 我的线路\nHK hk.example.com:8443 txt   # 备注\nUS us.example.com\nv6 [2001:db8::5]:9443\n';
+  const ok = await (await api('alt-routes', { method: 'POST', body: { text } })).json();
+  assert.deepEqual(ok.data.tags, ['HK', 'US', 'v6']);
+  assert.equal(env.CONFIG_KV.m.get('routes'), text);
+  const m1 = mountProxy('node.example.com', { PATH: UUID, state: ps(UUID) });
+  const m2 = mountProxy('second.example.com', { PATH: UUID, state: ps(UUID) });
+  const all = await (await api('proxy-sync-all', { method: 'POST' })).json();
+  assert.equal(all.ok, true); assert.deepEqual(all.data.results.map(r => [r.id, r.ok]), [['px-test-1', true], ['px-test-2', true]]);
+  for (const m of [m1, m2]) {
+    assert.deepEqual(proxyState(m).altTable, { HK: { host: 'hk.example.com', port: 8443, txt: true }, US: { host: 'us.example.com' }, v6: { host: '2001:db8::5', port: 9443 } });
+    assert.deepEqual(proxyState(m).altPick, ['auto', 'HK', 'US']);
+  }
+  // 一个代理连不上：只有它失败
+  m2.down = true;
+  const part = await (await api('proxy-sync-all', { method: 'POST' })).json();
+  assert.deepEqual(part.data.results.map(r => r.ok), [true, false]); assert.match(part.data.results[1].error, /无法连接代理/);
+  // 线路表读不到：不能下发（会把代理上的线路换成默认表）
+  const bad = failingKv({ proxies: [PROXY], routes: text });
+  const benv = baseEnv({ CONFIG_KV: bad });
+  const bc = await login(benv);
+  bad.setDown(false);
+  const brk = bad.get;
+  bad.get = async (key, opts) => { if (key === 'routes') throw new Error('KV unavailable'); return brk.call(bad, key, opts); };
+  const refused = await call(benv, `/${UUID}/api/proxies/${PROXY.id}/sync`, { method: 'POST', cookie: bc });
+  assert.equal(refused.status, 503); assert.match((await refused.json()).msg, /备用线路表读取失败/);
+  assert.equal((await call(benv, `/${UUID}/api/alt-routes`, { cookie: bc })).status, 200);
+  assert.equal((await (await call(benv, `/${UUID}/api/alt-routes`, { cookie: bc })).json()).data.error, 'unavailable');
 });
 
 test('订阅只下发启用的代理：停用的跳过（只剩一个时节点名不加后缀）；缺 UUID 的提示去连接并同步', async () => {
@@ -424,21 +503,21 @@ test('面板页面：代理的连接信息在「面板设置 → 代理」里，
   assert.equal(res.status, 200);
   const html = await res.text();
   for (const id of ['a-host', 'a-uuid', 'a-nodepath', 'a-key', 'a-penabled', 'px-conn', 'px-connect', 'px-sync', 'px-rotate', 'px-del', 'epwarn']) assert.ok(html.includes(`id="${id}"`), id);
-  for (const id of ['s-proxyIP', 's-outbound', 's-outmode', 'rl-mode', 'rl-region', 'rl-region2', 'rl-custom', 'px-note', 'px-save', 'px-reset']) assert.ok(html.includes(`id="${id}"`), id);
-  assert.ok(html.includes('data-view="proxy"') && html.includes('function saveProxySettings(') && html.includes('function loadProxySettings('));
+  for (const id of ['s-proxyIP', 's-outbound', 's-outmode', 'rl-mode', 'rl-custom', 'rl-tags', 'rt-text', 'rt-save', 'px-note', 'px-save', 'px-reset', 'px-which']) assert.ok(html.includes(`id="${id}"`), id);
+  assert.ok(html.includes('data-view="proxy"') && html.includes('function saveProxySettings(') && html.includes('function loadProxySettings(') && html.includes('function saveAltRoutes('));
   assert.ok(html.includes('var SCHEMA = ') && !html.includes('/*@HOPLINE_SCHEMA@*/'), '字段表已注入');
   const schema = JSON.parse(html.match(/var SCHEMA = (\[.*?\]) \|\| \[\];/s)[1]);
   const keys = schema.map(d => d.key);
   for (const k of ['host', 'uuid', 'nodePath', 'key']) assert.ok(!keys.includes(k), `${k} 在代理列表里，不在面板的字段表里`);
   assert.ok(html.includes('function saveProxyEntry(') && html.includes('function rotateProxyUuid(') && html.includes('function genKey('));
-  for (const k of ['edgeIP', 'hopAddr', 'hopMode', 'alt.mode', 'alt.region', 'alt.region2', 'alt.custom']) assert.ok(!keys.includes(k), `${k} 是代理的设置，不在面板的字段表里`);
+  for (const k of ['edgeIP', 'hop', 'hopMode', 'altMode', 'altCustom', 'altRoutes']) assert.ok(!keys.includes(k), `${k} 是代理的设置，不在面板的字段表里`);
   // 页面里每个字段表登记的控件都存在（回填 / 收集依赖它）
   for (const d of schema) for (const id of [d.el, ...Object.values(d.els || {})].filter(Boolean)) assert.ok(html.includes(`id="${id}"`), `${d.key} → #${id}`);
 });
 
 test('构建产物：面板脚本不含任何代理代码（sockets、WebSocket、XHTTP、出站、VLESS 头解析），也不再从网络拉取面板页面或 Clash 模板', () => {
   const code = readFileSync(new URL('../Hopline-panel.js', import.meta.url), 'utf8');
-  for (const needle of ['cloudflare:sockets', 'WebSocketPair', 'handleWsProto', 'handleXhtProto', 'openUpstream', 'connectViaS5', 'parseVssProtoHeader', 'ALT_DOMAINS', 'proxyip.hk', 'assetFromNetwork', 'sha256Hex', 'IS_OBFUSCATED', 'dist/panel.html', 'clash-template.yaml']) {
+  for (const needle of ['cloudflare:sockets', 'WebSocketPair', 'handleWsProto', 'handleXhtProto', 'openUpstream', 'connectViaS5', 'parseVssProtoHeader', 'ALT_DOMAINS', 'assetFromNetwork', 'sha256Hex', 'IS_OBFUSCATED', 'dist/panel.html', 'clash-template.yaml']) {
     assert.ok(!code.includes(needle), needle);
   }
   assert.match(code, /^\/\*!Hopline-panel v\d+\.\d+\.\d+\*\//);
@@ -1706,7 +1785,7 @@ test('多代理订阅：原生地址按各代理自己的域名下发；所有�
 test('代理状态 /api/proxy-status?all=1：全部代理的状态（一个连不上不影响其它）；需登录', async () => {
   const env = baseEnv({ CONFIG_KV: kv({ proxies: [PROXY, P2] }) });
   assert.equal((await call(env, `/${UUID}/api/proxy-status?all=1`)).status, 403);
-  mountProxy('node.example.com', { PATH: UUID, state: { uuid: UUID } });
+  mountProxy('node.example.com', { PATH: UUID, state: ps(UUID) });
   mountProxy('second.example.com').down = true;
   const r = await (await call(env, `/${UUID}/api/proxy-status?all=1`, { cookie: await login(env) })).json();
   assert.equal(r.ok, true);

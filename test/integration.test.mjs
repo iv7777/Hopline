@@ -57,7 +57,8 @@ const NODE_KEY = 'integration-node-key-0123456789ab';
 const PROXY_HOST = 'edge.proxy-example.net';
 const PROXY_PATH = 'tunnel-7';
 const kv = () => { const m = new Map(); return { m, async get(k) { return m.has(k) ? m.get(k) : null; }, async put(k, v) { m.set(k, v); }, async delete(k) { m.delete(k); } }; };
-const state = (m) => JSON.parse(m.env.NODE_KV.m.get('state'));
+// 代理上保存的状态（面板整份下发的）；uuid / prev 是方便断言的派生值
+const state = (m) => { const st = JSON.parse(m.env.NODE_KV.m.get('state')); return Object.assign(st, { uuid: st.uuids[0][0], prev: st.uuids[1] ? st.uuids[1][0] : '' }); };
 
 let loginSeq = 10;
 async function panelSession() {
@@ -157,37 +158,42 @@ test('面板添加代理（域名 / 节点路径 / 密钥）→ 自动生成 UUI
   }
 });
 
-test('面板在线修改代理设置：面板 → 签名 HTTPS → 代理自己的 KV → 代理按新设置出站；改不了 UUID / PATH / 密钥；密钥不对时面板连不上', async () => {
-  const m = mount(proxy, { EDGEIP: 'env-alt.example' });
+test('面板里改代理设置：保存在面板的代理记录里，整份下发给代理（KV 里是面板发来的原文）→ 代理按新设置出站；备用线路表由面板下发；密钥不对时面板连不上', async () => {
+  const m = mount(proxy);
   const { api } = await panelSession();
   const add = await api('proxies', { method: 'POST', body: JSON.stringify({ host: PROXY_HOST, nodePath: PROXY_PATH, key: NODE_KEY }) });
-  const uuid = add.body.data.proxy.uuid;
-  const got = await api('proxy-settings');
-  assert.equal(got.body.data.storage, true);
-  assert.equal(got.body.data.settings.edgeIP, 'env-alt.example');
-  assert.equal(got.body.data.source.edgeIP, 'env');
-  const saved = await api('proxy-settings', { method: 'POST', body: JSON.stringify({ edgeIP: 'panel-set.example:8443', 'alt.mode': 'off', UUID: 'hijack', PATH: 'hijack', NODE_KEY: 'hijack' }) });
+  const id = add.body.data.proxy.id, uuid = add.body.data.proxy.uuid;
+  assert.equal(add.body.data.sync.status.inSync, true);
+  const base = state(m);
+  assert.deepEqual(base.altPick, ['auto', 'HK', 'US'], '默认的备用线路选用方式');
+  assert.equal(Object.keys(base.altTable).length, 14, '备用线路表来自面板（纯文本的默认表）');
+  // 把线路换成自己的，再关闭备用线路
+  assert.equal((await api('alt-routes', { method: 'POST', body: JSON.stringify({ text: 'mine panel-set.example:8443\n' }) })).status, 200);
+  const all = await api('proxy-sync-all', { method: 'POST' });
+  assert.equal(all.body.data.results[0].ok, true);
+  assert.deepEqual(state(m).altTable, { mine: { host: 'panel-set.example', port: 8443 } });
+  const saved = await api(`proxies/${id}`, { method: 'POST', body: JSON.stringify({ edgeIP: 'edge-set.example:8443', altMode: 'off', hopMode: '' }) });
   assert.equal(saved.status, 200, JSON.stringify(saved.body));
-  assert.equal(saved.body.data.settings.edgeIP, 'panel-set.example:8443');
-  assert.deepEqual(state(m).set, { edgeIP: 'panel-set.example:8443', 'alt.mode': 'off' });
-  assert.equal(state(m).uuid, uuid, '设置不影响 UUID');
-  assert.ok(!JSON.stringify(state(m)).includes('hijack'));
-  const st = (await api('proxy-status')).body.data;
-  assert.equal(st.storage, true); assert.equal(st.provisioned, true); assert.equal(st.uuidMatch, true);
-  assert.equal(st.settings.edgeIP, true); assert.equal(st.settings.altMode, 'off');
-  // 代理按新设置工作：alt.mode=off → 目标直连失败后不尝试任何反代
+  assert.equal(saved.body.data.sync.status.inSync, true);
+  const st = state(m);
+  assert.equal(st.edgeIP, 'edge-set.example:8443'); assert.deepEqual(st.altPick, []);
+  assert.equal(st.uuid, uuid, '设置不影响 UUID');
+  const status = (await api('proxy-status')).body.data;
+  assert.equal(status.storage, true); assert.equal(status.provisioned, true); assert.equal(status.inSync, true);
+  // 代理按新状态工作：altPick 为空 → 目标直连失败后不尝试任何备用线路（落地 IP 先试，也失败）
   const upgrade = await proxy.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}`, { headers: { Upgrade: 'websocket' } }), m.env, {});
   assert.equal(upgrade.status, 101);
   connections.length = 0;
   const working = globalThis.__connect;
   globalThis.__connect = ({ hostname, port }) => { connections.push({ hostname, port }); throw new Error('refused'); };
   await lastServer.emit('message', { data: reqFor(uuid, 'nowhere.example').buffer });
-  await new Promise(r => setTimeout(r, 50));
+  await new Promise(r => setTimeout(r, 80));
   globalThis.__connect = working;
-  assert.ok(connections.length >= 1 && connections.every(c => c.hostname === 'nowhere.example' || c.hostname === 'panel-set.example'), '没有尝试任何地区反代');
-  const reset = await api('proxy-reset', { method: 'POST' });
-  assert.equal(reset.body.data.settings.edgeIP, 'env-alt.example');
-  assert.deepEqual(state(m).set, {});
+  assert.ok(connections.length >= 1 && connections.every(c => c.hostname === 'nowhere.example' || c.hostname === 'edge-set.example'), '没有尝试任何备用线路：' + JSON.stringify(connections));
+  // 恢复默认（面板里的「恢复默认」）
+  const reset = await api(`proxies/${id}`, { method: 'POST', body: JSON.stringify({ edgeIP: '', hop: '', hopMode: '', altMode: 'auto', altCustom: '' }) });
+  assert.equal(reset.status, 200);
+  assert.equal(state(m).edgeIP, ''); assert.deepEqual(state(m).altPick, ['auto', 'HK', 'US']);
   // 代理上的 NODE_KEY 被改过：面板连不上，给出可读的原因
   m.env.NODE_KEY = 'changed-key-0123456789-abcdefghij';
   const lost = await api('proxy-status');
@@ -218,11 +224,11 @@ test('混淆版代理脚本（顶层名字也已改名）功能不变：面板�
   assert.equal((await waitWritten()).hostname, 'obf-xh.example');
   // 伪装页与错误路径
   for (const path of ['/', '/other', '/status']) assert.match(await (await obf.default.fetch(new Request(`https://${PROXY_HOST}${path}`), m.env, {})).text(), /Hello World/);
-  // 在线设置与停用
-  assert.equal((await api('proxy-settings')).body.data.settings.edgeIP, '');
-  const saved = await api('proxy-settings', { method: 'POST', body: JSON.stringify({ edgeIP: 'saved-edge.example', 'alt.mode': 'off', hopMode: 'no' }) });
+  // 设置下发与停用
+  const saved = await api(`proxies/${add.body.data.proxy.id}`, { method: 'POST', body: JSON.stringify({ edgeIP: 'saved-edge.example', altMode: 'off', hop: 'socks5://u:p@10.0.0.1:1080', hopMode: 'only' }) });
   assert.equal(saved.status, 200, JSON.stringify(saved.body));
-  assert.deepEqual(state(m).set, { edgeIP: 'saved-edge.example', hopMode: 'no', 'alt.mode': 'off' });
+  assert.equal(saved.body.data.sync.status.inSync, true);
+  assert.deepEqual([state(m).edgeIP, state(m).altPick, state(m).hop, state(m).hopMode], ['saved-edge.example', [], { type: 'socks5', host: '10.0.0.1', port: 1080, user: 'u', pass: 'p' }, 'only']);
   const off = await api(`proxies/${add.body.data.proxy.id}/enabled`, { method: 'POST', body: JSON.stringify({ enabled: false }) });
   assert.equal(off.body.data.synced, true);
   assert.match(await (await obf.default.fetch(new Request(`https://${PROXY_HOST}/${PROXY_PATH}`, { headers: { Upgrade: 'websocket' } }), m.env, {})).text(), /Hello World/);

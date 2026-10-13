@@ -24,11 +24,11 @@ function explainControlFailure(status, text) {
   if (/Hello World/i.test(text)) return '代理没有响应控制请求：节点路径或密钥不对、代理还没设置 NODE_KEY，或代理脚本版本过旧';
   return '代理返回了无法识别的响应（HTTP ' + status + '）';
 }
-// 发一次签名请求并验证回应；失败抛 Error（message 可直接显示）。proxy：{ host, nodePath, key }
-async function callProxy(proxy, op, args) {
+// 发一次签名请求并验证回应；失败抛 Error（message 可直接显示）。proxy：{ host, nodePath, key }；args 是对象，rawArgs 给出时原样作为参数文本（setState 要让代理保存的 JSON 与面板算哈希的一致）
+async function callProxy(proxy, op, args, rawArgs) {
   if (!proxy || !proxy.key) throw new Error('这个代理还没有填写密钥');
   if (!proxyHostOk(proxy.host)) throw new Error('代理域名不正确（只能是域名，不能是 IP，也不带端口或路径）');
-  const ts = Date.now(), n = randomNonce(), a = JSON.stringify(args || {});
+  const ts = Date.now(), n = randomNonce(), a = rawArgs !== undefined ? rawArgs : JSON.stringify(args || {});
   const body = JSON.stringify({ ts, n, op, a, s: await hmacB64u(proxy.key, ts + '.' + n + '.' + op + '.' + a) });
   const url = 'https://' + proxy.host + '/' + proxy.nodePath + '/' + await routeTag(proxy.key);
   const ctrl = new AbortController();
@@ -50,31 +50,29 @@ async function callProxy(proxy, op, args) {
   return d;
 }
 // 把「操作失败」的结果（ok:false）转成 Error，方便调用方统一处理
-async function callProxyOk(proxy, op, args) {
-  const d = await callProxy(proxy, op, args);
+async function callProxyOk(proxy, op, args, rawArgs) {
+  const d = await callProxy(proxy, op, args, rawArgs);
   if (d.ok === false) throw Object.assign(new Error(String(d.error || '代理拒绝了这次操作')), { errors: Array.isArray(d.errors) ? d.errors : [] });
   return d;
 }
 
-// 同步：让代理与面板保存的一致。面板没有 UUID 时：代理上已经有就接管它（不会把已经在用的客户端搞断），没有才生成新的；
-// 代理还没下发 UUID 或 UUID 对不上就下发面板的；启用状态不一致就同步。返回 { status, actions, uuid }（uuid 可能是新得到的，由调用方存回面板）
-async function syncProxy(proxy) {
+// 同步：把面板保存的完整状态下发给代理（UUID、启用开关、运行设置、备用线路表）。面板没有 UUID 时先生成一个。
+// 先读代理的 status，状态哈希一致就什么都不做。返回 { status, actions, patch, inSync }：
+// patch 是要存回面板记录的字段（新生成的 UUID、清掉已过期的旧 UUID）；代理自己的环境变量有问题（status.ok 为假）时不下发
+async function syncProxy(proxy, table) {
   const actions = [];
   let st = await callProxyOk(proxy, 'status', {});
-  if (!st.ok) return { status: st, actions, uuid: proxy.uuid };   // 代理自己的环境变量有问题：先让管理员处理
-  let uuid = proxy.uuid;
-  if (!uuid) {
-    if (st.provisioned) { uuid = (await callProxyOk(proxy, 'getIdentity', {})).uuid; actions.push('已接管代理上现有的 UUID'); }
-    else { uuid = crypto.randomUUID(); actions.push('已生成 UUID'); }
+  if (!st.ok) return { status: st, actions, patch: {}, inSync: false };
+  const patch = {};
+  if (!proxy.uuid) { patch.uuid = crypto.randomUUID(); actions.push('已生成 UUID'); }
+  if (proxy.prev && proxy.prevUntil <= Date.now()) { patch.prev = ''; patch.prevUntil = 0; }
+  const next = Object.assign({}, proxy, patch);
+  const raw = JSON.stringify(buildState(next, table));
+  const want = await shortHash(raw);
+  if (st.stateHash !== want) {
+    await callProxyOk(proxy, 'setState', null, raw);
+    actions.push(st.provisioned ? '已把设置重新下发给代理' : '已把 UUID 与设置下发给代理');
+    st = await callProxyOk(proxy, 'status', {});
   }
-  if (!st.provisioned || st.uuidTag !== await uuidTag(uuid)) {
-    await callProxyOk(proxy, 'setIdentity', { uuid });
-    actions.push(st.provisioned ? '已把面板的 UUID 重新下发给代理' : '已把 UUID 下发给代理');
-  }
-  if (st.enabled !== proxy.enabled) {
-    await callProxyOk(proxy, 'setEnabled', { enabled: proxy.enabled });
-    actions.push(proxy.enabled ? '已启用代理' : '已停用代理');
-  }
-  if (actions.length) st = await callProxyOk(proxy, 'status', {});
-  return { status: st, actions, uuid };
+  return { status: st, actions, patch, inSync: st.stateHash === want };
 }

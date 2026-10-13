@@ -1,4 +1,4 @@
-/*!Hopline-panel v3.1.1*/
+/*!Hopline-panel v3.2.0*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -16,7 +16,7 @@
 //  代理的域名、节点路径、密钥在面板「面板设置 → 代理」里填写（保存在 CONFIG_KV）。
 // ============================================================================
 // 面板脚本（Hopline-panel.js）的版本号：用于检测更新与面板里显示。与代理脚本各自编号、各自升版本
-const VERSION = '3.1.1';
+const VERSION = '3.2.0';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
 // 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
@@ -448,56 +448,6 @@ const HTTP_PORTS = new Set([80, 8080, 8880, 2052, 2082, 2086, 2095]);
 // ---------------------------------------------------------------------------
 const TE = new TextEncoder();
 
-// MD5（纯 JS 实现，RFC 1321；WebCrypto 不支持 MD5）
-const MD5_S = [
-  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
-];
-const MD5_K = [
-  0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-  0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-  0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-  0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-  0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-  0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-  0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-  0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
-];
-function rotl32(x, c) { return ((x << c) | (x >>> (32 - c))) >>> 0; }
-// 输入字节数组，返回 16 字节摘要（Shadowsocks 的 EVP_BytesToKey 需要对字节拼接后再哈希）
-function md5Bytes(bytes) {
-  const bitLen = bytes.length * 8;
-  const paddedLen = (((bytes.length + 8) >> 6) + 1) << 6;
-  const data = new Uint8Array(paddedLen);
-  data.set(bytes);
-  data[bytes.length] = 0x80;
-  const dv = new DataView(data.buffer);
-  dv.setUint32(paddedLen - 8, bitLen >>> 0, true);
-  dv.setUint32(paddedLen - 4, Math.floor(bitLen / 0x100000000), true);
-  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
-  for (let i = 0; i < paddedLen; i += 64) {
-    const M = new Uint32Array(16);
-    for (let j = 0; j < 16; j++) M[j] = dv.getUint32(i + j * 4, true);
-    let a = a0, b = b0, c = c0, d = d0;
-    for (let j = 0; j < 64; j++) {
-      let f, g;
-      if (j < 16) { f = (b & c) | (~b & d); g = j; }
-      else if (j < 32) { f = (d & b) | (~d & c); g = (5 * j + 1) % 16; }
-      else if (j < 48) { f = b ^ c ^ d; g = (3 * j + 5) % 16; }
-      else { f = c ^ (b | ~d); g = (7 * j) % 16; }
-      const sum = (a + f + MD5_K[j] + M[g]) >>> 0;
-      const nb = (b + rotl32(sum, MD5_S[j])) >>> 0;
-      a = d; d = c; c = b; b = nb;
-    }
-    a0 = (a0 + a) >>> 0; b0 = (b0 + b) >>> 0; c0 = (c0 + c) >>> 0; d0 = (d0 + d) >>> 0;
-  }
-  const out = new Uint8Array(16);
-  const ov = new DataView(out.buffer);
-  [a0, b0, c0, d0].forEach((v, i) => ov.setUint32(i * 4, v, true));
-  return out;
-}
 function isUUID(str) {
   return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(str || '');
 }
@@ -554,6 +504,56 @@ function stubPage() {
 // ---------------------------------------------------------------------------
 // 哈希（面板）：MD5 用于缓存键，SHA-224 用于派生 Clash 本地凭据
 // ---------------------------------------------------------------------------
+// MD5（纯 JS 实现，RFC 1321；WebCrypto 不支持 MD5）
+const MD5_S = [
+  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+];
+const MD5_K = [
+  0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+  0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+  0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+  0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+  0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+  0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+  0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+  0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+];
+function rotl32(x, c) { return ((x << c) | (x >>> (32 - c))) >>> 0; }
+// 输入字节数组，返回 16 字节摘要
+function md5Bytes(bytes) {
+  const bitLen = bytes.length * 8;
+  const paddedLen = (((bytes.length + 8) >> 6) + 1) << 6;
+  const data = new Uint8Array(paddedLen);
+  data.set(bytes);
+  data[bytes.length] = 0x80;
+  const dv = new DataView(data.buffer);
+  dv.setUint32(paddedLen - 8, bitLen >>> 0, true);
+  dv.setUint32(paddedLen - 4, Math.floor(bitLen / 0x100000000), true);
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  for (let i = 0; i < paddedLen; i += 64) {
+    const M = new Uint32Array(16);
+    for (let j = 0; j < 16; j++) M[j] = dv.getUint32(i + j * 4, true);
+    let a = a0, b = b0, c = c0, d = d0;
+    for (let j = 0; j < 64; j++) {
+      let f, g;
+      if (j < 16) { f = (b & c) | (~b & d); g = j; }
+      else if (j < 32) { f = (d & b) | (~d & c); g = (5 * j + 1) % 16; }
+      else if (j < 48) { f = b ^ c ^ d; g = (3 * j + 5) % 16; }
+      else { f = c ^ (b | ~d); g = (7 * j) % 16; }
+      const sum = (a + f + MD5_K[j] + M[g]) >>> 0;
+      const nb = (b + rotl32(sum, MD5_S[j])) >>> 0;
+      a = d; d = c; c = b; b = nb;
+    }
+    a0 = (a0 + a) >>> 0; b0 = (b0 + b) >>> 0; c0 = (c0 + c) >>> 0; d0 = (d0 + d) >>> 0;
+  }
+  const out = new Uint8Array(16);
+  const ov = new DataView(out.buffer);
+  [a0, b0, c0, d0].forEach((v, i) => ov.setUint32(i * 4, v, true));
+  return out;
+}
 function md5hex(str) {
   return Array.from(md5Bytes(TE.encode(String(str)))).map(b => b.toString(16).padStart(2, '0')).join('');
 }
@@ -639,9 +639,9 @@ function timingSafeEqual(a, b) {
 }
 // 控制请求的路径标记：由密钥派生，不知道密钥就找不到控制入口
 async function routeTag(keyStr) { return (await hmacB64u(keyStr, 'route')).slice(0, 16); }
-// UUID 的短标记（SHA-256 前 8 位十六进制）：面板据此判断代理上的 UUID 是否与自己保存的一致，而不必回传 UUID 本身
-async function uuidTag(uuid) {
-  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', TE.encode(String(uuid).toLowerCase())));
+// 短哈希（SHA-256 前 4 字节的十六进制）：面板据此判断代理上保存的状态是否与自己下发的一致，而不必回传内容本身
+async function shortHash(text) {
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', TE.encode(String(text))));
   return Array.from(d.subarray(0, 4)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 // ---------------------------------------------------------------------------
@@ -772,6 +772,135 @@ async function saveConfig(env, cfg) {
 
 
 // ---------------------------------------------------------------------------
+// 代理设置的解析与校验（面板里做，代理只收结构化的数据）：落地 IP、出站代理地址、备用线路表与优先顺序
+// ---------------------------------------------------------------------------
+const HOP_HOSTNAME_RE = /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
+const TAG_PATTERN = /^[A-Za-z0-9_-]{1,16}$/;
+const ALT_TABLE_MAX = 32;
+const ALT_PICK_MAX = 8;
+const ALT_PICK_DEFAULT = ['auto', 'HK', 'US'];
+
+const hostValid = (h) => !!h && h.length <= 253 && (isValidIp(h) || HOP_HOSTNAME_RE.test(h));
+const portValid = (p) => Number.isInteger(p) && p >= 1 && p <= 65535;
+
+// 反代 / 落地 IP：host 或 host:port（IPv6 加方括号）；返回 { value } 或 { error }
+function checkEdgeIP(v) {
+  v = String(v == null ? '' : v).trim();
+  if (!v) return { value: '' };
+  if (v.length > 256) return { error: '长度不能超过 256' };
+  if (!/^[^\s/]+$/.test(v)) return { error: '格式为 host 或 host:port' };
+  const { host, port } = parseHostPort(v, 443);
+  if (!hostValid(host)) return { error: '不是有效的域名或 IP（格式 host 或 host:port，IPv6 需加方括号）' };
+  if (!portValid(port)) return { error: '端口须为 1 - 65535' };
+  return { value: v };
+}
+
+// 出站代理：socks5:// / http:// / https:// 或 host:port（默认按 socks5），可带 user:pass@；返回 { hop }（空 = null）或 { error }
+function parseHopInput(addr) {
+  let rest = String(addr == null ? '' : addr).trim();
+  if (!rest) return { hop: null };
+  if (rest.length > 1024) return { error: '长度不能超过 1024' };
+  if (/\s/.test(rest)) return { error: '出站代理不能包含空格' };
+  let type = 'socks5';
+  const m = rest.match(/^([A-Za-z][A-Za-z0-9+.-]*):\/\/(.+)$/);
+  if (m) {
+    type = m[1].toLowerCase();
+    rest = m[2];
+    if (type === 'ss') return { error: '不再支持 Shadowsocks 出站，请改用 socks5:// 或 http(s)://' };
+    if (!['socks5', 'http', 'https'].includes(type)) return { error: '不支持的出站代理类型「' + m[1] + '」（支持 socks5 / http / https）' };
+  }
+  let user = '', pass = '';
+  const at = rest.lastIndexOf('@');   // 以最后一个 @ 分隔凭据与主机：密码中未编码的 @ 不会把主机名截断
+  if (at >= 0) {
+    const u = rest.slice(0, at);
+    rest = rest.slice(at + 1);
+    // 用户名 / 密码可能经 URL 编码（%40 等），解码后才能用于认证
+    const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
+    const idx = u.indexOf(':');
+    if (idx >= 0) { user = dec(u.slice(0, idx)); pass = dec(u.slice(idx + 1)); } else user = dec(u);
+    if (user.length > 255 || pass.length > 255) return { error: '用户名或密码过长' };
+  }
+  const { host, port } = parseHostPort(rest, type === 'http' ? 80 : type === 'https' ? 443 : 1080);
+  if (!hostValid(host)) return { error: '无法解析出站代理地址（格式如 socks5://user:pass@1.2.3.4:1080）' };
+  if (!portValid(port)) return { error: '出站代理端口须为 1 - 65535' };
+  const hop = { type, host, port };
+  if (user) { hop.user = user; hop.pass = pass; }
+  return { hop };
+}
+
+// 备用线路表（文本，每行 `标签 域名[:端口] [txt]`，# 开头为注释）→ { table, errors }
+// table: 标签 → { host, port?, txt? }；txt = 解析时先查 TXT 记录（域名的 TXT 里放 IP 列表时用），默认只查 A 记录
+function parseAltRoutes(text) {
+  const table = {}, errors = [];
+  String(text == null ? '' : text).split(/\r?\n/).forEach((line, i) => {
+    line = line.replace(/#.*$/, '').trim();
+    if (!line) return;
+    const err = (msg) => errors.push({ line: i + 1, msg: '第 ' + (i + 1) + ' 行：' + msg });
+    const f = line.split(/\s+/);
+    if (f.length < 2 || f.length > 3 || (f[2] !== undefined && f[2].toLowerCase() !== 'txt')) return err('格式为「标签 域名[:端口] [txt]」');
+    if (!TAG_PATTERN.test(f[0]) || f[0].toLowerCase() === 'auto') return err('标签只能是字母、数字、_ -（最长 16 位），不能叫 auto');
+    if (table[f[0]]) return err('标签「' + f[0] + '」重复');
+    const { host, port } = parseHostPort(f[1], 443);
+    if (!hostValid(host)) return err('「' + f[1].slice(0, 60) + '」不是有效的域名或 IP（IPv6 需加方括号）');
+    if (!portValid(port)) return err('端口须为 1 - 65535');
+    const e = { host };
+    if (port !== 443) e.port = port;
+    if (f[2]) e.txt = true;
+    table[f[0]] = e;
+  });
+  if (Object.keys(table).length > ALT_TABLE_MAX) errors.push({ line: 0, msg: '最多 ' + ALT_TABLE_MAX + ' 条线路' });
+  return { table, errors };
+}
+
+// 备用线路的优先顺序（逗号 / 空格分隔的标签，auto = 按 Worker 机房选最近的地区）→ { pick } 或 { error }
+function parseAltPick(text) {
+  const pick = String(text == null ? '' : text).split(/[\s,;，]+/).filter(Boolean);
+  if (pick.length > ALT_PICK_MAX) return { error: '最多 ' + ALT_PICK_MAX + ' 项' };
+  const bad = pick.find(t => t !== 'auto' && !TAG_PATTERN.test(t));
+  if (bad) return { error: '「' + bad.slice(0, 20) + '」不是有效的标签（字母、数字、_ -，最长 16 位）' };
+  return { pick };
+}
+// ---------------------------------------------------------------------------
+// 备用线路表：面板 KV 里的 routes（纯文本），所有代理共用；整张表随代理的状态下发（见 proxies.js 的 buildState）
+// ---------------------------------------------------------------------------
+// 直连不通（例如目标站同在 Cloudflare 上）时，代理把 TLS 流量交给备用线路（SNI 型透明转发，解析为非 Cloudflare IP 的域名）。
+// 线路是第三方服务器，能看到目标域名与连接元数据；每个代理在「代理设置」里选用哪些、按什么顺序（默认 auto,HK,US）。
+const ROUTES_KEY = 'routes';
+const DEFAULT_ALT_ROUTES = `# 备用线路表：每行「标签 域名[:端口] [txt]」，# 开头是注释。
+# 标签 auto 保留给「按 Worker 机房自动选最近的地区」；HK / US / SG / JP / KR / DE / SE / NL / FI / GB 是自动选择会用到的地区标签。
+# 末尾写 txt = 解析时先查这个域名的 TXT 记录（TXT 里放 IP 列表时用），默认只查 A 记录。
+# 以下是社区提供的线路域名（解析为非 Cloudflare IP）。
+HK proxyip.hk.cmliussss.net
+US proxyip.us.cmliussss.net
+SG proxyip.sg.cmliussss.net
+JP proxyip.jp.cmliussss.net
+KR proxyip.kr.cmliussss.net
+DE proxyip.de.cmliussss.net
+SE proxyip.se.cmliussss.net
+NL proxyip.nl.cmliussss.net
+FI proxyip.fi.cmliussss.net
+GB proxyip.gb.cmliussss.net
+Oracle proxyip.oracle.cmliussss.net
+DigitalOcean proxyip.digitalocean.cmliussss.net
+Vultr proxyip.vultr.cmliussss.net
+Multacom proxyip.multacom.cmliussss.net
+`;
+
+// 读取线路表文本：没保存过就是默认表；返回 { text, error }（error：'unavailable' 时不能保存）
+async function readRoutes(env) {
+  const kv = kvStore(env);
+  if (!kv || typeof kv.get !== 'function') return { text: DEFAULT_ALT_ROUTES, error: '' };
+  try {
+    const raw = await kv.get(ROUTES_KEY, { cacheTtl: 30 });
+    return { text: raw == null ? DEFAULT_ALT_ROUTES : raw, error: '' };
+  } catch (e) { return { text: DEFAULT_ALT_ROUTES, error: 'unavailable' }; }
+}
+async function saveRoutes(env, text) {
+  const kv = kvStore(env);
+  if (!kv || typeof kv.put !== 'function') throw new Error('未绑定 KV 命名空间（变量名 CONFIG_KV），无法保存线路表');
+  await kv.put(ROUTES_KEY, text);
+}
+// ---------------------------------------------------------------------------
 // 面板调用代理的控制接口（签名的 HTTPS 请求；协议见 proxy-control.js）
 // ---------------------------------------------------------------------------
 // 面板与代理没有任何绑定关系：只需要代理的域名、节点路径与密钥，所以可以在不同的 Cloudflare 账号里。
@@ -797,11 +926,11 @@ function explainControlFailure(status, text) {
   if (/Hello World/i.test(text)) return '代理没有响应控制请求：节点路径或密钥不对、代理还没设置 NODE_KEY，或代理脚本版本过旧';
   return '代理返回了无法识别的响应（HTTP ' + status + '）';
 }
-// 发一次签名请求并验证回应；失败抛 Error（message 可直接显示）。proxy：{ host, nodePath, key }
-async function callProxy(proxy, op, args) {
+// 发一次签名请求并验证回应；失败抛 Error（message 可直接显示）。proxy：{ host, nodePath, key }；args 是对象，rawArgs 给出时原样作为参数文本（setState 要让代理保存的 JSON 与面板算哈希的一致）
+async function callProxy(proxy, op, args, rawArgs) {
   if (!proxy || !proxy.key) throw new Error('这个代理还没有填写密钥');
   if (!proxyHostOk(proxy.host)) throw new Error('代理域名不正确（只能是域名，不能是 IP，也不带端口或路径）');
-  const ts = Date.now(), n = randomNonce(), a = JSON.stringify(args || {});
+  const ts = Date.now(), n = randomNonce(), a = rawArgs !== undefined ? rawArgs : JSON.stringify(args || {});
   const body = JSON.stringify({ ts, n, op, a, s: await hmacB64u(proxy.key, ts + '.' + n + '.' + op + '.' + a) });
   const url = 'https://' + proxy.host + '/' + proxy.nodePath + '/' + await routeTag(proxy.key);
   const ctrl = new AbortController();
@@ -823,44 +952,49 @@ async function callProxy(proxy, op, args) {
   return d;
 }
 // 把「操作失败」的结果（ok:false）转成 Error，方便调用方统一处理
-async function callProxyOk(proxy, op, args) {
-  const d = await callProxy(proxy, op, args);
+async function callProxyOk(proxy, op, args, rawArgs) {
+  const d = await callProxy(proxy, op, args, rawArgs);
   if (d.ok === false) throw Object.assign(new Error(String(d.error || '代理拒绝了这次操作')), { errors: Array.isArray(d.errors) ? d.errors : [] });
   return d;
 }
 
-// 同步：让代理与面板保存的一致。面板没有 UUID 时：代理上已经有就接管它（不会把已经在用的客户端搞断），没有才生成新的；
-// 代理还没下发 UUID 或 UUID 对不上就下发面板的；启用状态不一致就同步。返回 { status, actions, uuid }（uuid 可能是新得到的，由调用方存回面板）
-async function syncProxy(proxy) {
+// 同步：把面板保存的完整状态下发给代理（UUID、启用开关、运行设置、备用线路表）。面板没有 UUID 时先生成一个。
+// 先读代理的 status，状态哈希一致就什么都不做。返回 { status, actions, patch, inSync }：
+// patch 是要存回面板记录的字段（新生成的 UUID、清掉已过期的旧 UUID）；代理自己的环境变量有问题（status.ok 为假）时不下发
+async function syncProxy(proxy, table) {
   const actions = [];
   let st = await callProxyOk(proxy, 'status', {});
-  if (!st.ok) return { status: st, actions, uuid: proxy.uuid };   // 代理自己的环境变量有问题：先让管理员处理
-  let uuid = proxy.uuid;
-  if (!uuid) {
-    if (st.provisioned) { uuid = (await callProxyOk(proxy, 'getIdentity', {})).uuid; actions.push('已接管代理上现有的 UUID'); }
-    else { uuid = crypto.randomUUID(); actions.push('已生成 UUID'); }
+  if (!st.ok) return { status: st, actions, patch: {}, inSync: false };
+  const patch = {};
+  if (!proxy.uuid) { patch.uuid = crypto.randomUUID(); actions.push('已生成 UUID'); }
+  if (proxy.prev && proxy.prevUntil <= Date.now()) { patch.prev = ''; patch.prevUntil = 0; }
+  const next = Object.assign({}, proxy, patch);
+  const raw = JSON.stringify(buildState(next, table));
+  const want = await shortHash(raw);
+  if (st.stateHash !== want) {
+    await callProxyOk(proxy, 'setState', null, raw);
+    actions.push(st.provisioned ? '已把设置重新下发给代理' : '已把 UUID 与设置下发给代理');
+    st = await callProxyOk(proxy, 'status', {});
   }
-  if (!st.provisioned || st.uuidTag !== await uuidTag(uuid)) {
-    await callProxyOk(proxy, 'setIdentity', { uuid });
-    actions.push(st.provisioned ? '已把面板的 UUID 重新下发给代理' : '已把 UUID 下发给代理');
-  }
-  if (st.enabled !== proxy.enabled) {
-    await callProxyOk(proxy, 'setEnabled', { enabled: proxy.enabled });
-    actions.push(proxy.enabled ? '已启用代理' : '已停用代理');
-  }
-  if (actions.length) st = await callProxyOk(proxy, 'status', {});
-  return { status: st, actions, uuid };
+  return { status: st, actions, patch, inSync: st.stateHash === want };
 }
 // ---------------------------------------------------------------------------
-// 代理列表：面板 KV 里的 proxies（一个 JSON 数组），每项 { id, name, host, nodePath, uuid, key, enabled }
+// 代理列表：面板 KV 里的 proxies（一个 JSON 数组），每项 { id, name, host, nodePath, uuid, key, enabled, prev, prevUntil, edgeIP, hop, hopMode, altMode, altCustom }
 // ---------------------------------------------------------------------------
-// 面板是 UUID 的权威：由面板生成并下发给代理（见 proxy-client.js 的 syncProxy）。密钥只写不读：接口不回传，备份不导出。
+// 面板是代理全部状态的唯一权威：UUID（含轮换后限时保留的旧 UUID：prev / prevUntil）、启用开关与运行设置
+// （edgeIP 落地 IP、hop 出站代理地址、hopMode 出站方式、altMode / altCustom 备用线路的选用方式）都存在这里，
+// 整份下发给代理（buildState → 控制接口 setState）。密钥只写不读：接口不回传，备份不导出。
+const UUID_GRACE_MS = 10 * 60 * 1000;   // 更换 UUID 后，旧 UUID 在代理上再保留 10 分钟
 // 订阅合并所有可用的代理（见 readyProxies）；接口 /api/proxies 与面板的代理列表按多个代理设计。
 const PROXIES_KEY = 'proxies';
 const PROXIES_MAX = 8;
 
 function publicProxy(p) {
-  return { id: p.id, name: p.name, host: p.host, nodePath: p.nodePath, uuid: p.uuid, keySet: !!p.key, enabled: p.enabled };
+  return {
+    id: p.id, name: p.name, host: p.host, nodePath: p.nodePath, uuid: p.uuid, keySet: !!p.key, enabled: p.enabled,
+    prevUntil: p.prev && p.prevUntil > Date.now() ? p.prevUntil : 0,
+    edgeIP: p.edgeIP, hop: p.hop, hopMode: p.hopMode, altMode: p.altMode, altCustom: p.altCustom,
+  };
 }
 function cleanProxyRecord(r) {
   if (!r || typeof r !== 'object') return null;
@@ -870,6 +1004,9 @@ function cleanProxyRecord(r) {
     id, name: String(r.name || '').slice(0, 40) || id,
     host: String(r.host || '').toLowerCase(), nodePath: String(r.nodePath || ''),
     uuid: isUUID(r.uuid) ? String(r.uuid).toLowerCase() : '', key: typeof r.key === 'string' ? r.key : '', enabled: r.enabled !== false,
+    prev: isUUID(r.prev) ? String(r.prev).toLowerCase() : '', prevUntil: Number(r.prevUntil) > 0 ? Number(r.prevUntil) : 0,
+    edgeIP: typeof r.edgeIP === 'string' ? r.edgeIP : '', hop: typeof r.hop === 'string' ? r.hop : '', hopMode: r.hopMode === 'only' ? 'only' : '',
+    altMode: r.altMode === 'custom' || r.altMode === 'off' ? r.altMode : 'auto', altCustom: typeof r.altCustom === 'string' ? r.altCustom : '',
   };
 }
 // 读入面板配置时附带代理列表：cfg.proxies 全部，cfg.proxy 第一个启用的（面板接口没指定 id 时的默认代理）；读取失败记在 cfg._proxiesError（此时拒绝保存）
@@ -924,9 +1061,33 @@ function sanitizeProxyInput(input, { partial } = {}) {
     else value.key = v;
   } else if (!partial) err('key', '请填写密钥（与代理的环境变量 NODE_KEY 相同；可以点「生成密钥」）');
   if (has('enabled')) { if (typeof input.enabled !== 'boolean') err('enabled', '必须为开或关'); else value.enabled = input.enabled; }
+  // 运行设置（落地 IP / 出站代理 / 出站方式 / 备用线路）：字符串原样保存（出站代理校验通过后才保存），下发时再解析
+  if (has('edgeIP')) { const r = checkEdgeIP(input.edgeIP); if (r.error) err('edgeIP', r.error); else value.edgeIP = r.value; }
+  if (has('hop')) { const v = String(input.hop == null ? '' : input.hop).trim(); const r = parseHopInput(v); if (r.error) err('hop', r.error); else value.hop = v; }
+  if (has('hopMode')) { if (input.hopMode !== '' && input.hopMode !== 'only') err('hopMode', '出站方式不支持「' + String(input.hopMode).slice(0, 20) + '」'); else value.hopMode = input.hopMode; }
+  if (has('altMode')) { if (!['auto', 'custom', 'off'].includes(input.altMode)) err('altMode', '备用线路方式不支持「' + String(input.altMode).slice(0, 20) + '」'); else value.altMode = input.altMode; }
+  if (has('altCustom')) { const r = parseAltPick(input.altCustom); if (r.error) err('altCustom', r.error); else value.altCustom = r.pick.join(','); }
   return { value, errors };
 }
+// 合并后的整条记录的交叉校验（单项校验过不了的组合）：返回 [{ field, msg }]
+function crossCheckProxy(r) {
+  const errors = [];
+  if (r.altMode === 'custom' && !r.altCustom) errors.push({ field: 'altCustom', msg: '已选择自定义顺序，请填写要用的线路标签（或改回自动 / 关闭）' });
+  if (r.hopMode === 'only' && !r.hop) errors.push({ field: 'hop', msg: '出站方式选了「仅走出站代理」，请先填写出站代理' });
+  return errors;
+}
 function newProxyId() { return b64uOfBytes(crypto.getRandomValues(new Uint8Array(6))); }
+
+// 代理应有的完整状态（整份下发）：键的顺序固定，JSON 文本因此稳定，代理返回的 stateHash 可以与面板自己算的比较。
+// table 是备用线路表（parseAltRoutes 的结果）；已经过期的旧 UUID 仍然列在里面（代理自己会忽略），避免状态哈希因时间流逝而变化，
+// 下一次同步时由 syncProxy 清掉
+function buildState(p, table) {
+  const uuids = [[p.uuid, 0]];
+  if (p.prev && p.prevUntil) uuids.push([p.prev, p.prevUntil]);
+  const hop = p.hop ? parseHopInput(p.hop).hop : null;
+  const pick = p.altMode === 'off' ? [] : p.altMode === 'custom' ? parseAltPick(p.altCustom).pick : ALT_PICK_DEFAULT;
+  return { uuids, enabled: p.enabled, edgeIP: p.edgeIP || '', hop, hopMode: p.hopMode || '', altTable: table || {}, altPick: pick };
+}
 
 // 订阅会下发的代理：启用、且域名 / 节点路径 / UUID 都已齐全（多个时订阅合并它们的节点）
 function readyProxies(cfg) {
@@ -942,27 +1103,37 @@ function endpointMissing(cfg) {
   return [['host', '代理域名'], ['nodePath', '节点路径'], ['uuid', 'UUID（点「连接并同步」会自动生成并下发）']].filter(([k]) => !px[k]).map(([, label]) => label);
 }
 // ---------------------------------------------------------------------------
-// 面板的代理管理接口（需登录）：/api/proxies（增删改、同步、启停、换 UUID）、/api/proxy-status、/api/proxy-settings、/api/proxy-reset
+// 面板的代理管理接口（需登录）：/api/proxies（增删改、同步、启停、换 UUID）、/api/proxy-sync-all、/api/proxy-status、/api/alt-routes
 // ---------------------------------------------------------------------------
 const pickProxy = (cfg, id) => (id ? cfg.proxies.find(p => p.id === id) : (cfg.proxy || cfg.proxies[0])) || null;
 
+// 备用线路表（解析后）：线路表读不到时不能下发（会把代理上的线路换成默认表），直接报错
+async function loadAltTable(env) {
+  const r = await readRoutes(env);
+  if (r.error) throw new Error('备用线路表读取失败（KV 暂时无法读取），为避免下发错误的内容，已取消');
+  return parseAltRoutes(r.text).table;
+}
+
+// 由代理的 status 回应得出面板用的状态；inSync = 代理上保存的状态与面板应下发的完全一致
+async function statusFrom(p, st, table) {
+  const want = p.uuid ? await shortHash(JSON.stringify(buildState(p, table))) : '';
+  return {
+    configured: true, id: p.id, name: p.name, enabledHere: p.enabled,
+    up: true, ok: st.ok === true, version: String(st.version || ''), problems: Array.isArray(st.problems) ? st.problems.map(String) : [],
+    storage: st.storage === true, kvError: String(st.kvError || ''), provisioned: st.provisioned === true, enabled: st.enabled !== false,
+    inSync: !!want && st.stateHash === want,
+  };
+}
 // 代理状态（给仪表盘）：调用失败不抛错，返回 { configured, up, error }
-async function proxyStatusOf(p) {
+async function proxyStatusOf(p, table) {
   if (!p) return { configured: false };
   const base = { configured: true, id: p.id, name: p.name, enabledHere: p.enabled };
   if (!p.key) return Object.assign(base, { up: false, error: '没有填写密钥' });
-  try {
-    const st = await callProxyOk(p, 'status', {});
-    return Object.assign(base, {
-      up: true, ok: st.ok === true, version: String(st.version || ''), problems: Array.isArray(st.problems) ? st.problems.map(String) : [],
-      storage: st.storage === true, kvError: String(st.kvError || ''), provisioned: st.provisioned === true, enabled: st.enabled !== false,
-      uuidMatch: !!(st.provisioned && p.uuid && st.uuidTag === await uuidTag(p.uuid)),
-      settings: st.settings && typeof st.settings === 'object' ? st.settings : {},
-    });
-  } catch (e) { return Object.assign(base, { up: false, error: String((e && e.message) || e) }); }
+  try { return await statusFrom(p, await callProxyOk(p, 'status', {}), table); }
+  catch (e) { return Object.assign(base, { up: false, error: String((e && e.message) || e) }); }
 }
 const proxyFail = (e) => json({ ok: false, msg: String((e && e.message) || e), errors: (e && e.errors) || [] }, (e && e.errors && e.errors.length) ? 400 : 502);
-const noProxy = () => json({ ok: false, msg: '还没有代理：请先在「面板设置 → 代理」添加一个（填写域名、节点路径和密钥）' }, 400);
+const fieldErrors = (errors) => json({ ok: false, msg: errors.map(e => e.msg).join('；'), errors }, 400);
 
 async function handleProxiesApi(apiName, request, env, cfg, segs, url) {
   const method = request.method;
@@ -974,29 +1145,51 @@ async function handleProxiesApi(apiName, request, env, cfg, segs, url) {
   };
   const readBody = async () => { try { return await request.json(); } catch (e) { return undefined; } };
   const save = async (list) => { await saveProxies(env, list); cfg.proxies = list; cfg.proxy = list.find(p => p.enabled) || null; };
+  const patchOf = (id, patch) => cfg.proxies.map(x => (x.id === id ? Object.assign({}, x, patch) : x));
 
+  // 同步一个代理并把可能新生成的 UUID 存回面板；失败不抛错，返回 { ok:false, error }
+  const syncAndStore = async (id, table) => {
+    const p = cfg.proxies.find(x => x.id === id);
+    try {
+      const r = await syncProxy(p, table);
+      if (Object.keys(r.patch).length) await save(patchOf(id, r.patch));
+      const cur = cfg.proxies.find(x => x.id === id);
+      return { ok: r.status.ok === true && r.inSync, actions: r.actions, status: await statusFrom(cur, r.status, table), error: !r.status.ok ? (r.status.problems || []).join(' ') : (r.inSync ? '' : '代理没有按下发的内容更新状态') };
+    } catch (e) { return { ok: false, error: String((e && e.message) || e), actions: [] }; }
+  };
+  const withTable = async (fn) => { let table; try { table = await loadAltTable(env); } catch (e) { return json({ ok: false, msg: e.message }, 503); } return fn(table); };
+
+  if (apiName === 'alt-routes') {
+    if (method === 'GET') {
+      const r = await readRoutes(env);
+      return json({ ok: true, data: { text: r.text, defaultText: DEFAULT_ALT_ROUTES, tags: Object.keys(parseAltRoutes(r.text).table), error: r.error } });
+    }
+    if (method !== 'POST') return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
+    const kv = kvStore(env);
+    if (!kv || typeof kv.put !== 'function') return json({ ok: false, msg: '未绑定 KV 命名空间（变量名 CONFIG_KV），无法保存线路表' }, 400);
+    const body = await readBody();
+    if (!body || typeof body.text !== 'string' || body.text.length > 8000) return json({ ok: false, msg: '缺少线路表文本（text，最长 8000 个字符）' }, 400);
+    const { table, errors } = parseAltRoutes(body.text);
+    if (errors.length) return fieldErrors(errors.map(e => ({ field: 'text', msg: e.msg })));
+    await saveRoutes(env, body.text);
+    return json({ ok: true, data: { tags: Object.keys(table) } });
+  }
+  if (apiName === 'proxy-sync-all') {
+    if (method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);
+    const blocked = guardWrite(); if (blocked) return blocked;
+    return withTable(async (table) => {
+      const results = [];
+      for (const p of cfg.proxies) results.push(Object.assign({ id: p.id, name: p.name }, await syncAndStore(p.id, table)));
+      return json({ ok: true, data: { results } });
+    });
+  }
   if (apiName === 'proxy-status') {
     if (method !== 'GET') return json({ ok: false, msg: '仅支持 GET' }, 405);
-    // ?all=1：全部代理的状态（并行查询，给仪表盘与代理列表）
-    if (url.searchParams.get('all') === '1') return json({ ok: true, data: { proxies: await Promise.all(cfg.proxies.map(proxyStatusOf)) } });
-    return json({ ok: true, data: await proxyStatusOf(pickProxy(cfg, url.searchParams.get('id'))) });
-  }
-  if (apiName === 'proxy-settings' || apiName === 'proxy-reset') {
-    const p = pickProxy(cfg, url.searchParams.get('id'));
-    if (!p) return noProxy();
-    try {
-      if (apiName === 'proxy-reset') {
-        if (method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);
-        return json({ ok: true, data: await callProxyOk(p, 'resetSettings', {}) });
-      }
-      if (method === 'GET') return json({ ok: true, data: await callProxyOk(p, 'getSettings', {}) });
-      if (method === 'POST') {
-        const body = await readBody();
-        if (!body || typeof body !== 'object' || Array.isArray(body)) return json({ ok: false, msg: '请求体必须为 JSON 对象' }, 400);
-        return json({ ok: true, data: await callProxyOk(p, 'setSettings', body) });
-      }
-      return json({ ok: false, msg: '仅支持 GET / POST' }, 405);
-    } catch (e) { return proxyFail(e); }
+    return withTable(async (table) => {
+      // ?all=1：全部代理的状态（并行查询，给仪表盘与代理列表）
+      if (url.searchParams.get('all') === '1') return json({ ok: true, data: { proxies: await Promise.all(cfg.proxies.map(p => proxyStatusOf(p, table))) } });
+      return json({ ok: true, data: await proxyStatusOf(pickProxy(cfg, url.searchParams.get('id')), table) });
+    });
   }
 
   // /api/proxies[/<id>[/<action>]]
@@ -1008,11 +1201,14 @@ async function handleProxiesApi(apiName, request, env, cfg, segs, url) {
     if (cfg.proxies.length >= PROXIES_MAX) return json({ ok: false, msg: '最多 ' + PROXIES_MAX + ' 个代理' }, 400);
     const body = await readBody();
     const { value, errors } = sanitizeProxyInput(body);
-    if (errors.length) return json({ ok: false, msg: errors.map(e => e.msg).join('；'), errors }, 400);
     const rec = cleanProxyRecord(Object.assign({ id: newProxyId(), name: '代理 ' + (cfg.proxies.length + 1), uuid: '', enabled: true }, value));
-    await save([...cfg.proxies, rec]);
-    const sync = body.sync === false ? null : await syncAndStore(env, cfg, rec.id, save);
-    return json({ ok: true, data: { proxy: publicProxy(cfg.proxies.find(x => x.id === rec.id)), sync } });
+    const all = errors.concat(errors.length ? [] : crossCheckProxy(rec));
+    if (all.length) return fieldErrors(all);
+    return withTable(async (table) => {
+      await save([...cfg.proxies, rec]);
+      const sync = body.sync === false ? null : await syncAndStore(rec.id, table);
+      return json({ ok: true, data: { proxy: publicProxy(cfg.proxies.find(x => x.id === rec.id)), sync } });
+    });
   }
   const p = cfg.proxies.find(x => x.id === id);
   if (!p) return (method !== 'GET' && guardWrite()) || json({ ok: false, msg: '没有这个代理' }, 404);
@@ -1026,45 +1222,44 @@ async function handleProxiesApi(apiName, request, env, cfg, segs, url) {
     if (method !== 'POST') return json({ ok: false, msg: '仅支持 GET / POST / DELETE' }, 405);
     const body = await readBody();
     const { value, errors } = sanitizeProxyInput(body, { partial: true });
-    if (errors.length) return json({ ok: false, msg: errors.map(e => e.msg).join('；'), errors }, 400);
     const next = cleanProxyRecord(Object.assign({}, p, value));
-    await save(cfg.proxies.map(x => (x.id === id ? next : x)));
-    const sync = body.sync === false ? null : await syncAndStore(env, cfg, id, save);
-    return json({ ok: true, data: { proxy: publicProxy(cfg.proxies.find(x => x.id === id)), sync } });
+    const all = errors.concat(errors.length ? [] : crossCheckProxy(next));
+    if (all.length) return fieldErrors(all);
+    return withTable(async (table) => {
+      await save(cfg.proxies.map(x => (x.id === id ? next : x)));
+      const sync = body.sync === false ? null : await syncAndStore(id, table);
+      return json({ ok: true, data: { proxy: publicProxy(cfg.proxies.find(x => x.id === id)), sync } });
+    });
   }
   if (method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);
   const blocked = guardWrite(); if (blocked) return blocked;
-  if (action === 'sync') {
-    const sync = await syncAndStore(env, cfg, id, save);
-    return json({ ok: true, data: { proxy: publicProxy(cfg.proxies.find(x => x.id === id)), sync } });
-  }
-  if (action === 'enabled') {
-    const body = await readBody();
-    if (!body || typeof body.enabled !== 'boolean') return json({ ok: false, msg: '缺少 enabled（true / false）' }, 400);
-    const next = Object.assign({}, p, { enabled: body.enabled });
-    await save(cfg.proxies.map(x => (x.id === id ? next : x)));
-    // 面板这边立刻生效（停用的代理不进订阅）；同时通知代理本身启用 / 停用，代理没响应时只给出提醒，之后可以「连接并同步」补上
-    let synced = false, warning = '';
-    try { await callProxyOk(next, 'setEnabled', { enabled: body.enabled }); synced = true; } catch (e) { warning = '面板已' + (body.enabled ? '启用' : '停用') + '，但没能通知代理：' + e.message + '。代理上的状态以后可以点「连接并同步」补上'; }
-    return json({ ok: true, data: { proxy: publicProxy(next), synced, warning } });
-  }
-  if (action === 'rotate') {
-    const uuid = crypto.randomUUID();
-    try { var r = await callProxyOk(p, 'setIdentity', { uuid, rotate: true }); } catch (e) { return proxyFail(e); }
-    const next = Object.assign({}, p, { uuid });
-    await save(cfg.proxies.map(x => (x.id === id ? next : x)));
-    return json({ ok: true, data: { proxy: publicProxy(next), graceMs: r.graceMs || 0 } });
-  }
-  return json({ ok: false, msg: '未知操作：' + action }, 404);
-}
-// 同步一个代理并把可能新生成的 UUID 存回面板；失败不抛错，返回 { ok:false, error }
-async function syncAndStore(env, cfg, id, save) {
-  const p = cfg.proxies.find(x => x.id === id);
-  try {
-    const r = await syncProxy(p);
-    if (r.uuid !== p.uuid) await save(cfg.proxies.map(x => (x.id === id ? Object.assign({}, x, { uuid: r.uuid }) : x)));
-    return { ok: r.status.ok === true, actions: r.actions, status: await proxyStatusOf(cfg.proxies.find(x => x.id === id)), error: r.status.ok ? '' : r.status.problems.join(' ') };
-  } catch (e) { return { ok: false, error: String((e && e.message) || e), actions: [] }; }
+  return withTable(async (table) => {
+    if (action === 'sync') {
+      const sync = await syncAndStore(id, table);
+      return json({ ok: true, data: { proxy: publicProxy(cfg.proxies.find(x => x.id === id)), sync } });
+    }
+    if (action === 'enabled') {
+      const body = await readBody();
+      if (!body || typeof body.enabled !== 'boolean') return json({ ok: false, msg: '缺少 enabled（true / false）' }, 400);
+      // 面板这边立刻生效（停用的代理不进订阅）；同时把新状态下发给代理（停用 = 代理对外只显示 Hello World），代理没响应时只给出提醒，之后可以「连接并同步」补上
+      await save(patchOf(id, { enabled: body.enabled }));
+      const sync = await syncAndStore(id, table);
+      const warning = sync.ok ? '' : '面板已' + (body.enabled ? '启用' : '停用') + '，但没能通知代理：' + sync.error + '。代理上的状态以后可以点「连接并同步」补上';
+      return json({ ok: true, data: { proxy: publicProxy(cfg.proxies.find(x => x.id === id)), synced: sync.ok, warning } });
+    }
+    if (action === 'rotate') {
+      // 先把新 UUID 下发给代理，成功了才改面板的记录；旧 UUID 在代理上保留一段宽限期
+      const next = Object.assign({}, p, { uuid: crypto.randomUUID(), prev: p.uuid, prevUntil: p.uuid ? Date.now() + UUID_GRACE_MS : 0 });
+      try {
+        const r = await syncProxy(next, table);
+        if (!r.status.ok) throw new Error('代理的环境变量有问题：' + (r.status.problems || []).join(' '));
+        if (!r.inSync) throw new Error('代理没有按下发的内容更新状态');
+      } catch (e) { return proxyFail(e); }
+      await save(cfg.proxies.map(x => (x.id === id ? next : x)));
+      return json({ ok: true, data: { proxy: publicProxy(next), graceMs: p.uuid ? UUID_GRACE_MS : 0 } });
+    }
+    return json({ ok: false, msg: '未知操作：' + action }, 404);
+  });
 }
 // ---------------------------------------------------------------------------
 // 优选器：候选提取（txt / HTML 多源）+ TCP 延迟测试
@@ -3098,55 +3293,54 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
     </section>
 
     
-    <section class="view" data-view="proxy" data-title="代理设置" data-sub="在线修改代理脚本的落地、出站与地区反代设置（面板用密钥签名后通过 HTTPS 发给代理，不经过订阅）">
+    <section class="view" data-view="proxy" data-title="代理设置" data-sub="代理的落地、出站与备用线路设置，以及所有代理共用的备用线路表（保存在面板里，面板用密钥签名后下发给代理）">
       <div class="card">
         <h3><span class="tick"></span>状态</h3>
         <div class="note-box" id="px-note" style="margin:0">读取中…</div>
         <div class="field" id="px-whichbox" style="display:none;margin:12px 0 0"><label>要修改的代理</label><select id="px-which" onchange="onProxyWhich()"></select></div>
         <div class="inrow" style="margin-top:12px">
           <button class="btn" id="px-reload" onclick="loadProxySettings()">重新读取</button>
-          <button class="btn primary" id="px-save" onclick="saveProxySettings()">保存到代理</button>
-          <button class="btn danger" id="px-reset" onclick="resetProxySettings()">恢复为环境变量</button>
+          <button class="btn primary" id="px-save" onclick="saveProxySettings()">保存并下发</button>
+          <button class="btn danger" id="px-reset" onclick="resetProxySettings()">恢复默认</button>
         </div>
-        <p class="hint" style="margin-top:10px">这里的设置只保存在代理自己的 KV（变量名 NODE_KV）里，面板不保存；保存后代理约 1 分钟内生效（KV 同步与缓存）。优先级：这里的设置 &gt; 代理的环境变量 &gt; 默认值；与环境变量相同的值不会存入 KV。节点路径（PATH）与密钥（NODE_KEY）只能在代理的环境变量里改，改完后到「面板设置 → 代理」同步更新；UUID 由面板管理。「恢复为环境变量」会清除这里保存的全部覆盖项。</p>
+        <p class="hint" style="margin-top:10px">这里的设置保存在面板里（和代理的域名、密钥一起），保存时整份下发给代理，代理约 1 分钟内生效（KV 同步与缓存）；之后哪怕代理的 KV 被清空，点「连接并同步」也能原样恢复。有多个代理时，每个代理各有一份设置。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>落地与出站</h3>
-        <div class="field"><label>反代 / 落地 IP（填写后作为固定出口优先使用；留空则直连失败后由地区反代兜底（见下方「内置地区反代」），格式 host 或 host:port）</label><input type="text" id="s-proxyIP" placeholder="留空则直连失败后走地区反代" autocomplete="off"><div class="hint src" data-src="edgeIP"></div></div>
-        <div class="field"><label>出站代理（可选）</label><input type="text" id="s-outbound" placeholder="socks5://user:pass@1.2.3.4:1080 或 ss://chacha20-ietf-poly1305:密码@1.2.3.4:8388" autocomplete="off"><div class="hint src" data-src="hopAddr"></div></div>
-        <p class="hint">支持 socks5://（可带 user:pass@）、http(s)://、ss:// 或 host:port（默认按 socks5，端口 1080）。SS 加密支持 aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305。未填写出站代理时，三种出站方式都按直连处理。</p>
+        <div class="field"><label>反代 / 落地 IP（填写后作为固定出口优先使用；留空则直连失败后由备用线路兜底，格式 host 或 host:port）</label><input type="text" id="s-proxyIP" placeholder="留空则直连失败后走备用线路" autocomplete="off"></div>
+        <div class="field"><label>出站代理（可选）</label><input type="text" id="s-outbound" placeholder="socks5://user:pass@1.2.3.4:1080 或 http://1.2.3.4:8080" autocomplete="off"></div>
+        <p class="hint">支持 socks5://（可带 user:pass@）、http(s)://，或 host:port（默认按 socks5，端口 1080）；不再支持 Shadowsocks。用户名与密码保存在面板的 KV 里，并随状态下发到代理的 KV。</p>
         <div class="field" style="margin-bottom:0"><label>出站方式</label>
           <select id="s-outmode">
-            <option value="">默认（先走代理，失败后直连 / 地区反代）</option>
-            <option value="no">直连 / 地区反代优先，都不通再走代理（no）</option>
-            <option value="only">仅走代理，失败后只用地区反代、不直连（only）</option>
+            <option value="">默认（先走出站代理，失败后直连 / 备用线路）</option>
+            <option value="only">仅走出站代理，失败后只用备用线路、不直连（only）</option>
           </select>
-          <div class="hint src" data-src="hopMode"></div>
+        </div>
+        <p class="hint" style="margin-top:10px">未填写出站代理时，两种出站方式都按直连处理。</p>
+      </div>
+      <div class="card">
+        <h3><span class="tick"></span>备用线路（这个代理）</h3>
+        <p class="hint" style="margin-top:0">直连不通（例如目标站同在 Cloudflare 上）时，代理会把 TLS 流量交给备用线路按 SNI 转发，并与直连并发竞速。线路是第三方服务器，能看到目标域名与连接元数据；不想经第三方时选「关闭」。非 TLS 流量不会走备用线路。线路表见下方。</p>
+        <div class="field"><label>选用方式</label>
+          <select id="rl-mode" onchange="onRelayMode()">
+            <option value="auto">自动（按 Worker 所在机房选最近的地区，再补 HK、US）</option>
+            <option value="custom">自定义顺序（只用我列出的线路标签）</option>
+            <option value="off">关闭（只直连 / 出站代理）</option>
+          </select>
+        </div>
+        <div class="field" id="rl-custom-box" style="margin-bottom:0">
+          <label>线路标签（按优先顺序，逗号分隔，最多 8 个；auto = 按机房自动选最近地区；第一条取 2 个 IP，其余各取 1 个，最多用 3 条）</label>
+          <input type="text" id="rl-custom" placeholder="auto,HK,US" autocomplete="off">
+          <div class="hint" id="rl-tags"></div>
         </div>
       </div>
       <div class="card">
-        <h3><span class="tick"></span>内置地区反代</h3>
-        <p class="hint" style="margin-top:0">直连不通（例如目标站同在 Cloudflare 上）时，代理会把 TLS 流量交给地区反代按 SNI 转发，并与直连并发竞速。反代是第三方服务器，能看到目标域名与连接元数据；不想经第三方时选「关闭」，或改用自己的反代。非 TLS 流量不会走地区反代。</p>
-        <div class="field"><label>地区反代模式</label>
-          <select id="rl-mode" onchange="onRelayMode()">
-            <option value="builtin">内置（proxyip.*.cmliussss.net，按 Worker 机房自动选地区）</option>
-            <option value="custom">仅使用我的反代列表</option>
-            <option value="off">关闭（只直连 / 出站代理）</option>
-          </select>
-          <div class="hint src" data-src="alt.mode"></div>
-        </div>
-        <div id="rl-builtin-box">
-          <div class="inrow">
-            <div class="field" style="flex:1;margin-bottom:0"><label>首选地区（取 2 个 IP）</label><select id="rl-region"></select><div class="hint src" data-src="alt.region"></div></div>
-            <div class="field" style="flex:1;margin-bottom:0"><label>次选地区（取 1 个 IP）</label><select id="rl-region2"></select><div class="hint src" data-src="alt.region2"></div></div>
-          </div>
-          <div class="hint">首选留空 = 按 Worker 所在机房自动选择；次选留空 = 默认的另一地区（首选为 HK 时用 US，否则用 HK），选「不使用」则只用首选地区。</div>
-        </div>
-        <div class="field" id="rl-custom-box" style="margin-bottom:0">
-          <label>自定义反代列表（每行一个 host 或 host:port，最多 3 个，IPv6 需加方括号）</label>
-          <textarea id="rl-custom" rows="3" placeholder="proxyip.example.com&#10;203.0.113.10:443" autocomplete="off"></textarea>
-          <div class="hint src" data-src="alt.custom"></div>
-          <div class="hint">域名按 TXT / A 记录解析（与「反代 / 落地 IP」相同，缓存 5 分钟）；多个条目并发竞速。「反代 / 落地 IP」仍然优先于这里。</div>
+        <h3><span class="tick"></span>备用线路表（所有代理共用）</h3>
+        <p class="hint" style="margin-top:0">每行「标签 域名[:端口] [txt]」，# 开头是注释。标签 <code>auto</code> 保留给自动选择；<code>HK / US / SG / JP / KR / DE / SE / NL / FI / GB</code> 是自动选择会用到的地区标签。末尾写 <code>txt</code> = 解析时先查该域名的 TXT 记录（TXT 里放 IP 列表时用），默认只查 A 记录。保存后会立即下发给所有代理。</p>
+        <div class="field" style="margin-bottom:0"><textarea id="rt-text" rows="18" spellcheck="false" autocomplete="off" style="font-family:ui-monospace,Consolas,monospace;font-size:12.5px"></textarea></div>
+        <div class="inrow" style="margin-top:12px">
+          <button class="btn primary" id="rt-save" onclick="saveAltRoutes()">保存并下发给全部代理</button>
+          <button class="btn" onclick="defaultAltRoutes()">载入默认表</button>
         </div>
       </div>
     </section>
@@ -3158,7 +3352,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
         <p class="hint" style="margin-top:0;margin-bottom:12px">订阅里的节点指向哪里：可以添加多个代理，订阅会<b>合并所有启用的代理</b>（每个代理各出一套节点，多个时节点名带「·代理名」后缀，总数仍受 500 的上限，平均分给各代理）。点列表里的代理进行编辑。每个代理填写代理脚本（Hopline-proxy.js）所在的域名、它的环境变量 PATH（节点路径）和 NODE_KEY（密钥）。面板用密钥签名后通过 HTTPS 联系代理：<b>UUID 由面板生成并下发给代理</b>（存在代理的 NODE_KV 里），不需要手工填写。密钥只写入、不回显；留空保持不变。</p>
         <div class="note-box" id="px-conn" style="margin:0 0 12px">读取中…</div>
         <div id="px-list"></div>
-        <div class="inrow" style="margin:0 0 14px"><button class="btn sm" onclick="newProxyEntry()">＋ 添加代理</button></div>
+        <div class="inrow" style="margin:0 0 14px"><button class="btn sm" onclick="newProxyEntry()">＋ 添加代理</button><button class="btn sm" onclick="syncAllProxies()">同步全部代理</button></div>
         <div class="field"><label>名称（可选）</label><input type="text" id="a-pname" placeholder="代理 1" autocomplete="off"></div>
         <div class="field"><label>代理域名（节点 SNI / Host，如 node.example.com；须是代理 Worker 的自定义域名）</label><input type="text" id="a-host" placeholder="node.example.com" autocomplete="off"></div>
         <div class="field"><label>节点路径（须与代理脚本的环境变量 PATH 相同）</label><input type="text" id="a-nodepath" placeholder="mynode" autocomplete="off"></div>
@@ -3452,7 +3646,6 @@ function loadAll(){
   }).catch(function(){});
   checkProxy();
   loadProxySettings();
-  loadProxyEntry();
   api('config').then(function(r){
     if (r && r.ok){
       CFG = r.data;
@@ -3479,12 +3672,10 @@ function setConn(ok){
   $('connText').textContent = ok ? '运行中' : '无法连接';
 }
 
-var PROXY_FIELDS = { 'edgeIP': 's-proxyIP', 'hopAddr': 's-outbound', 'hopMode': 's-outmode', 'alt.mode': 'rl-mode', 'alt.region': 'rl-region', 'alt.region2': 'rl-region2', 'alt.custom': 'rl-custom' };
-var PROXY_ENV_NAMES = { 'edgeIP': 'EDGEIP', 'hopAddr': 'HOP_ADDR', 'hopMode': 'HOP_MODE', 'alt.mode': 'ALT_MODE', 'alt.region': 'ALT_REGION', 'alt.region2': 'ALT_REGION2', 'alt.custom': 'ALT_CUSTOM' };
-var RELAY_ZH = { HK: '香港', US: '美国', SG: '新加坡', JP: '日本', KR: '韩国', DE: '德国', SE: '瑞典', NL: '荷兰', FI: '芬兰', GB: '英国' };
+var PROXY_FIELDS = { 'edgeIP': 's-proxyIP', 'hop': 's-outbound', 'hopMode': 's-outmode', 'altMode': 'rl-mode', 'altCustom': 'rl-custom' };
+var PROXY_DEFAULTS = { edgeIP: '', hop: '', hopMode: '', altMode: 'auto', altCustom: '' };
 var PXSEL = '';   
-function pxq(){ return PXSEL ? '?id=' + encodeURIComponent(PXSEL) : ''; }
-function onProxyWhich(){ PXSEL = $('px-which').value; loadProxySettings(); }
+function onProxyWhich(){ PXSEL = $('px-which').value; renderProxySettings(); }
 function proxyNote(text, kind){
   var n = $('px-note');
   n.textContent = text;
@@ -3497,12 +3688,13 @@ function setProxyFormEnabled(on){
 }
 function clearProxyErrors(){
   Object.keys(PROXY_FIELDS).forEach(function(k){ clearFieldError($(PROXY_FIELDS[k])); });
+  clearFieldError($('rt-text'));
 }
 function showProxyErrors(errors){
   clearProxyErrors();
   var unplaced = [], first = null;
   (errors || []).forEach(function(e){
-    var el = PROXY_FIELDS[e.field] ? $(PROXY_FIELDS[e.field]) : null;
+    var el = PROXY_FIELDS[e.field] ? $(PROXY_FIELDS[e.field]) : (e.field === 'text' ? $('rt-text') : null);
     if (!el){ unplaced.push(e.msg); return; }
     el.classList.add('invalid');
     if (el._errTip) el._errTip.textContent += '；' + e.msg;
@@ -3513,30 +3705,34 @@ function showProxyErrors(errors){
   return unplaced;
 }
 function onRelayMode(){
-  var m = $('rl-mode').value;
-  $('rl-builtin-box').style.display = (m === 'builtin') ? '' : 'none';
-  $('rl-custom-box').style.display = (m === 'custom') ? '' : 'none';
+  $('rl-custom-box').style.display = ($('rl-mode').value === 'custom') ? '' : 'none';
 }
-function fillProxy(d){
+var ALT_TAGS = [], ALT_DEFAULT_TEXT = '';
+function pxCurrent(){
+  var cur = null;
+  PXLIST.forEach(function(p){ if (p.id === PXSEL) cur = p; });
+  return cur;
+}
 
+function renderProxySettings(){
+  var p = pxCurrent();
   clearProxyErrors();
-  [['rl-region', 'alt.region', '自动（按 Worker 机房）'], ['rl-region2', 'alt.region2', '自动（默认的另一地区）']].forEach(function(c){
-    var el = $(c[0]);
-    el.innerHTML = '';
-    var opts = c[1] === 'alt.region2' ? ['', 'none'].concat(d.regions || []) : [''].concat(d.regions || []);
-    opts.forEach(function(o){
-      var op = document.createElement('option');
-      op.value = o;
-      op.textContent = o === '' ? c[2] : (o === 'none' ? '不使用' : (RELAY_ZH[o] ? o + ' ' + RELAY_ZH[o] : o));
-      el.appendChild(op);
-    });
-  });
-  Object.keys(PROXY_FIELDS).forEach(function(k){ $(PROXY_FIELDS[k]).value = (d.settings && d.settings[k] != null) ? d.settings[k] : ''; });
-  document.querySelectorAll('[data-src]').forEach(function(h){
-    var k = h.getAttribute('data-src'), s = d.source && d.source[k];
-    h.textContent = s === 'kv' ? '当前值来自这里保存的设置（覆盖了环境变量）' : (s === 'env' ? '当前值来自代理的环境变量 ' + PROXY_ENV_NAMES[k] : '未设置，使用默认值');
-  });
+  if (!p){
+    setProxyFormEnabled(false);
+    Object.keys(PROXY_FIELDS).forEach(function(k){ $(PROXY_FIELDS[k]).value = PROXY_DEFAULTS[k]; });
+    onRelayMode();
+    proxyNote('还没有代理：先到「面板设置 → 代理」添加一个。', 'err');
+    return;
+  }
+  setProxyFormEnabled(true);
+  Object.keys(PROXY_FIELDS).forEach(function(k){ $(PROXY_FIELDS[k]).value = p[k] != null ? p[k] : PROXY_DEFAULTS[k]; });
   onRelayMode();
+  updateProxyNote(p);
+  $('rl-tags').textContent = ALT_TAGS.length ? '线路表里现有的标签：' + ALT_TAGS.join('、') + '（表里没有的标签会被跳过）' : '线路表是空的：请先在下方填写备用线路表';
+}
+function updateProxyNote(p){
+  var st = PXSTAT[p.id];
+  proxyNote('正在修改「' + p.name + '」（' + p.host + '）的设置。' + (st ? (st.up ? (st.inSync ? '代理上的状态与面板一致。' : '代理上的状态与这里不一致：保存并下发，或到「面板设置 → 代理」点「连接并同步」。') : '当前连不上代理：' + (st.error || '') + '；仍可先保存，之后点「连接并同步」。') : ''), st && st.up && !st.inSync ? 'err' : '');
 }
 function collectProxy(){
   var out = {};
@@ -3546,32 +3742,33 @@ function collectProxy(){
 function loadProxySettings(){
   proxyNote('读取中…');
   setProxyFormEnabled(false);
-  return api('proxy-settings' + pxq()).then(function(r){
-    if (!r || !r.ok || !r.data){
-      proxyNote((r && r.msg) || '读取失败', 'err');
-      return;
+  api('alt-routes').then(function(r){
+    if (r && r.ok && r.data){
+      ALT_DEFAULT_TEXT = r.data.defaultText || '';
+      ALT_TAGS = r.data.tags || [];
+      $('rt-text').value = r.data.text;
+      $('rt-save').disabled = false;
+      if (r.data.error){ $('rt-save').disabled = true; toast('备用线路表读取失败（KV 暂时无法读取），暂时不能保存', 'err'); }
     }
-    fillProxy(r.data);
-    if (!r.data.storage){
-      proxyNote('代理没有绑定 KV（变量名 NODE_KV）：无法保存 UUID 与这些设置，代理也无法对外提供服务。给代理 Worker 绑定一个单独的 KV 命名空间后点「面板设置 → 代理 → 连接并同步」。', 'err');
-      setProxyFormEnabled(false);
-      return;
-    }
-    proxyNote(r.data.error === 'unavailable' ? '代理的 KV 暂时无法读取：下面显示的可能不是最新的设置，保存会被拒绝，稍后重新读取。' : (r.data.error === 'corrupt' ? '代理 KV 里保存的设置已损坏，已忽略；保存一次即可修复。' : '已连接代理，可以在线修改。'), r.data.error ? 'err' : '');
-    setProxyFormEnabled(r.data.error !== 'unavailable');
-  }).catch(function(){ proxyNote('无法连接服务器', 'err'); });
+  }).catch(function(){}).then(function(){ return loadProxyEntry(undefined, true); });
+}
+function proxySaveDone(r, okMsg){
+  var d = r.data || {};
+  var t = (d.sync ? pxSyncText(d.sync) : '') || okMsg;
+  var bad = d.sync && !d.sync.ok;
+  toast(bad ? t : okMsg + (d.sync ? '：' + t : ''), bad ? 'err' : 'ok');
+  loadProxyEntry(d.proxy ? d.proxy.id : undefined, true).then(pxRefreshAll);
 }
 function saveProxySettings(){
+  var p = pxCurrent();
+  if (!p) return;
   var btn = $('px-save');
   btn.disabled = true;
-  api('proxy-settings' + pxq(), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(collectProxy()) })
+  clearProxyErrors();
+  api('proxies/' + p.id, { method: 'POST', headers: JSON_H, body: JSON.stringify(collectProxy()) })
     .then(function(r){
-      if (r && r.ok && r.data){
-        fillProxy(r.data);
-        toast('已保存到代理：约 1 分钟内生效', 'ok');
-        proxyNote('已保存：' + new Date().toLocaleTimeString() + '，代理约 1 分钟内生效。');
-        checkProxy();
-      } else {
+      if (r && r.ok && r.data) proxySaveDone(r, '已保存');
+      else {
         var unplaced = showProxyErrors(r && r.errors);
         toast((unplaced.length ? unplaced.join('；') : (r && r.msg)) || '保存失败', 'err');
       }
@@ -3580,21 +3777,50 @@ function saveProxySettings(){
     .then(function(){ btn.disabled = false; });
 }
 function resetProxySettings(){
-  if (!confirm('确定恢复？将清除这里保存的全部覆盖项，代理回到环境变量 + 默认值。')) return;
-  api('proxy-reset' + pxq(), { method: 'POST' }).then(function(r){
-    if (r && r.ok && r.data){ fillProxy(r.data); toast('已恢复为环境变量设置：代理约 1 分钟内生效', 'ok'); checkProxy(); }
+  var p = pxCurrent();
+  if (!p || !confirm('确定恢复默认？落地 IP、出站代理清空，出站方式与备用线路回到默认（自动选择）。')) return;
+  api('proxies/' + p.id, { method: 'POST', headers: JSON_H, body: JSON.stringify(PROXY_DEFAULTS) }).then(function(r){
+    if (r && r.ok && r.data) proxySaveDone(r, '已恢复默认');
     else toast((r && r.msg) || '恢复失败', 'err');
   }).catch(function(){ toast('恢复失败：无法连接服务器', 'err'); });
 }
+function defaultAltRoutes(){
+  if (ALT_DEFAULT_TEXT) $('rt-text').value = ALT_DEFAULT_TEXT;
+}
+function saveAltRoutes(){
+  var btn = $('rt-save');
+  btn.disabled = true;
+  clearFieldError($('rt-text'));
+  api('alt-routes', { method: 'POST', headers: JSON_H, body: JSON.stringify({ text: $('rt-text').value }) }).then(function(r){
+    if (!(r && r.ok)){
+      var unplaced = showProxyErrors(r && r.errors);
+      toast((unplaced.length ? unplaced.join('；') : (r && r.msg)) || '保存失败', 'err');
+      return;
+    }
+    ALT_TAGS = (r.data && r.data.tags) || [];
+    return syncAllProxies('线路表已保存');
+  }).catch(function(){ toast('保存失败：无法连接服务器', 'err'); }).then(function(){ btn.disabled = false; });
+}
+
+function syncAllProxies(prefix){
+  return api('proxy-sync-all', { method: 'POST' }).then(function(r){
+    if (!(r && r.ok && r.data)){ toast((r && r.msg) || '同步失败', 'err'); return; }
+    var res = r.data.results || [], bad = res.filter(function(x){ return !x.ok; });
+    if (!res.length) toast((prefix ? prefix + '，' : '') + '没有代理可同步', '');
+    else if (!bad.length) toast((prefix ? prefix + '，' : '') + '已同步 ' + res.length + ' 个代理', 'ok');
+    else toast((prefix ? prefix + '，' : '') + bad.map(function(x){ return x.name + '：' + (x.error || '失败'); }).join('；'), 'err');
+    loadProxyEntry(undefined, true).then(pxRefreshAll);
+  }).catch(function(){ toast('同步失败：无法连接服务器', 'err'); });
+}
 
 
-function proxySummary(s){
-  s = s || {};
+function proxySummary(p){
   var a = [];
-  a.push('出站代理：' + (s.hopAddr || '无'));
-  if (s.hopMode) a.push('出站方式：' + s.hopMode);
-  a.push('反代 / 落地 IP：' + (s.edgeIP ? '已设置' : '无'));
-  a.push('地区反代：' + (s.altMode || 'builtin') + (s.altMode === 'custom' ? '（' + (s.altCustom || 0) + ' 个）' : ''));
+  var m = p && p.hop ? p.hop.match(/^([A-Za-z0-9]+):\/\//) : null;
+  a.push('出站代理：' + (p && p.hop ? (m ? m[1].toLowerCase() : 'socks5') : '无'));
+  if (p && p.hopMode) a.push('出站方式：' + p.hopMode);
+  a.push('落地 IP：' + (p && p.edgeIP ? '已设置' : '无'));
+  a.push('备用线路：' + (p && p.altMode === 'off' ? '关闭' : (p && p.altMode === 'custom' ? '自定义' : '自动')));
   return a.join(' · ');
 }
 var PXSTAT = {};   
@@ -3603,7 +3829,7 @@ function pxStatusInfo(d){
   if (!d.up) return { text: '无法连接：' + (d.error || ''), ok: false };
   var tags = [];
   if (!d.provisioned) tags.push('尚未下发 UUID');
-  else if (!d.uuidMatch) tags.push('UUID 与面板不一致');
+  else if (!d.inSync) tags.push('与面板的设置不一致，点「连接并同步」');
   if (!d.enabled) tags.push('代理已停用');
   if (!d.storage) tags.push('代理未绑定 NODE_KV');
   if (!d.ok) tags.push('配置有问题：' + (d.problems || []).join(' '));
@@ -3618,6 +3844,8 @@ function checkProxy(){
     PXSTAT = {};
     list.forEach(function(d){ PXSTAT[d.id] = d; });
     pxApplyStatus();
+    var cur = pxCurrent();
+    if (cur) updateProxyNote(cur);
     if (!list.length){
       v.textContent = '未添加';
       h.textContent = '到「面板设置 → 代理」添加代理（域名、节点路径、密钥），面板会自动生成 UUID 并下发';
@@ -3630,7 +3858,9 @@ function checkProxy(){
       var line = document.createElement('div');
       line.className = 'hint';
       line.style.margin = '6px 0 0';
-      line.textContent = d.name + (d.enabledHere ? '' : '（面板已停用）') + '：' + info.text + (d.up && d.ok ? ' · ' + proxySummary(d.settings) : '');
+      var rec = null;
+      PXLIST.forEach(function(p){ if (p.id === d.id) rec = p; });
+      line.textContent = d.name + (d.enabledHere ? '' : '（面板已停用）') + '：' + info.text + (d.up && d.ok && rec ? ' · ' + proxySummary(rec) : '');
       l.appendChild(line);
     });
     v.textContent = list.length === 1 ? (good ? '在线' : '有问题') : (good + ' / ' + list.length + ' 正常');
@@ -3985,7 +4215,6 @@ function pxRefreshAll(){
   
   api('config').then(function(r){ if (r && r.ok && r.data){ if (CFG) CFG.endpointMissing = r.data.endpointMissing; renderEndpoint(); } }).catch(function(){});
   checkProxy();
-  loadProxySettings();
 }
 function pxSyncText(sync){
   if (!sync) return '';
@@ -4009,6 +4238,7 @@ function loadProxyEntry(selectId, keepNote){
     if (!PXLIST.some(function(p){ return p.id === PXSEL; })) PXSEL = PXLIST.length ? PXLIST[0].id : '';
     sel.value = PXSEL;
     $('px-whichbox').style.display = PXLIST.length > 1 ? '' : 'none';
+    renderProxySettings();
     if (keepNote) return;
     if (r.data.error){ pxConn('代理列表读取失败（' + r.data.error + '）：为避免覆盖已有数据，暂时不能保存。', 'err'); return; }
     pxConn(PXLIST.length ? '已添加 ' + PXLIST.length + ' 个代理，订阅会合并其中启用的。点列表里的代理编辑，或「添加代理」。' : '还没有代理：填写下面的域名、节点路径和密钥，点「保存并连接」。');
@@ -4765,7 +4995,7 @@ async function handleRequest(request, env, state) {
     }
 
     // 代理管理（增删改 / 同步 / 启停 / 状态 / 在线设置）：面板通过签名的 HTTPS 请求调用代理的控制接口，见 proxies-api.js
-    if (apiName === 'proxies' || apiName === 'proxy-status' || apiName === 'proxy-settings' || apiName === 'proxy-reset') return handleProxiesApi(apiName, request, env, cfg, segs, url);
+    if (apiName === 'proxies' || apiName === 'proxy-status' || apiName === 'proxy-sync-all' || apiName === 'alt-routes') return handleProxiesApi(apiName, request, env, cfg, segs, url);
 
     if (apiName === 'logout') {
       if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);

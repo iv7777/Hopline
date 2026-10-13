@@ -1,4 +1,4 @@
-/*!Hopline-proxy v3.1.0*/
+/*!Hopline-proxy v3.2.0*/
 // ============================================================================
 //  Hopline 代理 —— 只做一件事：在节点路径上接收 VLESS（WebSocket / XHTTP）并转发
 //  ----------------------------------------------------------------------------
@@ -10,70 +10,19 @@
 //  绑定：
 //    NODE_KV    【面板配置必需】代理自己的 KV 命名空间（单独建一个，只有代理绑定）：保存 UUID、启用开关与运行设置
 //  面板还没下发 UUID 或代理被停用时，节点路径与其它任何路径一样只返回伪装页。
-//  运行设置也可以用环境变量给出默认值（面板里保存的设置优先）：
-//    EDGEIP / HOP_ADDR / HOP_MODE / ALT_MODE / ALT_REGION / ALT_REGION2 / ALT_CUSTOM（含义见 proxy-config.js）
+//  落地 / 出站 / 备用线路等设置同样由面板整份下发（控制接口 setState），代理没有这些环境变量。
 //  VLESS 的 WebSocket 与 XHTTP 两种传输始终同时启用。
 //  控制接口是签名的 HTTPS 请求（POST /<PATH>/<由密钥派生的标记>），面板与代理可以在不同账号里；见 proxy-control.js。
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
 
 // 代理脚本（Hopline-proxy.js）的版本号：只通过服务绑定的 status() 报告（不会出现在任何公开响应里）。与面板脚本各自编号、各自升版本
-const VERSION = '3.1.0';
+const VERSION = '3.2.0';
 // ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
 const TE = new TextEncoder();
 
-// MD5（纯 JS 实现，RFC 1321；WebCrypto 不支持 MD5）
-const MD5_S = [
-  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-  5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-  4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-  6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
-];
-const MD5_K = [
-  0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-  0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-  0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-  0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-  0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-  0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-  0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-  0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
-];
-function rotl32(x, c) { return ((x << c) | (x >>> (32 - c))) >>> 0; }
-// 输入字节数组，返回 16 字节摘要（Shadowsocks 的 EVP_BytesToKey 需要对字节拼接后再哈希）
-function md5Bytes(bytes) {
-  const bitLen = bytes.length * 8;
-  const paddedLen = (((bytes.length + 8) >> 6) + 1) << 6;
-  const data = new Uint8Array(paddedLen);
-  data.set(bytes);
-  data[bytes.length] = 0x80;
-  const dv = new DataView(data.buffer);
-  dv.setUint32(paddedLen - 8, bitLen >>> 0, true);
-  dv.setUint32(paddedLen - 4, Math.floor(bitLen / 0x100000000), true);
-  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
-  for (let i = 0; i < paddedLen; i += 64) {
-    const M = new Uint32Array(16);
-    for (let j = 0; j < 16; j++) M[j] = dv.getUint32(i + j * 4, true);
-    let a = a0, b = b0, c = c0, d = d0;
-    for (let j = 0; j < 64; j++) {
-      let f, g;
-      if (j < 16) { f = (b & c) | (~b & d); g = j; }
-      else if (j < 32) { f = (d & b) | (~d & c); g = (5 * j + 1) % 16; }
-      else if (j < 48) { f = b ^ c ^ d; g = (3 * j + 5) % 16; }
-      else { f = c ^ (b | ~d); g = (7 * j) % 16; }
-      const sum = (a + f + MD5_K[j] + M[g]) >>> 0;
-      const nb = (b + rotl32(sum, MD5_S[j])) >>> 0;
-      a = d; d = c; c = b; b = nb;
-    }
-    a0 = (a0 + a) >>> 0; b0 = (b0 + b) >>> 0; c0 = (c0 + c) >>> 0; d0 = (d0 + d) >>> 0;
-  }
-  const out = new Uint8Array(16);
-  const ov = new DataView(out.buffer);
-  [a0, b0, c0, d0].forEach((v, i) => ov.setUint32(i * 4, v, true));
-  return out;
-}
 function isUUID(str) {
   return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(str || '');
 }
@@ -154,9 +103,9 @@ function timingSafeEqual(a, b) {
 }
 // 控制请求的路径标记：由密钥派生，不知道密钥就找不到控制入口
 async function routeTag(keyStr) { return (await hmacB64u(keyStr, 'route')).slice(0, 16); }
-// UUID 的短标记（SHA-256 前 8 位十六进制）：面板据此判断代理上的 UUID 是否与自己保存的一致，而不必回传 UUID 本身
-async function uuidTag(uuid) {
-  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', TE.encode(String(uuid).toLowerCase())));
+// 短哈希（SHA-256 前 4 字节的十六进制）：面板据此判断代理上保存的状态是否与自己下发的一致，而不必回传内容本身
+async function shortHash(text) {
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', TE.encode(String(text))));
   return Array.from(d.subarray(0, 4)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 // ---------------------------------------------------------------------------
@@ -415,7 +364,7 @@ function dohFirst(endpoints, buildUrl, validate, opts) {
   });
 }
 // ---------------------------------------------------------------------------
-// 出站连接：直连 / SOCKS5 / HTTP CONNECT / 反代 IP 中继
+// 出站连接：直连 / SOCKS5 / HTTP CONNECT
 // ---------------------------------------------------------------------------
 // 通用超时助手：promise 超时即 reject（出站层兜底，避免目标 SYN 被静默丢弃时永久阻塞）
 function withTimeout(promise, ms, msg) {
@@ -523,299 +472,7 @@ async function connectViaHtHop(hop, target) {
   return socket;
 }
 
-// ---------------------------------------------------------------------------
-// Shadowsocks AEAD 出站代理客户端（ss://）：aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305
-// 协议：客户端发随机 salt + AEAD 流（数据流以目标地址头 ATYP+地址+端口 开头）；
-//       服务端回随机 salt + 同构 AEAD 流。密钥派生：masterKey=EVP_BytesToKey(MD5, password)，
-//       sessionKey=HKDF-SHA1(masterKey, salt, "ss-subkey")，每 chunk 两个 AEAD 块
-//       （2B 大端长度 + 负载），nonce 为 12B 小端计数器逐块 +1；单块明文 ≤ 0x3FFF；salt 长度 = 密钥长度。
-// ---------------------------------------------------------------------------
-function aeadAlgo(method) {
-  const m = String(method || '').toLowerCase().replace(/_/g, '-');
-  if (m === 'aes-128-gcm' || m === 'aes-128gcm') return { name: 'AES-GCM', keyLen: 16 };
-  if (m === 'aes-256-gcm' || m === 'aes-256gcm') return { name: 'AES-GCM', keyLen: 32 };
-  if (m === 'chacha20-ietf-poly1305' || m === 'chacha20-poly1305' || m === 'chacha20poly1305') return { name: 'CHACHA20-POLY1305', keyLen: 32 };
-  return null;
-}
-// ---------- SS 加密原语（纯 JS，兼容 CF Workers / Node / 浏览器） ----------
-// CF Workers 的 crypto.subtle 官方支持矩阵不含 CHACHA20-POLY1305（SS 最常用的 chacha20-ietf-poly1305
-// 用 WebCrypto 会抛 NotSupportedError → 出站全超时），故 chacha20-poly1305（RFC 8439）与
-// HKDF-SHA1 用纯 JS 实现，不依赖 WebCrypto；AES-GCM 保留 WebCrypto（CF 明确支持、性能好）。
-// （rotl32 复用 utils.js 中 MD5 实现的同名函数）
-
-// SHA-1（FIPS 180-4）
-function sha1Bytes(data) {
-  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-  const ml = bytes.length, lenBits = ml * 8;
-  const padded = new Uint8Array((((ml + 8) >> 6) + 1) << 6);
-  padded.set(bytes);
-  padded[ml] = 0x80;
-  const dv = new DataView(padded.buffer);
-  dv.setUint32(padded.length - 8, Math.floor(lenBits / 0x100000000), false);
-  dv.setUint32(padded.length - 4, lenBits >>> 0, false);
-  let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
-  const w = new Uint32Array(80);
-  for (let off = 0; off < padded.length; off += 64) {
-    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4, false);
-    for (let i = 16; i < 80; i++) w[i] = rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-    let a = h0, b = h1, c = h2, d = h3, e = h4;
-    for (let i = 0; i < 80; i++) {
-      let f, k;
-      if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }
-      else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
-      else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
-      else { f = b ^ c ^ d; k = 0xca62c1d6; }
-      const tmp = (rotl32(a, 5) + f + e + k + w[i]) >>> 0;
-      e = d; d = c; c = rotl32(b, 30); b = a; a = tmp;
-    }
-    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
-  }
-  const out = new Uint8Array(20), ov = new DataView(out.buffer);
-  ov.setUint32(0, h0, false); ov.setUint32(4, h1, false); ov.setUint32(8, h2, false);
-  ov.setUint32(12, h3, false); ov.setUint32(16, h4, false);
-  return out;
-}
-// HMAC-SHA1（RFC 2104）
-function hmacSha1(key, data) {
-  const block = 64;
-  let k = key;
-  if (k.length > block) k = sha1Bytes(k);
-  const ipad = new Uint8Array(block), opad = new Uint8Array(block);
-  for (let i = 0; i < block; i++) { ipad[i] = (i < k.length ? k[i] : 0) ^ 0x36; opad[i] = (i < k.length ? k[i] : 0) ^ 0x5c; }
-  return sha1Bytes(concatBytes(opad, sha1Bytes(concatBytes(ipad, data))));
-}
-// HKDF-SHA1（RFC 5869，info="ss-subkey"）：SS AEAD 会话密钥派生
-function hkdfSha1(ikm, salt, keyLen) {
-  const prk = hmacSha1(salt && salt.length ? salt : new Uint8Array(20), ikm);
-  let t = new Uint8Array(0), okm = new Uint8Array(0);
-  for (let i = 1; okm.length < keyLen; i++) {
-    const ti = new Uint8Array([i]);
-    t = hmacSha1(prk, concatBytes(concatBytes(t, TE.encode('ss-subkey')), ti));
-    okm = concatBytes(okm, t);
-  }
-  return okm.slice(0, keyLen);
-}
-
-// ---------- ChaCha20-Poly1305 AEAD（RFC 8439，纯 JS） ----------
-function chacha20Block(key32, counter, nonce12) {
-  const st = new Uint32Array(16);
-  st[0] = 0x61707865; st[1] = 0x3320646e; st[2] = 0x79622d32; st[3] = 0x6b206574;
-  const dv = new DataView(key32.buffer, key32.byteOffset, 32);
-  for (let i = 0; i < 8; i++) st[4 + i] = dv.getUint32(i * 4, true);
-  st[12] = counter >>> 0;
-  const nv = new DataView(nonce12.buffer, nonce12.byteOffset, 12);
-  st[13] = nv.getUint32(0, true); st[14] = nv.getUint32(4, true); st[15] = nv.getUint32(8, true);
-  const w = st.slice();
-  const qr = (a, b, c, d) => {
-    w[a] = (w[a] + w[b]) >>> 0; w[d] = rotl32(w[d] ^ w[a], 16);
-    w[c] = (w[c] + w[d]) >>> 0; w[b] = rotl32(w[b] ^ w[c], 12);
-    w[a] = (w[a] + w[b]) >>> 0; w[d] = rotl32(w[d] ^ w[a], 8);
-    w[c] = (w[c] + w[d]) >>> 0; w[b] = rotl32(w[b] ^ w[c], 7);
-  };
-  for (let i = 0; i < 10; i++) {
-    qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15);
-    qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14);
-  }
-  const out = new Uint8Array(64), odv = new DataView(out.buffer);
-  for (let i = 0; i < 16; i++) { w[i] = (w[i] + st[i]) >>> 0; odv.setUint32(i * 4, w[i], true); }
-  return out;
-}
-function chacha20Xor(key32, nonce12, counterStart, data) {
-  const out = data.slice();
-  const blocks = Math.ceil(data.length / 64);
-  for (let b = 0; b < blocks; b++) {
-    const ks = chacha20Block(key32, counterStart + b, nonce12);
-    const off = b * 64, n = Math.min(64, out.length - off);
-    for (let i = 0; i < n; i++) out[off + i] ^= ks[i];
-  }
-  return out;
-}
-// Poly1305（RFC 8439 §2.5，BigInt 实现，简洁可靠）
-function poly1305(key32, msg) {
-  let r = 0n, p = 0n;
-  // RFC 8439 §2.5：r = le_bytes_to_num(key[0..16))，s = le_bytes_to_num(key[16..32))（小端）
-  for (let i = 0; i < 16; i++) { r |= BigInt(key32[i]) << BigInt(8 * i); p |= BigInt(key32[16 + i]) << BigInt(8 * i); }
-  r &= 0x0ffffffc0ffffffc0ffffffc0fffffffn;
-  let h = 0n;
-  const MOD = (1n << 130n) - 5n;
-  // RFC 8439 §2.5.1：每块 n_i = 块内容 || 0x01（小端）。完整 16B 块 → 内容 + 2^128；
-  // 不足 16B 的最后一块不补齐 → 内容 + 2^(8*实际字节数)。
-  for (let i = 0; i < msg.length; i += 16) {
-    const n = Math.min(16, msg.length - i);
-    let c = 1n;
-    for (let j = n - 1; j >= 0; j--) c = (c << 8n) | BigInt(msg[i + j]);
-    h = ((h + c) * r) % MOD;
-  }
-  h = (h + p) & ((1n << 128n) - 1n);
-  const tag = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) tag[i] = Number((h >> BigInt(8 * i)) & 0xffn);
-  return tag;
-}
-// AEAD_CHACHA20_POLY1305（RFC 8439 §2.8）；输出 = 密文 || 16B tag
-function chacha20Poly1305Seal(key32, nonce12, plaintext, aad) {
-  const aadB = aad || new Uint8Array(0);
-  const polyKey = chacha20Xor(key32, nonce12, 0, new Uint8Array(32));
-  const ct = chacha20Xor(key32, nonce12, 1, plaintext);
-  const pad16 = (len) => new Uint8Array((16 - (len % 16)) % 16);
-  const le64 = (n) => {
-    const b = new Uint8Array(8), dv = new DataView(b.buffer);
-    dv.setUint32(0, n >>> 0, true); dv.setUint32(4, Math.floor(n / 0x100000000), true);
-    return b;
-  };
-  const macData = concatBytes(aadB, concatBytes(pad16(aadB.length), concatBytes(ct,
-    concatBytes(pad16(ct.length), concatBytes(le64(aadB.length), le64(ct.length))))));
-  const tag = poly1305(polyKey, macData);
-  return concatBytes(ct, tag);
-}
-function chacha20Poly1305Open(key32, nonce12, data, aad) {
-  if (data.length < 16) throw new Error('AEAD 数据过短');
-  const ct = data.subarray(0, data.length - 16);
-  const got = data.subarray(data.length - 16);
-  const aadB = aad || new Uint8Array(0);
-  const polyKey = chacha20Xor(key32, nonce12, 0, new Uint8Array(32));
-  const pad16 = (len) => new Uint8Array((16 - (len % 16)) % 16);
-  const le64 = (n) => {
-    const b = new Uint8Array(8), dv = new DataView(b.buffer);
-    dv.setUint32(0, n >>> 0, true); dv.setUint32(4, Math.floor(n / 0x100000000), true);
-    return b;
-  };
-  const macData = concatBytes(aadB, concatBytes(pad16(aadB.length), concatBytes(ct,
-    concatBytes(pad16(ct.length), concatBytes(le64(aadB.length), le64(ct.length))))));
-  const expect = poly1305(polyKey, macData);
-  let diff = 0;
-  for (let i = 0; i < 16; i++) diff |= expect[i] ^ got[i];
-  if (diff !== 0) return null;
-  return chacha20Xor(key32, nonce12, 1, ct);
-}
-// 每个方向一个 AEAD 实例，nonce 是 12 字节小端计数器：每次 seal / open（即每个长度块、每个数据块各一次）后加 1。
-// （此前 nonce 从未真正递增，所有块都用同一个 nonce，既违反协议也无法与任何 SS 服务器互通）
-function aeadNonceCounter() {
-  const nonce = new Uint8Array(12);
-  return () => {
-    const cur = nonce.slice();
-    for (let i = 0; i < 12; i++) { nonce[i]++; if (nonce[i] !== 0) break; }
-    return cur;
-  };
-}
-async function newAead(algoName, keyBytes) {
-  const next = aeadNonceCounter();
-  if (algoName === 'CHACHA20-POLY1305') {
-    // 纯 JS：CF Workers 的 crypto.subtle 不支持该算法
-    return {
-      seal(data) { return chacha20Poly1305Seal(keyBytes, next(), data); },
-      open(data) {
-        const plain = chacha20Poly1305Open(keyBytes, next(), data);
-        if (!plain) throw new Error('AEAD 解密失败（密码/加密方式与服务器不匹配）');
-        return plain;
-      }
-    };
-  }
-  // AES-GCM：WebCrypto（CF 明确支持）
-  const ck = await crypto.subtle.importKey('raw', keyBytes, { name: algoName }, false, ['encrypt', 'decrypt']);
-  return {
-    async seal(data) { return new Uint8Array(await crypto.subtle.encrypt({ name: algoName, iv: next() }, ck, data)); },
-    async open(data) {
-      try { return new Uint8Array(await crypto.subtle.decrypt({ name: algoName, iv: next() }, ck, data)); }
-      catch (e) { throw new Error('AEAD 解密失败（密码/加密方式与服务器不匹配）'); }
-    }
-  };
-}
-// 主密钥：传统 AEAD 方式用 OpenSSL EVP_BytesToKey(MD5, 无盐, 1 轮) 由密码派生，长度等于密钥长度
-// （此前误用 SHA-256(密码)，派生出的密钥与服务器不一致）
-function aeadMasterKey(password, keyLen) {
-  const pw = TE.encode(password);
-  let key = new Uint8Array(0), prev = new Uint8Array(0);
-  while (key.length < keyLen) {
-    prev = md5Bytes(concatBytes(prev, pw));
-    key = concatBytes(key, prev);
-  }
-  return key.slice(0, keyLen);
-}
-// 目标地址头：ATYP(1=IPv4 / 3=域名 / 4=IPv6) + 地址 + 端口(2 字节大端)，作为客户端数据流的开头
-function aeadTargetHeader(hostname, port) {
-  let head;
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname)) head = new Uint8Array([1, ...hostname.split('.').map(Number)]);
-  else if (hostname.indexOf(':') >= 0 && isValidIp(hostname)) head = new Uint8Array([4, ...ipv6ToBytes(hostname)]);
-  else {
-    const name = TE.encode(hostname);
-    if (name.length > 255) throw new Error('AEAD 目标域名过长');
-    head = new Uint8Array([3, name.length, ...name]);
-  }
-  return concatBytes(head, new Uint8Array([(port >> 8) & 255, port & 255]));
-}
-const AEAD_MAX_CHUNK = 0x3fff;   // AEAD 单块明文上限 16383 字节（长度字段高两位必须为 0）
-
-async function aeadSealChunk(aead, data) {
-  const len = new Uint8Array([(data.length >> 8) & 255, data.length & 255]);
-  return concatBytes(await aead.seal(len), await aead.seal(data));
-}
-
-
-// 通过 SS 出站代理建立到目标的加密隧道；返回兼容 socket 语义的包装（readable 已解密 / writable 自动加密）
-async function connectViaAead(hop, target) {
-  const algo = aeadAlgo(hop.method);
-  if (!algo) throw new Error('不支持的 AEAD 加密方式: ' + (hop.method || '（未指定）'));
-  if (!hop.password) throw new Error('AEAD 缺少密码');
-  const raw = await connectWithTimeout(hop.host, hop.port, 6000);
-  const rawWriter = raw.writable.getWriter();
-  const rawReader = raw.readable.getReader();
-  let pending = new Uint8Array(0);
-  const readN = async (n) => {
-    while (pending.length < n) {
-      const { done, value } = await rawReader.read();
-      if (done) throw new Error('AEAD 连接被关闭');
-      pending = concatBytes(pending, value);
-    }
-    const out = pending.slice(0, n);
-    pending = pending.subarray(n);
-    return out;
-  };
-  const masterKey = aeadMasterKey(hop.password, algo.keyLen);
-  // 客户端方向：随机 salt（长度 = 密钥长度：AES-128 为 16，AES-256 / ChaCha20 为 32）→ 会话子密钥；
-  // 数据流以目标地址头开始（首个数据块即携带目标地址），之后才是转发的数据
-  const clientSalt = crypto.getRandomValues(new Uint8Array(algo.keyLen));
-  const clientAead = await newAead(algo.name, hkdfSha1(masterKey, clientSalt, algo.keyLen));
-  await rawWriter.write(concatBytes(clientSalt, await aeadSealChunk(clientAead, aeadTargetHeader(target.hostname, target.port))));
-
-  // 读方向：先收服务端 salt → 派生服务端子密钥 → 逐块解密（长度块 2+16 字节，数据块 len+16 字节；空块跳过）
-  const readable = new ReadableStream({
-    async start(controller) {
-      try {
-        const serverSalt = await readN(algo.keyLen);
-        const serverAead = await newAead(algo.name, hkdfSha1(masterKey, serverSalt, algo.keyLen));
-        while (true) {
-          const lb = await serverAead.open(await readN(18));
-          const len = (lb[0] << 8) | lb[1];
-          if (len > AEAD_MAX_CHUNK) throw new Error('AEAD 分片长度非法 ' + len);
-          const pb = await serverAead.open(await readN(len + 16));
-          if (len > 0) controller.enqueue(pb);
-        }
-      } catch (e) {
-        try { controller.error(e); } catch (e2) { /* 忽略 */ }
-      }
-    }
-  });
-
-  // 写方向：明文按 ≤ 0x3FFF 分块加密写入底层
-  const writable = new WritableStream({
-    async write(chunk) {
-      const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-      for (let off = 0; off < data.length; off += AEAD_MAX_CHUNK) {
-        await rawWriter.write(await aeadSealChunk(clientAead, data.subarray(off, Math.min(data.length, off + AEAD_MAX_CHUNK))));
-      }
-    },
-    close() { try { rawWriter.close(); } catch (e) { /* 忽略 */ } },
-    abort() { try { rawWriter.abort(); } catch (e) { /* 忽略 */ } }
-  });
-
-  return {
-    readable,
-    writable,
-    close() { try { raw.close(); } catch (e) { /* 忽略 */ } }
-  };
-}
-
-
+// 读取 HTTP 响应头（到空行为止）
 async function readUntilHeaderEnd(reader) {
   let buf = new Uint8Array(0);
   while (buf.length < 65536) {
@@ -851,106 +508,17 @@ function b64FromBytes(bytes) {
   }
   return btoa(bin);
 }
-
-// 出站代理地址解析：socks5:// / http(s):// / ss:// 或 host:port，可带 user:pass@
-function parseHopAddress(addr) {
-  if (!addr) return null;
-  let type = 'socks5', rest = String(addr).trim();
-  const m = rest.match(/^(socks5|http|https|ss):\/\/(.+)$/i);
-  if (m) { type = m[1].toLowerCase(); rest = m[2]; }
-  if (type === 'ss') return parseAeadHop(rest);
-  let user = '', pass = '';
-  if (rest.includes('@')) {
-    // 以最后一个 @ 分隔凭据与主机：密码中未编码的 @ 不会把主机名截断
-    const at = rest.lastIndexOf('@');
-    const u = rest.slice(0, at), h = rest.slice(at + 1);
-    // 用户名/密码可能经 URL 编码（含 %40/@、%28/() 等特殊字符时），需解码后再用于认证，
-    // 否则 socks5 用户名密码 / HTTP Basic 认证会失败
-    const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
-    const idx = u.indexOf(':');
-    if (idx >= 0) { user = dec(u.slice(0, idx)); pass = dec(u.slice(idx + 1)); }
-    else user = dec(u);
-    rest = h;
-  }
-  const defaultPort = type === 'http' ? 80 : type === 'https' ? 443 : 1080;
-  const { host, port } = parseHostPort(rest, defaultPort);
-  return { type, host, port, user, pass };
-}
-
-// SS 出站解析：SIP002（ss://method:password@host:port#name 或 ss://BASE64(method:password)@host:port#name）
-// 及旧格式 ss://BASE64(method:password@host:port)（整段无 @）。密码支持 percent-encoding。
-function parseAeadHop(rest) {
-  let hostPort = rest, userinfo = '';
-  const hashIdx = rest.indexOf('#');
-  if (hashIdx >= 0) hostPort = rest.slice(0, hashIdx);
-  const atIdx = hostPort.lastIndexOf('@');
-  if (atIdx >= 0) { userinfo = hostPort.slice(0, atIdx); hostPort = hostPort.slice(atIdx + 1); }
-  else {
-    const dec = b64ToUtf8(hostPort);   // 旧格式：整段 BASE64(method:password@host:port)
-    if (dec && dec.includes('@')) {
-      const at2 = dec.lastIndexOf('@');
-      userinfo = dec.slice(0, at2); hostPort = dec.slice(at2 + 1);
-    }
-  }
-  let method = '', password = '';
-  if (userinfo) {
-    let ui = b64ToUtf8(userinfo) || userinfo;   // SIP002 userinfo 可为 BASE64(method:password) 或明文
-    try { ui = decodeURIComponent(ui); } catch (e) { /* 保持原样 */ }
-    const ci = ui.indexOf(':');
-    if (ci > 0) { method = ui.slice(0, ci); password = ui.slice(ci + 1); }
-    else method = ui;
-  }
-  const { host, port } = parseHostPort(hostPort, 8388);
-  return { type: 'ss', host, port, method, password };
-}
-function b64ToUtf8(s) {
-  try {
-    const bin = atob(String(s).replace(/-/g, '+').replace(/_/g, '/'));
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return new TextDecoder('utf-8').decode(bytes);
-  } catch (e) { return null; }
-}
 // ---------------------------------------------------------------------------
 // 出站兜底：直连与自定义反代均失败后使用，透明代理模式发送去掉 VLESS 头部的原始
 // TLS 数据，由对端按 SNI 路由到目标
 // ---------------------------------------------------------------------------
-// 内置地区备用线路域名池（社区提供，解析为非 Cloudflare IP；以 base64 保存）
-// 当前内容（改动下面的 base64 时可参照，键为地区标签，值为域名）：
-//   HK: proxyip.hk.cmliussss.net
-//   US: proxyip.us.cmliussss.net
-//   SG: proxyip.sg.cmliussss.net
-//   JP: proxyip.jp.cmliussss.net
-//   KR: proxyip.kr.cmliussss.net
-//   DE: proxyip.de.cmliussss.net
-//   SE: proxyip.se.cmliussss.net
-//   NL: proxyip.nl.cmliussss.net
-//   FI: proxyip.fi.cmliussss.net
-//   GB: proxyip.gb.cmliussss.net
-//   Oracle: proxyip.oracle.cmliussss.net
-//   DigitalOcean: proxyip.digitalocean.cmliussss.net
-//   Vultr: proxyip.vultr.cmliussss.net
-//   Multacom: proxyip.multacom.cmliussss.net
-const ALT_DOMAINS = JSON.parse(atob('eyJISyI6InByb3h5aXAuaGsuY21saXVzc3NzLm5ldCIsIlVTIjoicHJveHlpcC51cy5jbWxpdXNzc3MubmV0IiwiU0ciOiJwcm94eWlwLnNnLmNtbGl1c3Nzcy5uZXQiLCJKUCI6InByb3h5aXAuanAuY21saXVzc3NzLm5ldCIsIktSIjoicHJveHlpcC5rci5jbWxpdXNzc3MubmV0IiwiREUiOiJwcm94eWlwLmRlLmNtbGl1c3Nzcy5uZXQiLCJTRSI6InByb3h5aXAuc2UuY21saXVzc3NzLm5ldCIsIk5MIjoicHJveHlpcC5ubC5jbWxpdXNzc3MubmV0IiwiRkkiOiJwcm94eWlwLmZpLmNtbGl1c3Nzcy5uZXQiLCJHQiI6InByb3h5aXAuZ2IuY21saXVzc3NzLm5ldCIsIk9yYWNsZSI6InByb3h5aXAub3JhY2xlLmNtbGl1c3Nzcy5uZXQiLCJEaWdpdGFsT2NlYW4iOiJwcm94eWlwLmRpZ2l0YWxvY2Vhbi5jbWxpdXNzc3MubmV0IiwiVnVsdHIiOiJwcm94eWlwLnZ1bHRyLmNtbGl1c3Nzcy5uZXQiLCJNdWx0YWNvbSI6InByb3h5aXAubXVsdGFjb20uY21saXVzc3NzLm5ldCJ9'));   // 备用线路域名表（base64，启动时解码一次）
-// 根据 Worker 所在机房 colo（IATA 代码）选择最近的中继地区
-function selectAltRegion(colo) {
-  const c = (colo || '').toUpperCase();
-  // 亚洲
-  if (c.startsWith('HKG') || c.startsWith('HK')) return 'HK';
-  if (c.startsWith('SIN') || c.startsWith('SG')) return 'SG';
-  if (c.startsWith('NRT') || c.startsWith('KIX') || c.startsWith('TYO') || c.startsWith('OSA') || c.startsWith('JP')) return 'JP';
-  if (c.startsWith('ICN') || c.startsWith('SEL') || c.startsWith('KR')) return 'KR';
-  if (/^(HKG|SIN|NRT|KIX|ICN|TYO|OSA|SEL|HK|SG|JP|KR|SJC)/.test(c)) return 'HK';
-  // 欧洲
-  if (c.startsWith('FRA') || c.startsWith('BER') || c.startsWith('MUC') || c.startsWith('DUS') || c.startsWith('HAM') || c.startsWith('STR') || c.startsWith('DE')) return 'DE';
-  if (c.startsWith('ARN') || c.startsWith('SE')) return 'SE';
-  if (c.startsWith('AMS') || c.startsWith('NL')) return 'NL';
-  if (c.startsWith('HEL') || c.startsWith('FI')) return 'FI';
-  if (c.startsWith('LHR') || c.startsWith('MAN') || c.startsWith('GB') || c.startsWith('UK')) return 'GB';
-  if (/^(FRA|ARN|AMS|HEL|LHR|MAN|CDG|MAD|VIE|ZRH|MXP|PRG|WAW|BER|MUC|DUS|HAM|STR|DE|SE|NL|FI|GB|UK|FR|ES|AT|CH|IT|CZ|PL)/.test(c)) return 'DE';
-  // 北美及其他默认 US
-  return 'US';
-}
+// Worker 所在机房（IATA 代码）→ 最近的地区标签（表里没有的机房按 US）。地区标签对应面板下发的备用线路表里的标签
+const COLO_REGIONS = {
+  HK: 'HKG', SG: 'SIN', JP: 'NRT KIX TYO OSA', KR: 'ICN SEL', SE: 'ARN', NL: 'AMS', FI: 'HEL', GB: 'LHR MAN',
+  DE: 'FRA BER MUC DUS HAM STR CDG MAD VIE ZRH MXP PRG WAW',
+};
+const COLO_TO_REGION = new Map(Object.entries(COLO_REGIONS).flatMap(([r, codes]) => codes.split(' ').map(c => [c, r])));
+function selectAltRegion(colo) { return COLO_TO_REGION.get(String(colo || '').toUpperCase().slice(0, 3)) || 'US'; }
 
 // EDGEIP 反代 IP 解析缓存（TTL 5 分钟：域名 → DoH TXT/A 解析结果）
 const EDGEIP_CACHE = new Map();
@@ -1123,43 +691,32 @@ function payloadKindOf(bytes) {
   return (bytes[0] === 0x16 && bytes[1] === 0x03) ? 'tls' : 'nontls';
 }
 
-// 按面板「内置地区反代」设置得出要竞速的反代：[{ host, port, take }]（take = 取该域名解析结果的前几个 IP）
-//   off     → 空（不使用地区反代）
-//   custom  → 自定义列表（最多 3 个，第一个取 2 个 IP，其余各 1 个）
-//   builtin → 首选地区（relay.region，留空按机房自动选）取 2 个 IP + 次选地区（relay.region2，留空取默认的另一地区，'none' 不用）取 1 个 IP
+// 按面板下发的备用线路得出要竞速的线路：[{ host, port, txt, take }]（take = 取该域名解析结果的前几个 IP）。
+// altPick 是按优先顺序排列的标签（auto = 按 Worker 机房选最近的地区），altTable 是 标签 → { host, port, txt }；
+// 取前 ALT_MAX 个不重复的线路，第一个取 2 个 IP，其余各 1 个；altPick 为空 = 不使用备用线路
 function altPlan(cfg, colo) {
-  const rl = cfg.alt || {};
-  const mode = rl.mode || 'builtin';
-  if (mode === 'off') return [];
-  if (mode === 'custom') {
-    return String(rl.custom || '').split('\n').map(s => s.trim()).filter(Boolean).slice(0, ALT_CUSTOM_MAX).map((entry, i) => {
-      const { host, port } = parseHostPort(entry, 443);
-      return { host, port, take: i === 0 ? 2 : 1 };
-    });
+  const out = [], seen = new Set();
+  for (const tag of cfg.altPick || []) {
+    const e = cfg.altTable && cfg.altTable[tag === 'auto' ? selectAltRegion(colo) : tag];
+    if (!e) continue;
+    const key = e.host + ':' + (e.port || 443);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ host: e.host, port: e.port || 443, txt: e.txt === true, take: out.length ? 1 : 2 });
+    if (out.length >= ALT_MAX) break;
   }
-  const primary = ALT_DOMAINS[rl.region] ? rl.region : selectAltRegion(colo);
-  const plan = [{ host: ALT_DOMAINS[primary], port: 443, take: 2, txt: false }];   // 内置域名只有 A 记录
-  if (rl.region2 !== 'none') {
-    const second = (ALT_DOMAINS[rl.region2] && rl.region2 !== primary) ? rl.region2 : Object.keys(ALT_DOMAINS).find(r => r !== primary);
-    plan.push({ host: ALT_DOMAINS[second], port: 443, take: 1, txt: false });
-  }
-  return plan;
+  return out;
 }
 
 // 打开到目标的出站连接（自定义反代 / 出站代理 / 直连 / 地区反代）
 // 反代均为透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标。
-// 出站模式语义：only = 仅走出站代理（失败用地区反代兜底，地区反代设为 off 时不兜底）；'' 默认 = 出站代理优先，失败后直连 ∥ 反代；
-// no = 直连 ∥ 反代优先，都不通时最后用出站代理
+// 出站模式语义：only = 仅走出站代理（失败用备用线路兜底，没有备用线路时不兜底）；'' 默认 = 出站代理优先，失败后直连 ∥ 备用线路
 async function openUpstream(parsed, cfg, colo, payloadKind) {
-  const hop = parseHopAddress(cfg.hopAddr);
+  const hop = cfg.hop || null;
   const mode = cfg.hopMode || '';
   const allowSniAlt = payloadKind !== 'nontls';
 
-  const viaHop = hop ? (hop.type === 'http' || hop.type === 'https'
-    ? (t) => connectViaHtHop(hop, t)
-    : hop.type === 'ss'
-      ? (t) => connectViaAead(hop, t)
-      : (t) => connectViaS5(hop, t)) : null;
+  const viaHop = hop ? (hop.type === 'socks5' ? (t) => connectViaS5(hop, t) : (t) => connectViaHtHop(hop, t)) : null;
 
   let lastErr;
   const attempt = async (fn) => { try { const r = await fn(); if (r) return r; } catch (e) { lastErr = e; } return null; };
@@ -1181,7 +738,7 @@ async function openUpstream(parsed, cfg, colo, payloadKind) {
     if (!allowSniAlt) return [];
     return altPlan(cfg, colo).map((p) => async () => {
       let ts = [];
-      try { ts = await resolveEdgeIPs(p.host, p.port, { txt: p.txt !== false }); } catch (e) { return null; }
+      try { ts = await resolveEdgeIPs(p.host, p.port, { txt: p.txt }); } catch (e) { return null; }
       if (!ts.length) return null;
       return await raceConnect(ts.slice(0, p.take).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT))));
     });
@@ -1213,13 +770,10 @@ async function openUpstream(parsed, cfg, colo, payloadKind) {
     const r = await pickBest(); if (r) return r;   // 未配置出站代理：按直连处理
     return fail();
   }
-  if (mode === '' && hopJob) {
+  if (hopJob) {   // 默认：出站代理优先，失败后直连 ∥ 备用线路
     const r = await hopJob(); if (r) return r;
-    const r2 = await pickBest(); if (r2) return r2;
-    return fail();
   }
   const r = await pickBest(); if (r) return r;
-  if (hopJob) { const r2 = await hopJob(); if (r2) return r2; }
   return fail();
 }
 
@@ -1469,326 +1023,139 @@ async function handleXhtProto(request, cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// 代理配置：环境变量只有两项必填，其余全部由面板在线下发
+// 代理配置：环境变量只有两项，其余（UUID、启用开关、落地 / 出站 / 备用线路）全部由面板通过控制接口下发
 //   PATH       【必填】节点路径（WebSocket / XHTTP 共用）
 //   NODE_KEY   【必填】控制密钥（至少 24 位随机字符）：面板用它给控制请求签名，也决定控制入口的路径
-// UUID 不再来自环境变量：由面板生成并通过控制接口下发，保存在 NODE_KV 里（见 proxy-settings.js）；
-// 面板还没下发 UUID（或代理被停用）时，节点路径上的请求和其它任何路径一样只返回伪装页。
-// 下面这些运行设置也可以用环境变量给出默认值（面板里在线保存的设置优先于它们）：
-//   EDGEIP      反代 / 落地 IP（host 或 host:port）
-//   HOP_ADDR    出站代理（socks5:// / http(s):// / ss:// 或 host:port）
-//   HOP_MODE    出站方式：留空 = 出站代理优先；no = 直连优先；only = 仅走出站代理
-//   ALT_MODE    地区反代：builtin（默认，按机房自动选地区）/ custom / off
-//   ALT_REGION  builtin 的首选地区（留空按机房自动选）
-//   ALT_REGION2 builtin 的次选地区（留空自动；none = 不用）
-//   ALT_CUSTOM  custom 的反代列表（最多 3 个 host[:port]，换行 / 逗号分隔）
-// 无效取值按默认值处理。
+// 面板下发的状态保存在 NODE_KV 里（见 proxy-settings.js）；还没下发 UUID（或代理被停用）时，节点路径上的请求和其它任何路径一样只返回伪装页。
 // ---------------------------------------------------------------------------
 const NODE_PATH_RE = /^[A-Za-z0-9._~-]+$/;
 const NODE_KEY_MIN = 24;
-const ALT_CUSTOM_MAX = 3;   // 自定义反代最多 3 个：与直连并发竞速，受 Workers 6 个同时出站连接的限制
+const ALT_MAX = 3;   // 备用线路最多 3 条：与直连并发竞速，受 Workers 6 个同时出站连接的限制
 
 function nodeConfig(env) {
   const str = (k) => (env && env[k] != null ? String(env[k]).trim() : '');
-  const cfg = {
-    path: '', key: '', uuids: [], enabled: true, edgeIP: str('EDGEIP'), hopAddr: str('HOP_ADDR'), hopMode: '',
-    alt: { mode: 'builtin', region: '', region2: '', custom: '' },
-    _problems: [],
-  };
+  const cfg = Object.assign({ path: '', key: '', _problems: [] }, emptyState());
   const path = str('PATH').replace(/^\/+/, '').replace(/\/+$/, '');
   if (path && NODE_PATH_RE.test(path) && path.length <= 128) cfg.path = path;
   else cfg._problems.push(path ? '环境变量 PATH 的值不正确：只能包含字母、数字及 . _ ~ -（不含 /），最长 128 位。' : '请设置环境变量 PATH（节点的访问路径，如 mynode）。');
   const key = str('NODE_KEY');
   if (key.length >= NODE_KEY_MIN && key.length <= 256 && /^[\x21-\x7e]+$/.test(key)) cfg.key = key;
   else cfg._problems.push(key ? '环境变量 NODE_KEY 的值不正确：至少 ' + NODE_KEY_MIN + ' 位，只能是可见的 ASCII 字符（面板里可以点「生成密钥」）。' : '请设置环境变量 NODE_KEY（控制密钥，至少 ' + NODE_KEY_MIN + ' 位随机字符，与面板里填写的密钥一致）。');
-  const mode = str('HOP_MODE').toLowerCase();
-  if (mode === 'no' || mode === 'only') cfg.hopMode = mode;
-  const rmode = str('ALT_MODE').toLowerCase();
-  if (rmode === 'custom' || rmode === 'off') cfg.alt.mode = rmode;
-  const regionOf = (v, extra) => {
-    const k = Object.keys(ALT_DOMAINS).find(x => x.toLowerCase() === v.toLowerCase());
-    return k || (extra && v.toLowerCase() === extra ? extra : '');
-  };
-  cfg.alt.region = regionOf(str('ALT_REGION'));
-  cfg.alt.region2 = regionOf(str('ALT_REGION2'), 'none');
-  cfg.alt.custom = str('ALT_CUSTOM').split(/[\n,;]+/).map(s => s.trim()).filter(Boolean).slice(0, ALT_CUSTOM_MAX).join('\n');
   return cfg;
 }
 // ---------------------------------------------------------------------------
-// 代理的在线状态：身份（UUID）、启用开关与运行设置，由面板通过控制接口（proxy-control.js）读写
+// 代理的状态：面板整份下发（控制接口 setState），代理只存、只读，不做合并
 // ---------------------------------------------------------------------------
-// 保存在代理自己的 KV 里（绑定变量名 NODE_KV，单独的命名空间，只有代理绑定它），一个键 state：
-//   { uuid, prev, prevUntil, enabled, set }
-//   uuid / prev / prevUntil  当前 UUID；轮换后旧 UUID 在 prevUntil 之前仍被接受（10 分钟宽限，在途连接与尚未更新订阅的客户端不会立刻断开）
-//   enabled                  false = 停用：节点路径与其它路径一样只返回伪装页（控制接口仍可用，用来重新启用）
-//   set                      7 项运行设置的覆盖项，优先级：这里 > 环境变量 > 默认值；与环境变量相同的值不落盘
-// 没有 NODE_KV 时无处保存 UUID，代理无法被面板配置好，节点路径上只会返回伪装页。
+// 保存在代理自己的 KV 里（绑定变量名 NODE_KV，单独的命名空间），一个键 state，内容就是面板发来的那段 JSON 原文：
+//   uuids      [[UUID, 失效时间]]：接受的 UUID（失效时间 0 = 不失效）；轮换后旧 UUID 带一个 10 分钟的失效时间，在途连接与尚未更新订阅的客户端不会立刻断开
+//   enabled    false = 停用：节点路径与其它路径一样只返回伪装页（控制接口仍可用，用来重新启用）
+//   edgeIP     反代 / 落地 IP（host 或 host:port）：填写后作为固定出口优先使用
+//   hop        出站代理 { type: socks5 | http | https, host, port, user, pass } 或 null
+//   hopMode    '' = 出站代理优先，失败后直连 ∥ 备用线路；only = 仅走出站代理（失败用备用线路兜底）
+//   altTable   备用线路表：标签 → { host, port, txt }
+//   altPick    备用线路的优先顺序：标签列表，auto = 按 Worker 机房选最近的地区；空 = 不使用备用线路
+// 面板是唯一的写入方，所以没有读-改-写，也不需要合并：整份覆盖，重复下发无副作用。状态的短哈希（stateHash）随 status 返回，面板据此判断两边是否一致。
+// 没有 NODE_KV 时无处保存状态，代理无法被面板配置好，节点路径上只会返回伪装页。
 // 读取走 isolate 内存缓存（STATE_MEM_TTL）+ KV 边缘缓存，每个 isolate 约每 20 秒读一次 KV；只有节点路径上的连接才会触发。
 // KV 读取失败时沿用上一次读到的状态（从没读到过就视为未配置），绝不因此影响已有连接。
 const STATE_KEY = 'state';
 const STATE_MEM_TTL = 20 * 1000;
-const UUID_GRACE_MS = 10 * 60 * 1000;
-const SETTINGS_FIELDS = ['edgeIP', 'hopAddr', 'hopMode', 'alt.mode', 'alt.region', 'alt.region2', 'alt.custom'];
-const AEAD_METHODS = ['aes-128-gcm', 'aes-256-gcm', 'chacha20-ietf-poly1305'];
 const HOSTNAME_RE = /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
+const TAG_RE = /^[A-Za-z0-9_-]{1,16}$/;
+const STATE_KEYS = ['uuids', 'enabled', 'edgeIP', 'hop', 'hopMode', 'altTable', 'altPick'];
+const NO_KV_MSG = '代理没有绑定 KV（变量名 NODE_KV），无法保存：UUID 与设置都保存在这个 KV 里，请先给代理绑定一个单独的 KV 命名空间';
 
+function emptyState() {
+  return { uuids: [], enabled: true, edgeIP: '', hop: null, hopMode: '', altTable: {}, altPick: [] };
+}
 function nodeKv(env) {
   const kv = env && env.NODE_KV;
   return kv && typeof kv === 'object' && typeof kv.get === 'function' ? kv : null;
 }
+const okHost = (h) => typeof h === 'string' && h.length <= 253 && (isValidIp(h) || HOSTNAME_RE.test(h));
+const okPort = (p) => Number.isInteger(p) && p >= 1 && p <= 65535;
+const isObj = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
 
-// cfg ↔ 扁平的设置对象（键为 SETTINGS_FIELDS）
-function flatSettings(cfg) {
-  return {
-    edgeIP: cfg.edgeIP, hopAddr: cfg.hopAddr, hopMode: cfg.hopMode,
-    'alt.mode': cfg.alt.mode, 'alt.region': cfg.alt.region, 'alt.region2': cfg.alt.region2, 'alt.custom': cfg.alt.custom,
-  };
-}
-function applySettings(cfg, flat) {
-  for (const k of SETTINGS_FIELDS) {
-    if (!(k in flat)) continue;
-    if (k.startsWith('alt.')) cfg.alt[k.slice(4)] = flat[k];
-    else cfg[k] = flat[k];
+// 校验面板发来的状态：返回错误说明，没问题返回 ''（只做类型与长度检查，防止坏数据让代理出错；内容的友好校验在面板里做）
+function checkState(st) {
+  if (!isObj(st)) return '状态必须是 JSON 对象';
+  for (const k of Object.keys(st)) if (!STATE_KEYS.includes(k)) return '未知字段：' + k.slice(0, 40);
+  if (!Array.isArray(st.uuids) || st.uuids.length > 4 || !st.uuids.every(u => Array.isArray(u) && typeof u[0] === 'string' && isUUID(u[0]) && Number.isFinite(u[1]) && u[1] >= 0)) return 'uuids 不正确';
+  if (typeof st.enabled !== 'boolean') return 'enabled 必须是布尔值';
+  if (typeof st.edgeIP !== 'string' || st.edgeIP.length > 260) return 'edgeIP 不正确';
+  if (st.edgeIP) { const e = parseHostPort(st.edgeIP, 443); if (!okHost(e.host) || !okPort(e.port)) return 'edgeIP 不是有效的 host 或 host:port'; }
+  if (st.hopMode !== '' && st.hopMode !== 'only') return 'hopMode 不正确';
+  const h = st.hop;
+  if (h !== null && !(isObj(h) && ['socks5', 'http', 'https'].includes(h.type) && okHost(h.host) && okPort(h.port) && (h.user === undefined || (typeof h.user === 'string' && h.user.length <= 255)) && (h.pass === undefined || (typeof h.pass === 'string' && h.pass.length <= 255)))) return 'hop 不正确';
+  if (!isObj(st.altTable) || Object.keys(st.altTable).length > 32) return 'altTable 不正确';
+  for (const [tag, e] of Object.entries(st.altTable)) {
+    if (!TAG_RE.test(tag) || !isObj(e) || !okHost(e.host) || (e.port !== undefined && !okPort(e.port)) || (e.txt !== undefined && typeof e.txt !== 'boolean')) return 'altTable 里的「' + tag.slice(0, 20) + '」不正确';
   }
-  return cfg;
-}
-const DEFAULT_SETTINGS = flatSettings({ edgeIP: '', hopAddr: '', hopMode: '', alt: { mode: 'builtin', region: '', region2: '', custom: '' } });
-
-// 单项校验与规范化：返回 { value } 或 { error }（规则与原先面板里的字段校验一致）
-function checkSetting(key, v) {
-  if (v == null) v = '';
-  if (typeof v !== 'string') return { error: '格式不正确' };
-  v = v.trim();
-  const oneOf = (list, label) => (list.includes(v) ? { value: v } : { error: label + '：不支持的选项「' + v.slice(0, 40) + '」' });
-  const regions = Object.keys(ALT_DOMAINS);
-  switch (key) {
-    case 'edgeIP': {
-      if (!v) return { value: '' };
-      if (v.length > 256) return { error: '长度不能超过 256' };
-      if (!/^[^\s/]+$/.test(v)) return { error: '格式为 host 或 host:port' };
-      const { host, port } = parseHostPort(v, 443);
-      if (!host) return { error: '缺少主机名' };
-      if (!(port >= 1 && port <= 65535)) return { error: '端口须为 1 - 65535' };
-      return { value: v };
-    }
-    case 'hopAddr': {
-      if (!v) return { value: '' };
-      if (v.length > 1024) return { error: '长度不能超过 1024' };
-      if (!/^\S+$/.test(v)) return { error: '出站代理不能包含空格' };
-      const p = parseHopAddress(v);
-      if (!p || !p.host) return { error: '无法解析出站代理地址（格式如 socks5://user:pass@1.2.3.4:1080）' };
-      if (!(p.port >= 1 && p.port <= 65535)) return { error: '出站代理端口须为 1 - 65535' };
-      if (p.type === 'ss') {
-        if (!aeadAlgo(p.method)) return { error: 'AEAD 加密方式仅支持 ' + AEAD_METHODS.join(' / ') };
-        if (!p.password) return { error: 'AEAD 缺少密码' };
-      }
-      return { value: v };
-    }
-    case 'hopMode': return oneOf(['', 'no', 'only'], '出站方式');
-    case 'alt.mode': return oneOf(['builtin', 'custom', 'off'], '地区反代模式');
-    case 'alt.region': case 'alt.region2': {
-      const extra = key === 'alt.region2' ? ['', 'none'] : [''];
-      const hit = regions.find(r => r.toLowerCase() === v.toLowerCase());
-      if (hit) return { value: hit };
-      return oneOf(extra, key === 'alt.region' ? '首选反代地区' : '次选反代地区');
-    }
-    case 'alt.custom': {
-      if (v.length > 1024) return { error: '长度不能超过 1024' };
-      const seen = new Set(), out = [];
-      for (const raw of v.split(/[\n,;]+/).map(s => s.trim()).filter(Boolean)) {
-        const { host, port } = parseHostPort(raw, 443);
-        const h = host.toLowerCase();
-        if (!h || !(isValidIp(h) || HOSTNAME_RE.test(h))) return { error: '「' + raw.slice(0, 60) + '」不是有效的反代地址（格式 host 或 host:port，IPv6 需加方括号）' };
-        if (!(port >= 1 && port <= 65535)) return { error: '「' + raw.slice(0, 60) + '」的端口须为 1 - 65535' };
-        const entry = (h.indexOf(':') >= 0 ? '[' + h + ']' : h) + (port === 443 ? '' : ':' + port);
-        if (!seen.has(entry)) { seen.add(entry); out.push(entry); }
-      }
-      if (out.length > ALT_CUSTOM_MAX) return { error: '最多 ' + ALT_CUSTOM_MAX + ' 个自定义反代（当前 ' + out.length + ' 个）' };
-      return { value: out.join('\n') };
-    }
-  }
-  return { error: '未知设置项' };
-}
-// 校验一批设置：只处理出现的项；未登记的项记入 ignored（strict 写入时报告，读取 KV 时直接丢弃无效项）
-function sanitizeSettings(input) {
-  const values = {}, errors = [], ignored = [];
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return { values, errors: [{ field: '', msg: '设置必须是一个对象' }], ignored };
-  for (const k of Object.keys(input)) {
-    if (!SETTINGS_FIELDS.includes(k)) { ignored.push(k); continue; }
-    const r = checkSetting(k, input[k]);
-    if (r.error) errors.push({ field: k, msg: r.error });
-    else values[k] = r.value;
-  }
-  return { values, errors, ignored };
-}
-function crossCheckSettings(flat) {
-  const errors = [];
-  if (flat['alt.mode'] === 'custom' && !flat['alt.custom']) {
-    errors.push({ field: 'alt.custom', msg: '已选择「仅使用自定义反代」，请至少填写一个反代地址（或改回内置 / 关闭）' });
-  }
-  return errors;
+  if (!Array.isArray(st.altPick) || st.altPick.length > 8 || !st.altPick.every(t => typeof t === 'string' && TAG_RE.test(t))) return 'altPick 不正确';
+  return '';
 }
 
-// 状态的规范化：只认合法的字段，其它一律丢弃（无效项不影响其它项）
-function emptyState() { return { uuid: '', prev: '', prevUntil: 0, enabled: true, set: {} }; }
-function sanitizeState(obj) {
-  const st = emptyState();
-  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return st;
-  if (typeof obj.uuid === 'string' && isUUID(obj.uuid)) st.uuid = obj.uuid.toLowerCase();
-  if (typeof obj.prev === 'string' && isUUID(obj.prev) && Number(obj.prevUntil) > 0) { st.prev = obj.prev.toLowerCase(); st.prevUntil = Number(obj.prevUntil); }
-  if (obj.enabled === false) st.enabled = false;
-  st.set = sanitizeSettings(obj.set).values;
-  return st;
-}
-
-// 读 KV 里保存的状态：返回 { state, error }（error：'' / 'unavailable' / 'corrupt'）；带 isolate 内存缓存
+// 读 KV 里保存的状态：返回 { raw, state, error }（error：'' / 'unavailable' / 'corrupt'）；带 isolate 内存缓存
 const STATE_MEM = new WeakMap();
-async function readNodeState(kv, fresh) {
+async function readNodeState(kv) {
   const now = Date.now(), hit = STATE_MEM.get(kv);
-  if (!fresh && hit && now - hit.t < STATE_MEM_TTL) return hit;
+  if (hit && now - hit.t < STATE_MEM_TTL) return hit;
   let entry;
   try {
-    const raw = await kv.get(STATE_KEY, fresh ? undefined : { cacheTtl: 30 });
+    const raw = await kv.get(STATE_KEY, { cacheTtl: 30 });
     let state = emptyState(), error = '';
     if (raw) {
-      try {
-        const obj = JSON.parse(raw);
-        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new SyntaxError('not an object');
-        state = sanitizeState(obj);
-      } catch (e) { state = emptyState(); error = 'corrupt'; }
+      try { const obj = JSON.parse(raw); if (checkState(obj)) throw new SyntaxError('invalid'); state = obj; }
+      catch (e) { error = 'corrupt'; }
     }
-    entry = { t: now, state, error };
+    entry = { t: now, raw: error ? '' : (raw || ''), state, error };
   } catch (e) {
     // 读取失败：沿用上一次读到的状态，5 秒后重试；从没读到过就视为未配置
-    entry = { t: now - STATE_MEM_TTL + 5000, state: hit ? hit.state : emptyState(), error: 'unavailable' };
+    entry = { t: now - STATE_MEM_TTL + 5000, raw: hit ? hit.raw : '', state: hit ? hit.state : emptyState(), error: 'unavailable' };
   }
   STATE_MEM.set(kv, entry);
   return entry;
 }
-async function writeNodeState(kv, state) {
-  await kv.put(STATE_KEY, JSON.stringify(state));
-  STATE_MEM.set(kv, { t: Date.now(), state, error: '' });
-}
-// 当前接受的 UUID 列表：当前的一个，加上宽限期内的旧的一个
-function acceptedUuids(st, now) {
-  const out = [];
-  if (st.uuid) out.push(st.uuid);
-  if (st.prev && st.prevUntil > now) out.push(st.prev);
-  return out;
-}
 
-// 代理运行时使用的配置：环境变量 + KV 里的状态（UUID 列表、启用开关、设置覆盖项）。没有 NODE_KV 或环境变量有问题时就是环境变量本身（没有 UUID）
+// 代理运行时使用的配置：环境变量 + KV 里的状态。没有 NODE_KV 或环境变量有问题时就是环境变量本身（没有 UUID）
 async function loadNodeConfig(env, base) {
   const cfg = base || nodeConfig(env);
   const kv = nodeKv(env);
   if (!kv || cfg._problems.length) return cfg;
   const { state } = await readNodeState(kv);
-  cfg.uuids = acceptedUuids(state, Date.now());
-  cfg.enabled = state.enabled;
-  return applySettings(cfg, state.set);
+  const now = Date.now();
+  return Object.assign(cfg, state, { uuids: state.uuids.filter(u => !u[1] || u[1] > now).map(u => u[0]) });
 }
 
-// getSettings 的返回值：生效值、环境变量值、每项的来源、可选地区
-function describeSettings(env, set, error) {
-  const envFlat = flatSettings(nodeConfig(env));
-  const settings = Object.assign({}, envFlat, set);
-  const source = {};
-  for (const k of SETTINGS_FIELDS) source[k] = k in set ? 'kv' : (envFlat[k] !== DEFAULT_SETTINGS[k] ? 'env' : 'default');
-  const kv = nodeKv(env);
-  return { ok: true, storage: !!(kv && typeof kv.put === 'function'), settings, env: envFlat, source, regions: Object.keys(ALT_DOMAINS), error: error || '' };
-}
-const NO_KV_MSG = '代理没有绑定 KV（变量名 NODE_KV），无法保存：UUID 与在线设置都保存在这个 KV 里，请先给代理绑定一个单独的 KV 命名空间';
-async function getNodeSettings(env) {
-  const kv = nodeKv(env);
-  if (!kv) return describeSettings(env, {}, '');
-  const { state, error } = await readNodeState(kv);
-  return describeSettings(env, state.set, error);
-}
-// 读-改-写：先用 fresh 读到当前状态（KV 读取失败时拒绝，避免覆盖；内容损坏时允许写入来修复），再由 mutate 改出新状态
-async function updateNodeState(env, mutate) {
+// 控制接口 setState：raw 是面板发来的 JSON 原文（校验通过后原样保存，stateHash 因此与面板算出的一致）
+async function setNodeState(env, raw) {
   const kv = nodeKv(env);
   if (!kv || typeof kv.put !== 'function') return { ok: false, error: NO_KV_MSG };
-  const cur = await readNodeState(kv, true);
-  if (cur.error === 'unavailable') return { ok: false, error: 'KV 暂时无法读取，为避免覆盖已有状态，已禁止保存' };
-  const next = mutate(Object.assign({}, cur.state, { set: Object.assign({}, cur.state.set) }));
-  if (next.error) return { ok: false, error: next.error, errors: next.errors || [], ignored: next.ignored || [] };
-  try { await writeNodeState(kv, next.state); }
+  let st;
+  try { st = JSON.parse(raw); } catch (e) { return { ok: false, error: '状态不是合法的 JSON' }; }
+  const bad = checkState(st);
+  if (bad) return { ok: false, error: bad };
+  try { await kv.put(STATE_KEY, raw); }
   catch (e) { return { ok: false, error: 'KV 写入失败：' + ((e && e.message) || e) }; }
-  return { ok: true, state: next.state, ignored: next.ignored || [] };
+  STATE_MEM.set(kv, { t: Date.now(), raw, state: st, error: '' });
+  return { ok: true, stateHash: await shortHash(raw) };
 }
-// 保存设置：patch 里出现的项逐项校验（任何一项出错整批都不保存），与环境变量相同的值不落盘
-async function saveNodeSettings(env, patch) {
-  const { values, errors, ignored } = sanitizeSettings(patch);
-  if (errors.length) return { ok: false, error: errors.map(e => e.msg).join('；'), errors, ignored };
-  const envFlat = flatSettings(nodeConfig(env));
-  const r = await updateNodeState(env, (st) => {
-    const merged = Object.assign({}, envFlat, st.set, values);
-    const cross = crossCheckSettings(merged);
-    if (cross.length) return { error: cross.map(e => e.msg).join('；'), errors: cross, ignored };
-    const set = {};
-    for (const k of SETTINGS_FIELDS) if (merged[k] !== envFlat[k]) set[k] = merged[k];
-    st.set = set;
-    return { state: st, ignored };
-  });
-  return r.ok ? Object.assign(describeSettings(env, r.state.set, ''), { ignored: r.ignored }) : r;
-}
-// 重置设置：只清除设置覆盖项，回到环境变量 + 默认值；UUID 与启用开关不动
-async function resetNodeSettings(env) {
-  const r = await updateNodeState(env, (st) => { st.set = {}; return { state: st }; });
-  return r.ok ? describeSettings(env, {}, '') : r;
-}
-// 下发 UUID：rotate 为真且已有不同的 UUID 时，旧的保留 UUID_GRACE_MS 的宽限期
-async function setNodeIdentity(env, args) {
-  const uuid = args && typeof args.uuid === 'string' ? args.uuid.trim().toLowerCase() : '';
-  if (!isUUID(uuid)) return { ok: false, error: 'UUID 格式不正确' };
-  const r = await updateNodeState(env, (st) => {
-    if (st.uuid && st.uuid !== uuid && args.rotate === true) { st.prev = st.uuid; st.prevUntil = Date.now() + UUID_GRACE_MS; }
-    else if (st.uuid !== uuid) { st.prev = ''; st.prevUntil = 0; }
-    st.uuid = uuid;
-    return { state: st };
-  });
-  return r.ok ? { ok: true, uuidTag: await uuidTag(uuid), graceMs: r.state.prev ? UUID_GRACE_MS : 0 } : r;
-}
-// 读出当前 UUID（只有持有密钥的面板能调到）：面板丢了自己保存的 UUID（比如重新添加这个代理）时用来接管，而不是生成新的把客户端搞断
-async function getNodeIdentity(env) {
-  const kv = nodeKv(env);
-  if (!kv) return { ok: false, error: NO_KV_MSG };
-  const { state, error } = await readNodeState(kv, true);
-  if (error === 'unavailable') return { ok: false, error: 'KV 暂时无法读取' };
-  return state.uuid ? { ok: true, uuid: state.uuid } : { ok: false, error: '代理还没有下发 UUID' };
-}
-// 启用 / 停用：停用后节点路径只返回伪装页（控制接口不受影响）
-async function setNodeEnabled(env, args) {
-  if (!args || typeof args.enabled !== 'boolean') return { ok: false, error: '缺少 enabled（true / false）' };
-  const r = await updateNodeState(env, (st) => { st.enabled = args.enabled; return { state: st }; });
-  return r.ok ? { ok: true, enabled: r.state.enabled } : r;
-}
-// 状态：是否在线 / 版本 / 配置问题 / 是否已下发 UUID / 是否启用 / 设置摘要（不含 UUID、路径、密钥、反代地址与出站代理的主机和密码）
+
+// 状态：是否在线 / 版本 / 配置问题 / 是否已下发 UUID / 是否启用 / 状态哈希（不含任何设置内容）
 async function nodeStatus(env) {
   const base = nodeConfig(env);
   const kv = nodeKv(env);
-  let state = emptyState(), kvError = '';
-  if (kv && !base._problems.length) { const r = await readNodeState(kv); state = r.state; kvError = r.error; }
-  const cfg = applySettings(nodeConfig(env), state.set);
-  const out = cfg.hopAddr ? parseHopAddress(cfg.hopAddr) : null;
+  let entry = { raw: '', state: emptyState(), error: '' };
+  if (kv && !base._problems.length) entry = await readNodeState(kv);
   return {
     ok: base._problems.length === 0,
     version: VERSION,
     problems: base._problems,
     storage: !!kv,
-    kvError,
-    provisioned: !!state.uuid,
-    enabled: state.enabled,
-    uuidTag: state.uuid ? await uuidTag(state.uuid) : '',
-    settings: {
-      edgeIP: !!cfg.edgeIP,
-      hopAddr: out ? out.type : '',
-      hopMode: cfg.hopMode,
-      altMode: cfg.alt.mode,
-      altRegion: cfg.alt.region,
-      altRegion2: cfg.alt.region2,
-      altCustom: cfg.alt.custom ? cfg.alt.custom.split('\n').length : 0,
-    },
+    kvError: entry.error,
+    provisioned: entry.state.uuids.length > 0,
+    enabled: entry.state.enabled,
+    stateHash: entry.raw ? await shortHash(entry.raw) : '',
   };
 }
 // ---------------------------------------------------------------------------
@@ -1797,6 +1164,7 @@ async function nodeStatus(env) {
 // 入口：POST /<PATH>/<标记>，标记由 NODE_KEY 派生（不知道密钥就找不到入口）。请求体是 JSON：
 //   { ts, n, op, a, s }   ts 毫秒时间戳，n 一次性随机串，op 操作名，a 参数的 JSON 文本，s = HMAC-SHA256(NODE_KEY, ts.n.op.a)
 // 任何一步不符（方法、体积、JSON、时间偏差、重放、签名）都返回与其它路径完全相同的伪装页，不泄露这里有入口。
+// 操作只有两个：status（读状态摘要）与 setState（整份覆盖状态，a 就是状态的 JSON 原文）。
 // 验证通过后返回 { ts, d, s }：d 是结果的 JSON 文本，s = HMAC-SHA256(NODE_KEY, ts.n.d)（绑定了请求的 n，面板据此确认回应来自持有密钥的一方）。
 // 重放：时间偏差 CONTROL_SKEW_MS 内同一个 n 只接受一次（isolate 内存里记）；各操作都是幂等的，跨 isolate 的重放最多重复一次相同的写入。
 const CONTROL_SKEW_MS = 30 * 1000;
@@ -1810,15 +1178,10 @@ function seenNonce(n, now) {
   while (SEEN_NONCES.size > 1000) SEEN_NONCES.delete(SEEN_NONCES.keys().next().value);
   return false;
 }
-async function runControlOp(env, op, args) {
+async function runControlOp(env, op, raw) {
   switch (op) {
     case 'status': return nodeStatus(env);
-    case 'getSettings': return getNodeSettings(env);
-    case 'setSettings': return saveNodeSettings(env, args);
-    case 'resetSettings': return resetNodeSettings(env);
-    case 'setIdentity': return setNodeIdentity(env, args);
-    case 'getIdentity': return getNodeIdentity(env);
-    case 'setEnabled': return setNodeEnabled(env, args);
+    case 'setState': return setNodeState(env, raw);
   }
   return { ok: false, error: '未知操作' };
 }
@@ -1834,7 +1197,7 @@ async function handleControl(request, env, base) {
     if (Math.abs(now - m.ts) > CONTROL_SKEW_MS) return stubPage();
     if (!timingSafeEqual(await hmacB64u(base.key, m.ts + '.' + m.n + '.' + m.op + '.' + m.a), m.s)) return stubPage();
     if (seenNonce(m.n, now)) return stubPage();
-    const result = await runControlOp(env, m.op, m.a ? JSON.parse(m.a) : {});
+    const result = await runControlOp(env, m.op, m.a);
     const d = JSON.stringify(result), ts = Date.now();
     return new Response(JSON.stringify({ ts, d, s: await hmacB64u(base.key, ts + '.' + m.n + '.' + d) }), { status: 200, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
   } catch (e) { return stubPage(); }

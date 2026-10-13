@@ -25,8 +25,8 @@ function timingSafeEqual(a, b) {
 }
 // 控制请求的路径标记：由密钥派生，不知道密钥就找不到控制入口
 async function routeTag(keyStr) { return (await hmacB64u(keyStr, 'route')).slice(0, 16); }
-// UUID 的短标记（SHA-256 前 8 位十六进制）：面板据此判断代理上的 UUID 是否与自己保存的一致，而不必回传 UUID 本身
-async function uuidTag(uuid) {
-  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', TE.encode(String(uuid).toLowerCase())));
+// 短哈希（SHA-256 前 4 字节的十六进制）：面板据此判断代理上保存的状态是否与自己下发的一致，而不必回传内容本身
+async function shortHash(text) {
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', TE.encode(String(text))));
   return Array.from(d.subarray(0, 4)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
