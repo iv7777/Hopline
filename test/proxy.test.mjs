@@ -758,6 +758,13 @@ test('路由：只有节点路径上的 WebSocket / XHTTP 进入代理，其余�
   await hello('/login', { method: 'POST', body: 'username=admin&password=x' });
   await hello('/other', { method: 'POST', body: new Uint8Array(vlessReq('x.example', 443)) });
   await hello('/mynode', { headers: { 'User-Agent': 'Mozilla/5.0' } });   // 节点路径上的普通 GET 也只是伪装页
+  // 与 Cloudflare 默认的 Hello World Worker（return new Response('Hello World!')）完全一致：正文、状态码与响应头
+  const stub = await worker.fetch(new Request('https://node.example.com/'), env, {});
+  const ref = new Response('Hello World!');
+  assert.equal(await stub.clone().text(), 'Hello World!');
+  assert.equal(stub.status, ref.status);
+  assert.deepEqual([...stub.headers], [...ref.headers], '没有任何多余的响应头');
+  assert.equal(stub.headers.get('content-type'), 'text/plain;charset=UTF-8');
   // 节点路径（首尾斜杠无关）上：WebSocket 升级与 XHTTP POST 始终可用，无需任何开关
   const ws = await worker.fetch(new Request('https://node.example.com/mynode/', { headers: { Upgrade: 'websocket' } }), env, {});
   assert.equal(ws.status, 101);

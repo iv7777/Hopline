@@ -495,11 +495,11 @@ function json(obj, status, headers) {
   return new Response(JSON.stringify(obj), { status: status || 200, headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, headers || {}) });
 }
 
-// 路径不对（根路径、未知路由）时返回一个普通的 Hello World 页面作为伪装：
-// 看起来像个占位站点，既不暴露路径 / UUID，也不返回 404 引人注意
+// 路径不对（根路径、未知路由）时返回与 Cloudflare 默认的 Hello World Worker 完全相同的响应：
+//   return new Response('Hello World!');  → 200，纯文本，没有任何多余的头；
+// 看起来像个刚创建的占位 Worker，既不暴露路径 / UUID，也不返回 404 引人注意
 function stubPage() {
-  return new Response('<!doctype html><html><head><meta charset="utf-8"><title>Hello World</title></head><body><h1>Hello World !</h1></body></html>',
-    { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  return new Response('Hello World!');
 }
 // ---------------------------------------------------------------------------
 // 哈希（面板）：MD5 用于缓存键，SHA-224 用于派生 Clash 本地凭据
