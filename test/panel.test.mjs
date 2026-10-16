@@ -1795,3 +1795,19 @@ test('代理状态 /api/proxy-status?all=1：全部代理的状态（一个连�
   const none = baseEnv({ CONFIG_KV: kv({ proxies: [] }) });
   assert.deepEqual((await (await call(none, `/${UUID}/api/proxy-status?all=1`, { cookie: await login(none) })).json()).data, { proxies: [] });
 });
+
+test('面板预览的节点列表：parseNodeLink 取出「地址:端口」（不是 443:undefined），IPv6 带方括号，XHTTP 识别；没有名称时用地址:端口作名称', async () => {
+  const env = baseEnv();
+  const html = await (await call(env, `/${UUID}`, { cookie: await login(env) })).text();
+  const src = html.slice(html.indexOf('var NODE_LINK_ANY_M'), html.indexOf('function loadNodeList('));
+  const parse = new Function(src + '\nreturn parseNodeLink;')();
+  const u = '11111111-2222-4333-8444-555555555555';
+  const a = parse(`vless://${u}@104.16.9.1:443?encryption=none&security=tls&type=ws#优选IP-01`);
+  assert.deepEqual([a.addr, a.name, a.proto], ['104.16.9.1:443', '优选IP-01', 'VLESS']);
+  const b = parse(`vless://${u}@node.example.com:8443?type=xhttp&mode=stream-one#原生地址.X`);
+  assert.deepEqual([b.addr, b.name, b.proto], ['node.example.com:8443', '原生地址.X', 'XHTTP']);
+  const c = parse(`vless://${u}@[2606:4700::1]:443?type=ws`);
+  assert.deepEqual([c.addr, c.name], ['[2606:4700::1]:443', '[2606:4700::1]:443']);
+  assert.equal(parse('not a link'), null);
+  for (const n of [a, b, c]) assert.ok(!n.addr.includes('undefined') && !n.name.includes('undefined'));
+});

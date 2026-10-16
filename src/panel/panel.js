@@ -1046,7 +1046,7 @@ function parseNodeLink(link){
   var hash = link.indexOf('#'), name = '';
   if (hash >= 0) { try { name = decodeURIComponent(link.slice(hash + 1)); } catch (e) { name = link.slice(hash + 1); } }
   var proto = /[?&]type=xhttp(&|#|$)/.test(link) ? 'XHTTP' : 'VLESS';
-  return { link: link, name: name || (m[2] + ':' + m[3]), proto: proto, addr: m[2] + ':' + m[3] };
+  return { link: link, name: name || (m[1] + ':' + m[2]), proto: proto, addr: m[1] + ':' + m[2] };   // m[1] 地址（IPv6 带方括号）、m[2] 端口
 }
 function loadNodeList(){
   var fmt = PREV.fmt;

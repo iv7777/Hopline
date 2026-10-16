@@ -1,4 +1,4 @@
-/*!Hopline-panel v3.2.0*/
+/*!Hopline-panel v3.2.1*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -16,7 +16,7 @@
 //  代理的域名、节点路径、密钥在面板「面板设置 → 代理」里填写（保存在 CONFIG_KV）。
 // ============================================================================
 // 面板脚本（Hopline-panel.js）的版本号：用于检测更新与面板里显示。与代理脚本各自编号、各自升版本
-const VERSION = '3.2.0';
+const VERSION = '3.2.1';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
 // 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
@@ -4498,7 +4498,7 @@ function parseNodeLink(link){
   var hash = link.indexOf('#'), name = '';
   if (hash >= 0) { try { name = decodeURIComponent(link.slice(hash + 1)); } catch (e) { name = link.slice(hash + 1); } }
   var proto = /[?&]type=xhttp(&|#|$)/.test(link) ? 'XHTTP' : 'VLESS';
-  return { link: link, name: name || (m[2] + ':' + m[3]), proto: proto, addr: m[2] + ':' + m[3] };
+  return { link: link, name: name || (m[1] + ':' + m[2]), proto: proto, addr: m[1] + ':' + m[2] };   
 }
 function loadNodeList(){
   var fmt = PREV.fmt;
