@@ -1,4 +1,4 @@
-/*!Hopline-proxy v3.2.0*/
+/*!Hopline-proxy v3.2.1*/
 // ============================================================================
 //  Hopline 代理 —— 只做一件事：在节点路径上接收 VLESS（WebSocket / XHTTP）并转发
 //  ----------------------------------------------------------------------------
@@ -17,7 +17,7 @@
 import { connect } from 'cloudflare:sockets';
 
 // 代理脚本（Hopline-proxy.js）的版本号：只通过服务绑定的 status() 报告（不会出现在任何公开响应里）。与面板脚本各自编号、各自升版本
-const VERSION = '3.2.0';
+const VERSION = '3.2.1';
 // ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
@@ -209,15 +209,15 @@ function uuidToBytes(u) {
   UUID_BYTES_CACHE.set(str, b);
   return b;
 }
-// 16 字节（getByte(i) 取第 i 个）是否匹配 cfg.uuids 里的任一项；逐项逐字节比较，不因提前不符而短路
+// 16 字节（getByte(i) 取第 i 个）匹配 cfg.uuids 里的哪一项：返回匹配的 UUID 文本，都不匹配返回 ''；逐项逐字节比较，不因提前不符而短路
 function uuidAccepted(getByte, cfg) {
-  let ok = false;
+  let ok = '';
   for (const u of (cfg && cfg.uuids) || []) {
     let want;
     try { want = uuidToBytes(u); } catch (e) { continue; }
     let diff = 0;
     for (let i = 0; i < 16; i++) diff |= (getByte(i) ^ want[i]);
-    if (diff === 0) ok = true;
+    if (diff === 0) ok = u;
   }
   return ok;
 }
@@ -227,7 +227,8 @@ function parseVssProtoHeader(data, cfg) {
   let offset = 0;
   if (view.getUint8(0) !== 0) throw new Error('不支持的 VSS 版本');
   if (data.byteLength < 17) throw new Error('VSS 头部过短');
-  if (!uuidAccepted((i) => view.getUint8(1 + i), cfg)) throw new Error('UUID 不匹配');
+  const uuid = uuidAccepted((i) => view.getUint8(1 + i), cfg);
+  if (!uuid) throw new Error('UUID 不匹配');
   offset += 1 + 16;                       // version + uuid
   if (offset >= data.byteLength) throw new Error('VSS 头部过短');
   const addonsLen = view.getUint8(offset); offset += 1;
@@ -239,7 +240,7 @@ function parseVssProtoHeader(data, cfg) {
   const { addr, len } = readAddress(data, view, offset, atyp);
   offset += len;
   return {
-    command, port, addr,
+    command, port, addr, uuid,
     headerLength: offset,
     earlyData: data.subarray(offset)
   };
@@ -376,8 +377,8 @@ function withTimeout(promise, ms, msg) {
 
 // connect + opened 超时：CF 回环保护会静默丢弃对 CF 托管站点的 SYN（连接永远挂起），
 // 带超时快速失败，由 openUpstream 按序走下一出站方式（反代兜底），解决「延迟有、流量 0」
-async function connectWithTimeout(hostname, port, ms) {
-  const socket = connect({ hostname, port });
+async function connectWithTimeout(hostname, port, ms, opts) {
+  const socket = opts ? connect({ hostname, port }, opts) : connect({ hostname, port });
   try {
     await withTimeout(socket.opened, ms || 6000, '连接超时（SYN 被静默丢弃）');
   } catch (e) {
@@ -453,8 +454,8 @@ async function connectViaS5(hop, target) {
 
 // 通过 HTTP/HTTPS CONNECT 代理建立连接
 async function connectViaHtHop(hop, target) {
-  // 6s 超时快速失败：代理不可达时不能永久挂起
-  const socket = await connectWithTimeout(hop.host, hop.port, 6000);
+  // 6s 超时快速失败：代理不可达时不能永久挂起；https 类型的出站代理要先与它建立 TLS（secureTransport），再在 TLS 里发 CONNECT
+  const socket = await connectWithTimeout(hop.host, hop.port, 6000, hop.type === 'https' ? { secureTransport: 'on', allowHalfOpen: false } : undefined);
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   let authHeader = '';
@@ -519,6 +520,11 @@ const COLO_REGIONS = {
 };
 const COLO_TO_REGION = new Map(Object.entries(COLO_REGIONS).flatMap(([r, codes]) => codes.split(' ').map(c => [c, r])));
 function selectAltRegion(colo) { return COLO_TO_REGION.get(String(colo || '').toUpperCase().slice(0, 3)) || 'US'; }
+// 地区的相邻地区（按优先顺序）：auto 先取本地区，再依次取相邻的，欧洲的机房不会被补到香港 / 美国去
+const ALT_NEIGHBORS = {
+  US: 'SG JP KR', SG: 'JP KR US', JP: 'SG KR US', KR: 'JP SG US', HK: 'SG JP KR',
+  DE: 'NL GB SE FI', SE: 'DE NL FI GB', NL: 'DE GB SE FI', FI: 'SE DE NL GB', GB: 'DE NL SE FI',
+};
 
 // EDGEIP 反代 IP 解析缓存（TTL 5 分钟：域名 → DoH TXT/A 解析结果）
 const EDGEIP_CACHE = new Map();
@@ -678,6 +684,7 @@ function nullAfter(promise, ms, late) {
 const DIRECT_TIMEOUT = 4000;   // 直连超时（反代并发进行，无需久等）
 const ALT_TIMEOUT = 4000;    // 单个反代 IP 连接超时
 const MAX_RACERS = 4;          // 单次竞速最多并发路数（CF 单请求同时出站连接上限 6，留余量给 DoH 等）
+const FIRST_BYTE_MS = 3500;  // 直连接通后等目标首个数据的上限，超过就换备用线路重试
 const FIRST_WAIT_MS = 80;      // 头部已完整但尚无数据时，等首包判定协议的上限（不能拖慢建连）
 const ALT_WAIT_MAX = 10000;  // 反代整体等待上限（DoH 解析 + 连接）
 const DIRECT_GRACE_MS = 1500;  // 直连优先窗口（直连失败会立即换反代，窗口只管「慢但能通」的直连；过短会让反代抢走正常站点的流量，如 YouTube 视频）
@@ -692,20 +699,71 @@ function payloadKindOf(bytes) {
 }
 
 // 按面板下发的备用线路得出要竞速的线路：[{ host, port, txt, take }]（take = 取该域名解析结果的前几个 IP）。
-// altPick 是按优先顺序排列的标签（auto = 按 Worker 机房选最近的地区），altTable 是 标签 → { host, port, txt }；
+// altPick 是按优先顺序排列的标签（auto = 按 Worker 机房选最近的地区，再依次补它相邻的地区），altTable 是 标签 → { host, port, txt }；
 // 取前 ALT_MAX 个不重复的线路，第一个取 2 个 IP，其余各 1 个；altPick 为空 = 不使用备用线路
 function altPlan(cfg, colo) {
   const out = [], seen = new Set();
-  for (const tag of cfg.altPick || []) {
-    const e = cfg.altTable && cfg.altTable[tag === 'auto' ? selectAltRegion(colo) : tag];
-    if (!e) continue;
+  const add = (tag) => {
+    const e = cfg.altTable && cfg.altTable[tag];
+    if (!e || out.length >= ALT_MAX) return;
     const key = e.host + ':' + (e.port || 443);
-    if (seen.has(key)) continue;
+    if (seen.has(key)) return;
     seen.add(key);
     out.push({ host: e.host, port: e.port || 443, txt: e.txt === true, take: out.length ? 1 : 2 });
-    if (out.length >= ALT_MAX) break;
+  };
+  for (const tag of cfg.altPick || []) {
+    if (tag !== 'auto') { add(tag); continue; }
+    const region = selectAltRegion(colo);
+    add(region);
+    for (const n of (ALT_NEIGHBORS[region] || '').split(' ')) add(n);
   }
   return out;
+}
+
+// 给连接记下它是怎么建立的（direct / alt / edge / hop），首包看门狗只对直连有效
+const via = (sock, how) => { if (sock) sock._via = how; return sock; };
+// 备用线路的连接任务：每条线路先解析（5 分钟缓存），再并发连接前 take 个 IP；返回的任务数组交给竞速
+function altJobsFor(cfg, colo, attempt) {
+  return altPlan(cfg, colo).map((p) => async () => {
+    let ts = [];
+    try { ts = await resolveEdgeIPs(p.host, p.port, { txt: p.txt }); } catch (e) { return null; }
+    if (!ts.length) return null;
+    return via(await raceConnect(ts.slice(0, p.take).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT)))), 'alt');
+  });
+}
+// 只走备用线路（首包看门狗重试用）：返回已连接的 socket，没有可用线路返回 null
+async function openAltOnly(cfg, colo) {
+  const attempt = async (fn) => { try { return await fn(); } catch (e) { return null; } };
+  return racePreferDirect(null, altJobsFor(cfg, colo, attempt).slice(0, MAX_RACERS - 1), 0);
+}
+// 首包看门狗：直连接通了，但目标 FIRST_BYTE_MS 内没有回任何数据，或者没回数据就关闭了
+// （目标在 Cloudflare 上被回环保护「接通后吞掉」、或中途被重置：延迟有、流量 0）——换备用线路并重发同一份首包，只重试一次。
+// 只对 TLS 首包（可原样重发）、直连建立的连接、且有备用线路时生效；其它情况原样返回。
+// 备用线路没接通时不放弃原连接（只是慢的目标仍能用）：继续等它的首个数据。
+// alive：客户端是否还在（已断开就不再重试）。
+// 返回 { conn, first }：first 是已经读到的第一块数据（调用方先把它发给客户端），重试后的新连接 first 为 null；
+// conn 为 null = 原连接确实没有数据且备用线路也没有（原连接已关闭）
+async function firstByteOrRetry(conn, payload, cfg, colo, alive = () => true) {
+  if (!payload || !payload.byteLength || conn._via !== 'direct' || payloadKindOf(payload) !== 'tls' || !altPlan(cfg, colo).length) return { conn, first: null };
+  const reader = conn.readable.getReader();
+  const hasData = (r) => !!(r && !r.done && r.value && r.value.byteLength);
+  const readP = reader.read().catch(() => null);
+  let timer = null;
+  const r1 = await Promise.race([readP, new Promise((res) => { timer = setTimeout(() => res(null), FIRST_BYTE_MS); })]);
+  clearTimeout(timer);
+  if (hasData(r1)) { reader.releaseLock(); return { conn, first: r1.value }; }
+  if (!alive()) { try { conn.close(); } catch (e) { /* 忽略 */ } return { conn: null, first: null }; }   // 客户端已经走了：不再建立新的连接
+  const alt = await openAltOnly(cfg, colo);
+  if (alt) {
+    try { conn.close(); } catch (e) { /* 忽略 */ }
+    try { const w = alt.writable.getWriter(); await w.write(payload); w.releaseLock(); return { conn: alt, first: null }; }
+    catch (e) { try { alt.close(); } catch (e2) { /* 忽略 */ } return { conn: null, first: null }; }
+  }
+  // 备用线路没接通：原连接若只是慢，继续等它的首个数据；它已经关闭 / 出错就没有别的办法了
+  const late = r1 || await readP;
+  if (hasData(late)) { reader.releaseLock(); return { conn, first: late.value }; }
+  try { conn.close(); } catch (e) { /* 忽略 */ }
+  return { conn: null, first: null };
 }
 
 // 打开到目标的出站连接（自定义反代 / 出站代理 / 直连 / 地区反代）
@@ -727,24 +785,16 @@ async function openUpstream(parsed, cfg, colo, payloadKind) {
   if (edge && edge.host && allowSniAlt) {
     let customTargets = await resolveEdgeIPs(edge.host, edge.port);
     if (!customTargets.length) customTargets = [{ hostname: edge.host, port: edge.port }];
-    const r = await raceConnect(customTargets.slice(0, MAX_RACERS).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT))));
+    const r = via(await raceConnect(customTargets.slice(0, MAX_RACERS).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT)))), 'edge');
     if (r) return r;
   }
 
   const target = { hostname: parsed.addr, port: parsed.port };
   // 2) 地区反代（面板「内置地区反代」设置）：builtin = 首选地区（2 个 IP）+ 次选地区（1 个 IP）；custom = 自定义列表；
   //    off = 不使用。各条目的 DoH 解析（5 分钟缓存）与连接并发竞速
-  const altJobs = () => {
-    if (!allowSniAlt) return [];
-    return altPlan(cfg, colo).map((p) => async () => {
-      let ts = [];
-      try { ts = await resolveEdgeIPs(p.host, p.port, { txt: p.txt }); } catch (e) { return null; }
-      if (!ts.length) return null;
-      return await raceConnect(ts.slice(0, p.take).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT))));
-    });
-  };
-  const directJob = () => attempt(() => connectDirect(target, DIRECT_TIMEOUT));
-  const hopJob = viaHop ? () => attempt(() => viaHop(target)) : null;
+  const altJobs = () => (allowSniAlt ? altJobsFor(cfg, colo, attempt) : []);
+  const directJob = () => attempt(async () => via(await connectDirect(target, DIRECT_TIMEOUT), 'direct'));
+  const hopJob = viaHop ? () => attempt(async () => via(await viaHop(target), 'hop')) : null;
   const hostKey = String(parsed.addr || '').toLowerCase();
   const cfIp = isCloudflareIP(hostKey);
   const learn = !isValidIp(hostKey);   // 学习型路由只针对域名目标（IP 目标按 CF 段直接判断）
@@ -874,6 +924,48 @@ function closeReason(msg) {
   return out;
 }
 
+// 上行队列（WebSocket 路径）：客户端的数据帧先入队，由单个写入循环合并成不超过 UP_BATCH 的块再写给目标；
+// 队列有上限（字节数与块数），客户端发得比目标收得快时超限就断开，而不是在内存里无限堆积
+const UP_MAX_BYTES = 256 * 1024, UP_MAX_COUNT = 2048, UP_BATCH = 16 * 1024;
+function uplinkQueue() {
+  const q = [];
+  let bytes = 0;
+  return {
+    get empty() { return !q.length; },
+    push(chunk) {
+      if (!chunk.byteLength) return true;
+      if (bytes + chunk.byteLength > UP_MAX_BYTES || q.length >= UP_MAX_COUNT) return false;
+      q.push(chunk); bytes += chunk.byteLength;
+      return true;
+    },
+    take() {
+      if (!q.length) return null;
+      const head = q.shift();
+      bytes -= head.byteLength;
+      if (!q.length || head.byteLength >= UP_BATCH) return head;
+      const parts = [head];
+      let total = head.byteLength;
+      while (q.length && total + q[0].byteLength <= UP_BATCH) { const c = q.shift(); bytes -= c.byteLength; total += c.byteLength; parts.push(c); }
+      if (parts.length === 1) return head;
+      const out = new Uint8Array(total);
+      let o = 0;
+      for (const c of parts) { out.set(c, o); o += c.byteLength; }
+      return out;
+    },
+    clear() { q.length = 0; bytes = 0; },
+  };
+}
+// XHTTP 响应里的填充头：头名取 UUID 的第 2–7 位、值是带随机长度（100–1000）填充的 URL（参数名取 UUID 的第 26–31 位前加 _），
+// 与面板下发给客户端的 xPadding 参数（nodes.js 的 xhttpPadding）一致
+function xhtPaddingHeader(uuid, host) {
+  const len = 100 + (crypto.getRandomValues(new Uint32Array(1))[0] % 901);
+  const rnd = crypto.getRandomValues(new Uint8Array(len));
+  let pad = '';
+  for (let i = 0; i < len; i++) pad += B62[rnd[i] % 62];
+  return [uuid.slice(1, 7), 'https://' + host + '/?_' + uuid.slice(25, 31) + '=' + pad];
+}
+const B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
 async function handleWsProto(request, cfg) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
@@ -881,12 +973,22 @@ async function handleWsProto(request, cfg) {
   // 关键：必须声明二进制类型，否则 CF 将二进制帧按 UTF-8 解码成 string，VLESS 头（含 16 字节原始 UUID）会被损坏导致隧道失败
   server.binaryType = 'arraybuffer';
   let socket = null, writer = null, headerSent = false, pending = null, protoWait = null, respSent = false;
+  const up = uplinkQueue();
+  let draining = false;
   let closed = false, pumped = false, wsClosed = false;   // closed：WS 已关闭（之后建好的出站连接要立即释放）；pumped：已开始把目标数据转给客户端（由它负责在结束时关闭 WS）
 
   const send = (data) => { try { server.send(data); } catch (e) { /* 忽略 */ } };
   // 只发一次关闭帧（重复 close 在运行时会抛异常，也会覆盖先发出的关闭码）
   const closeWs = (code, reason) => { if (wsClosed) return; wsClosed = true; try { server.close(code, reason); } catch (e) { /* 忽略 */ } };
   const fail = (err) => { closeWs(1011, closeReason(err && err.message || err)); cleanup(); };
+  // 上行写入循环：出站就绪（writer 已设置）后把队列里的数据合并写给目标；同一时刻只有一个循环在跑
+  const drain = async () => {
+    if (draining || !writer) return;
+    draining = true;
+    try { for (let c; writer && (c = up.take());) await writer.write(c); }
+    catch (err) { fail(err); }
+    finally { draining = false; }
+  };
 
   // 首包处理：WS 数据帧与 0-RTT 早数据共用。headerSent 在任何 await 之前置位，
   // 解析期间到达的后续帧走下方「暂存 / 直写」分支，不会重复解析
@@ -938,14 +1040,32 @@ async function handleWsProto(request, cfg) {
     // 建连期间客户端已断开：立即释放刚建好的出站连接，否则它会一直挂到目标端关闭
     if (closed) { try { conn.close(); } catch (e) { /* 忽略 */ } return; }
     socket = conn;
-    writer = conn.writable.getWriter();
+    const firstPayload = pending && pending.byteLength > parsed.headerLength ? pending.subarray(parsed.headerLength) : null;
+    pending = null;   // 头部之后到达的数据帧进上行队列（有上限），出站就绪后合并写出
     // 透明代理：去掉 VLESS 头部，发送原始 TLS 数据，由对端按 SNI 路由
     // 补发 SOCKS5/HTTP 代理握手残留字节（目标端早期数据），避免 TLS 握手中途被截断
     if (conn._preamble && conn._preamble.byteLength > 0) send(conn._preamble);
-    if (pending && pending.byteLength > parsed.headerLength) await writer.write(pending.subarray(parsed.headerLength));
-    pending = null;   // 出站就绪后清空缓冲，后续消息直接写出站
-    pumped = true;
-    pumpReadable(conn.readable, send, () => closeWs(1000));
+    let w = conn.writable.getWriter();
+    if (firstPayload) await w.write(firstPayload);
+    // 首包看门狗：直连接通但目标不回数据时换备用线路重试（期间 writer 保持为空，客户端的后续数据留在队列里）。
+    // 这一步可能等几秒，所以放到后台继续：不占着数据帧的事件处理，出错同样走 fail
+    const colo = request.cf && request.cf.colo;
+    const resume = async () => {
+      let first = null;
+      if (firstPayload && payloadKind === 'tls') {
+        const r = await firstByteOrRetry(conn, firstPayload, cfg, colo, () => !closed);
+        if (r.conn !== conn) { try { w.releaseLock(); } catch (e) { /* 忽略 */ } w = r.conn ? r.conn.writable.getWriter() : null; }
+        if (!r.conn) { socket = null; throw new Error('目标没有响应'); }
+        socket = r.conn; first = r.first;
+        if (closed) { try { r.conn.close(); } catch (e) { /* 忽略 */ } return; }
+      }
+      writer = w;
+      if (first) send(first);
+      pumped = true;
+      pumpReadable(socket.readable, send, () => closeWs(1000));
+      drain();
+    };
+    resume().catch(fail);
   };
 
   // WS 0-RTT：先处理握手头中预发的首包，再处理数据帧；校验不通过时 earlyBytes 为 null，走原流程
@@ -956,15 +1076,15 @@ async function handleWsProto(request, cfg) {
     try {
       const chunk = typeof ev.data === 'string' ? TE.encode(ev.data) : new Uint8Array(ev.data);
       if (!headerSent) await handleFirstChunk(chunk);
-      // 出站未就绪时暂存，避免头部之后的早期数据帧被丢弃（否则 TLS 握手不完整 → 连接通但流量为 0）
-      else if (writer) await writer.write(chunk);
-      else pending = pending ? concatBytes(pending, chunk) : chunk;
+      // 头部之后的数据帧一律先入上行队列：出站未就绪时暂存（避免早期数据帧被丢弃 → TLS 握手不完整 → 连接通但流量为 0），就绪后合并写出
+      else { if (!up.push(chunk)) throw new Error('上行缓冲溢出'); drain(); }
     } catch (err) { fail(err); }
   });
   // accept({ allowHalfOpen: true }) 下收到客户端的关闭帧不会自动回应：这里必须自己收尾。
   // 已有数据转发时，目标连接被关闭后由 pumpReadable 结束并关闭 WS；还没开始转发（握手 / 等首包 / 建连中）时直接关闭，避免连接悬挂
   function cleanup() {
     closed = true;
+    up.clear();
     if (protoWait) { clearTimeout(protoWait); protoWait = null; }
     if (socket) { try { socket.close(); } catch (e) { /* 忽略 */ } socket = null; }
     if (!pumped) closeWs(1000);
@@ -1003,8 +1123,16 @@ async function handleXhtProto(request, cfg) {
   if (firstPayload.byteLength) await writer.write(firstPayload);
   writer.releaseLock();
   bodyReader.releaseLock();
+  // 首包看门狗（同 WebSocket 路径）：直连接通但目标不回数据时换备用线路重试。TLS 里客户端要等到服务端回应才会继续发数据，
+  // 所以等首个数据期间先不接上行管道（请求体由运行时缓冲），拿到首包或重试完成后再接，数据面仍然是原生管道
+  let up = conn, firstChunk = null;
+  if (firstPayload.byteLength && payloadKindOf(firstPayload) === 'tls') {
+    const r = await firstByteOrRetry(conn, firstPayload, cfg, request.cf && request.cf.colo, () => !request.signal.aborted);
+    if (!r.conn) throw new Error('目标没有响应');
+    up = r.conn; firstChunk = r.first;
+  }
   // 上行：请求体 → 目标（请求体结束时关闭目标写端，即 TCP 半关闭）
-  request.body.pipeTo(conn.writable).catch(() => {});
+  request.body.pipeTo(up.writable).catch(() => {});
 
   // 下行：先写 2 字节 VLESS 响应头（version=0 + addonsLen=0，否则 xhttp 客户端报 unexpected response version）
   // 与 SOCKS5/HTTP 代理握手残留字节（目标端早期数据），再把目标连接原生管道接到响应体
@@ -1013,13 +1141,16 @@ async function handleXhtProto(request, cfg) {
     try {
       const w = ts.writable.getWriter();
       await w.write(new Uint8Array([0, 0]));
-      if (conn._preamble && conn._preamble.byteLength > 0) await w.write(conn._preamble);
+      if (up._preamble && up._preamble.byteLength > 0) await w.write(up._preamble);
+      if (firstChunk) await w.write(firstChunk);
       w.releaseLock();
-      await conn.readable.pipeTo(ts.writable);   // 客户端断开 → 取消目标读取；目标结束 → 响应结束
+      await up.readable.pipeTo(ts.writable);   // 客户端断开 → 取消目标读取；目标结束 → 响应结束
     } catch (e) { /* 忽略 */ }
-    try { conn.close(); } catch (e) { /* 忽略 */ }
+    try { up.close(); } catch (e) { /* 忽略 */ }
   })();
-  return new Response(ts.readable, { status: 200, headers: { 'content-type': 'application/octet-stream', 'x-accel-buffering': 'no', 'cache-control': 'no-store' } });
+  // 响应头与常见的 XHTTP 服务端一致：content-type 为 application/grpc，并带一条随机长度的填充头
+  const [padName, padValue] = xhtPaddingHeader(parsed.uuid, new URL(request.url).host);
+  return new Response(ts.readable, { status: 200, headers: { 'content-type': 'application/grpc', 'x-accel-buffering': 'no', 'cache-control': 'no-store', [padName]: padValue } });
 }
 
 // ---------------------------------------------------------------------------

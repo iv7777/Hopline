@@ -1,4 +1,4 @@
-/*!Hopline-panel v3.2.1*/
+/*!Hopline-panel v3.2.2*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -16,7 +16,7 @@
 //  代理的域名、节点路径、密钥在面板「面板设置 → 代理」里填写（保存在 CONFIG_KV）。
 // ============================================================================
 // 面板脚本（Hopline-panel.js）的版本号：用于检测更新与面板里显示。与代理脚本各自编号、各自升版本
-const VERSION = '3.2.1';
+const VERSION = '3.2.2';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
 // 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
@@ -778,7 +778,7 @@ const HOP_HOSTNAME_RE = /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([
 const TAG_PATTERN = /^[A-Za-z0-9_-]{1,16}$/;
 const ALT_TABLE_MAX = 32;
 const ALT_PICK_MAX = 8;
-const ALT_PICK_DEFAULT = ['auto', 'HK', 'US'];
+const ALT_PICK_DEFAULT = ['auto'];   // auto = 按 Worker 机房选最近的地区，再依次补它相邻的地区（由代理展开）
 
 const hostValid = (h) => !!h && h.length <= 253 && (isValidIp(h) || HOP_HOSTNAME_RE.test(h));
 const portValid = (p) => Number.isInteger(p) && p >= 1 && p <= 65535;
@@ -864,7 +864,7 @@ function parseAltPick(text) {
 // 备用线路表：面板 KV 里的 routes（纯文本），所有代理共用；整张表随代理的状态下发（见 proxies.js 的 buildState）
 // ---------------------------------------------------------------------------
 // 直连不通（例如目标站同在 Cloudflare 上）时，代理把 TLS 流量交给备用线路（SNI 型透明转发，解析为非 Cloudflare IP 的域名）。
-// 线路是第三方服务器，能看到目标域名与连接元数据；每个代理在「代理设置」里选用哪些、按什么顺序（默认 auto,HK,US）。
+// 线路是第三方服务器，能看到目标域名与连接元数据；每个代理在「代理设置」里选用哪些、按什么顺序（默认 auto）。
 const ROUTES_KEY = 'routes';
 const DEFAULT_ALT_ROUTES = `# 备用线路表：每行「标签 域名[:端口] [txt]」，# 开头是注释。
 # 标签 auto 保留给「按 Worker 机房自动选最近的地区」；HK / US / SG / JP / KR / DE / SE / NL / FI / GB 是自动选择会用到的地区标签。
@@ -3323,14 +3323,14 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
         <p class="hint" style="margin-top:0">直连不通（例如目标站同在 Cloudflare 上）时，代理会把 TLS 流量交给备用线路按 SNI 转发，并与直连并发竞速。线路是第三方服务器，能看到目标域名与连接元数据；不想经第三方时选「关闭」。非 TLS 流量不会走备用线路。线路表见下方。</p>
         <div class="field"><label>选用方式</label>
           <select id="rl-mode" onchange="onRelayMode()">
-            <option value="auto">自动（按 Worker 所在机房选最近的地区，再补 HK、US）</option>
+            <option value="auto">自动（按 Worker 所在机房选最近的地区，再依次补它相邻的地区）</option>
             <option value="custom">自定义顺序（只用我列出的线路标签）</option>
             <option value="off">关闭（只直连 / 出站代理）</option>
           </select>
         </div>
         <div class="field" id="rl-custom-box" style="margin-bottom:0">
           <label>线路标签（按优先顺序，逗号分隔，最多 8 个；auto = 按机房自动选最近地区；第一条取 2 个 IP，其余各取 1 个，最多用 3 条）</label>
-          <input type="text" id="rl-custom" placeholder="auto,HK,US" autocomplete="off">
+          <input type="text" id="rl-custom" placeholder="auto" autocomplete="off">
           <div class="hint" id="rl-tags"></div>
         </div>
       </div>

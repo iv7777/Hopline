@@ -5,7 +5,7 @@ const HOP_HOSTNAME_RE = /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([
 const TAG_PATTERN = /^[A-Za-z0-9_-]{1,16}$/;
 const ALT_TABLE_MAX = 32;
 const ALT_PICK_MAX = 8;
-const ALT_PICK_DEFAULT = ['auto', 'HK', 'US'];
+const ALT_PICK_DEFAULT = ['auto'];   // auto = 按 Worker 机房选最近的地区，再依次补它相邻的地区（由代理展开）
 
 const hostValid = (h) => !!h && h.length <= 253 && (isValidIp(h) || HOP_HOSTNAME_RE.test(h));
 const portValid = (p) => Number.isInteger(p) && p >= 1 && p <= 65535;

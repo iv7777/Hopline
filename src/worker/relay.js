@@ -9,6 +9,11 @@ const COLO_REGIONS = {
 };
 const COLO_TO_REGION = new Map(Object.entries(COLO_REGIONS).flatMap(([r, codes]) => codes.split(' ').map(c => [c, r])));
 function selectAltRegion(colo) { return COLO_TO_REGION.get(String(colo || '').toUpperCase().slice(0, 3)) || 'US'; }
+// 地区的相邻地区（按优先顺序）：auto 先取本地区，再依次取相邻的，欧洲的机房不会被补到香港 / 美国去
+const ALT_NEIGHBORS = {
+  US: 'SG JP KR', SG: 'JP KR US', JP: 'SG KR US', KR: 'JP SG US', HK: 'SG JP KR',
+  DE: 'NL GB SE FI', SE: 'DE NL FI GB', NL: 'DE GB SE FI', FI: 'SE DE NL GB', GB: 'DE NL SE FI',
+};
 
 // EDGEIP 反代 IP 解析缓存（TTL 5 分钟：域名 → DoH TXT/A 解析结果）
 const EDGEIP_CACHE = new Map();
@@ -168,6 +173,7 @@ function nullAfter(promise, ms, late) {
 const DIRECT_TIMEOUT = 4000;   // 直连超时（反代并发进行，无需久等）
 const ALT_TIMEOUT = 4000;    // 单个反代 IP 连接超时
 const MAX_RACERS = 4;          // 单次竞速最多并发路数（CF 单请求同时出站连接上限 6，留余量给 DoH 等）
+const FIRST_BYTE_MS = 3500;  // 直连接通后等目标首个数据的上限，超过就换备用线路重试
 const FIRST_WAIT_MS = 80;      // 头部已完整但尚无数据时，等首包判定协议的上限（不能拖慢建连）
 const ALT_WAIT_MAX = 10000;  // 反代整体等待上限（DoH 解析 + 连接）
 const DIRECT_GRACE_MS = 1500;  // 直连优先窗口（直连失败会立即换反代，窗口只管「慢但能通」的直连；过短会让反代抢走正常站点的流量，如 YouTube 视频）
@@ -182,20 +188,71 @@ function payloadKindOf(bytes) {
 }
 
 // 按面板下发的备用线路得出要竞速的线路：[{ host, port, txt, take }]（take = 取该域名解析结果的前几个 IP）。
-// altPick 是按优先顺序排列的标签（auto = 按 Worker 机房选最近的地区），altTable 是 标签 → { host, port, txt }；
+// altPick 是按优先顺序排列的标签（auto = 按 Worker 机房选最近的地区，再依次补它相邻的地区），altTable 是 标签 → { host, port, txt }；
 // 取前 ALT_MAX 个不重复的线路，第一个取 2 个 IP，其余各 1 个；altPick 为空 = 不使用备用线路
 function altPlan(cfg, colo) {
   const out = [], seen = new Set();
-  for (const tag of cfg.altPick || []) {
-    const e = cfg.altTable && cfg.altTable[tag === 'auto' ? selectAltRegion(colo) : tag];
-    if (!e) continue;
+  const add = (tag) => {
+    const e = cfg.altTable && cfg.altTable[tag];
+    if (!e || out.length >= ALT_MAX) return;
     const key = e.host + ':' + (e.port || 443);
-    if (seen.has(key)) continue;
+    if (seen.has(key)) return;
     seen.add(key);
     out.push({ host: e.host, port: e.port || 443, txt: e.txt === true, take: out.length ? 1 : 2 });
-    if (out.length >= ALT_MAX) break;
+  };
+  for (const tag of cfg.altPick || []) {
+    if (tag !== 'auto') { add(tag); continue; }
+    const region = selectAltRegion(colo);
+    add(region);
+    for (const n of (ALT_NEIGHBORS[region] || '').split(' ')) add(n);
   }
   return out;
+}
+
+// 给连接记下它是怎么建立的（direct / alt / edge / hop），首包看门狗只对直连有效
+const via = (sock, how) => { if (sock) sock._via = how; return sock; };
+// 备用线路的连接任务：每条线路先解析（5 分钟缓存），再并发连接前 take 个 IP；返回的任务数组交给竞速
+function altJobsFor(cfg, colo, attempt) {
+  return altPlan(cfg, colo).map((p) => async () => {
+    let ts = [];
+    try { ts = await resolveEdgeIPs(p.host, p.port, { txt: p.txt }); } catch (e) { return null; }
+    if (!ts.length) return null;
+    return via(await raceConnect(ts.slice(0, p.take).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT)))), 'alt');
+  });
+}
+// 只走备用线路（首包看门狗重试用）：返回已连接的 socket，没有可用线路返回 null
+async function openAltOnly(cfg, colo) {
+  const attempt = async (fn) => { try { return await fn(); } catch (e) { return null; } };
+  return racePreferDirect(null, altJobsFor(cfg, colo, attempt).slice(0, MAX_RACERS - 1), 0);
+}
+// 首包看门狗：直连接通了，但目标 FIRST_BYTE_MS 内没有回任何数据，或者没回数据就关闭了
+// （目标在 Cloudflare 上被回环保护「接通后吞掉」、或中途被重置：延迟有、流量 0）——换备用线路并重发同一份首包，只重试一次。
+// 只对 TLS 首包（可原样重发）、直连建立的连接、且有备用线路时生效；其它情况原样返回。
+// 备用线路没接通时不放弃原连接（只是慢的目标仍能用）：继续等它的首个数据。
+// alive：客户端是否还在（已断开就不再重试）。
+// 返回 { conn, first }：first 是已经读到的第一块数据（调用方先把它发给客户端），重试后的新连接 first 为 null；
+// conn 为 null = 原连接确实没有数据且备用线路也没有（原连接已关闭）
+async function firstByteOrRetry(conn, payload, cfg, colo, alive = () => true) {
+  if (!payload || !payload.byteLength || conn._via !== 'direct' || payloadKindOf(payload) !== 'tls' || !altPlan(cfg, colo).length) return { conn, first: null };
+  const reader = conn.readable.getReader();
+  const hasData = (r) => !!(r && !r.done && r.value && r.value.byteLength);
+  const readP = reader.read().catch(() => null);
+  let timer = null;
+  const r1 = await Promise.race([readP, new Promise((res) => { timer = setTimeout(() => res(null), FIRST_BYTE_MS); })]);
+  clearTimeout(timer);
+  if (hasData(r1)) { reader.releaseLock(); return { conn, first: r1.value }; }
+  if (!alive()) { try { conn.close(); } catch (e) { /* 忽略 */ } return { conn: null, first: null }; }   // 客户端已经走了：不再建立新的连接
+  const alt = await openAltOnly(cfg, colo);
+  if (alt) {
+    try { conn.close(); } catch (e) { /* 忽略 */ }
+    try { const w = alt.writable.getWriter(); await w.write(payload); w.releaseLock(); return { conn: alt, first: null }; }
+    catch (e) { try { alt.close(); } catch (e2) { /* 忽略 */ } return { conn: null, first: null }; }
+  }
+  // 备用线路没接通：原连接若只是慢，继续等它的首个数据；它已经关闭 / 出错就没有别的办法了
+  const late = r1 || await readP;
+  if (hasData(late)) { reader.releaseLock(); return { conn, first: late.value }; }
+  try { conn.close(); } catch (e) { /* 忽略 */ }
+  return { conn: null, first: null };
 }
 
 // 打开到目标的出站连接（自定义反代 / 出站代理 / 直连 / 地区反代）
@@ -217,24 +274,16 @@ async function openUpstream(parsed, cfg, colo, payloadKind) {
   if (edge && edge.host && allowSniAlt) {
     let customTargets = await resolveEdgeIPs(edge.host, edge.port);
     if (!customTargets.length) customTargets = [{ hostname: edge.host, port: edge.port }];
-    const r = await raceConnect(customTargets.slice(0, MAX_RACERS).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT))));
+    const r = via(await raceConnect(customTargets.slice(0, MAX_RACERS).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT)))), 'edge');
     if (r) return r;
   }
 
   const target = { hostname: parsed.addr, port: parsed.port };
   // 2) 地区反代（面板「内置地区反代」设置）：builtin = 首选地区（2 个 IP）+ 次选地区（1 个 IP）；custom = 自定义列表；
   //    off = 不使用。各条目的 DoH 解析（5 分钟缓存）与连接并发竞速
-  const altJobs = () => {
-    if (!allowSniAlt) return [];
-    return altPlan(cfg, colo).map((p) => async () => {
-      let ts = [];
-      try { ts = await resolveEdgeIPs(p.host, p.port, { txt: p.txt }); } catch (e) { return null; }
-      if (!ts.length) return null;
-      return await raceConnect(ts.slice(0, p.take).map(t => () => attempt(() => connectDirect(t, ALT_TIMEOUT))));
-    });
-  };
-  const directJob = () => attempt(() => connectDirect(target, DIRECT_TIMEOUT));
-  const hopJob = viaHop ? () => attempt(() => viaHop(target)) : null;
+  const altJobs = () => (allowSniAlt ? altJobsFor(cfg, colo, attempt) : []);
+  const directJob = () => attempt(async () => via(await connectDirect(target, DIRECT_TIMEOUT), 'direct'));
+  const hopJob = viaHop ? () => attempt(async () => via(await viaHop(target), 'hop')) : null;
   const hostKey = String(parsed.addr || '').toLowerCase();
   const cfIp = isCloudflareIP(hostKey);
   const learn = !isValidIp(hostKey);   // 学习型路由只针对域名目标（IP 目标按 CF 段直接判断）

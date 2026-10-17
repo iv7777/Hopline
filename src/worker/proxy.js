@@ -33,6 +33,48 @@ function closeReason(msg) {
   return out;
 }
 
+// 上行队列（WebSocket 路径）：客户端的数据帧先入队，由单个写入循环合并成不超过 UP_BATCH 的块再写给目标；
+// 队列有上限（字节数与块数），客户端发得比目标收得快时超限就断开，而不是在内存里无限堆积
+const UP_MAX_BYTES = 256 * 1024, UP_MAX_COUNT = 2048, UP_BATCH = 16 * 1024;
+function uplinkQueue() {
+  const q = [];
+  let bytes = 0;
+  return {
+    get empty() { return !q.length; },
+    push(chunk) {
+      if (!chunk.byteLength) return true;
+      if (bytes + chunk.byteLength > UP_MAX_BYTES || q.length >= UP_MAX_COUNT) return false;
+      q.push(chunk); bytes += chunk.byteLength;
+      return true;
+    },
+    take() {
+      if (!q.length) return null;
+      const head = q.shift();
+      bytes -= head.byteLength;
+      if (!q.length || head.byteLength >= UP_BATCH) return head;
+      const parts = [head];
+      let total = head.byteLength;
+      while (q.length && total + q[0].byteLength <= UP_BATCH) { const c = q.shift(); bytes -= c.byteLength; total += c.byteLength; parts.push(c); }
+      if (parts.length === 1) return head;
+      const out = new Uint8Array(total);
+      let o = 0;
+      for (const c of parts) { out.set(c, o); o += c.byteLength; }
+      return out;
+    },
+    clear() { q.length = 0; bytes = 0; },
+  };
+}
+// XHTTP 响应里的填充头：头名取 UUID 的第 2–7 位、值是带随机长度（100–1000）填充的 URL（参数名取 UUID 的第 26–31 位前加 _），
+// 与面板下发给客户端的 xPadding 参数（nodes.js 的 xhttpPadding）一致
+function xhtPaddingHeader(uuid, host) {
+  const len = 100 + (crypto.getRandomValues(new Uint32Array(1))[0] % 901);
+  const rnd = crypto.getRandomValues(new Uint8Array(len));
+  let pad = '';
+  for (let i = 0; i < len; i++) pad += B62[rnd[i] % 62];
+  return [uuid.slice(1, 7), 'https://' + host + '/?_' + uuid.slice(25, 31) + '=' + pad];
+}
+const B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
 async function handleWsProto(request, cfg) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
@@ -40,12 +82,22 @@ async function handleWsProto(request, cfg) {
   // 关键：必须声明二进制类型，否则 CF 将二进制帧按 UTF-8 解码成 string，VLESS 头（含 16 字节原始 UUID）会被损坏导致隧道失败
   server.binaryType = 'arraybuffer';
   let socket = null, writer = null, headerSent = false, pending = null, protoWait = null, respSent = false;
+  const up = uplinkQueue();
+  let draining = false;
   let closed = false, pumped = false, wsClosed = false;   // closed：WS 已关闭（之后建好的出站连接要立即释放）；pumped：已开始把目标数据转给客户端（由它负责在结束时关闭 WS）
 
   const send = (data) => { try { server.send(data); } catch (e) { /* 忽略 */ } };
   // 只发一次关闭帧（重复 close 在运行时会抛异常，也会覆盖先发出的关闭码）
   const closeWs = (code, reason) => { if (wsClosed) return; wsClosed = true; try { server.close(code, reason); } catch (e) { /* 忽略 */ } };
   const fail = (err) => { closeWs(1011, closeReason(err && err.message || err)); cleanup(); };
+  // 上行写入循环：出站就绪（writer 已设置）后把队列里的数据合并写给目标；同一时刻只有一个循环在跑
+  const drain = async () => {
+    if (draining || !writer) return;
+    draining = true;
+    try { for (let c; writer && (c = up.take());) await writer.write(c); }
+    catch (err) { fail(err); }
+    finally { draining = false; }
+  };
 
   // 首包处理：WS 数据帧与 0-RTT 早数据共用。headerSent 在任何 await 之前置位，
   // 解析期间到达的后续帧走下方「暂存 / 直写」分支，不会重复解析
@@ -97,14 +149,32 @@ async function handleWsProto(request, cfg) {
     // 建连期间客户端已断开：立即释放刚建好的出站连接，否则它会一直挂到目标端关闭
     if (closed) { try { conn.close(); } catch (e) { /* 忽略 */ } return; }
     socket = conn;
-    writer = conn.writable.getWriter();
+    const firstPayload = pending && pending.byteLength > parsed.headerLength ? pending.subarray(parsed.headerLength) : null;
+    pending = null;   // 头部之后到达的数据帧进上行队列（有上限），出站就绪后合并写出
     // 透明代理：去掉 VLESS 头部，发送原始 TLS 数据，由对端按 SNI 路由
     // 补发 SOCKS5/HTTP 代理握手残留字节（目标端早期数据），避免 TLS 握手中途被截断
     if (conn._preamble && conn._preamble.byteLength > 0) send(conn._preamble);
-    if (pending && pending.byteLength > parsed.headerLength) await writer.write(pending.subarray(parsed.headerLength));
-    pending = null;   // 出站就绪后清空缓冲，后续消息直接写出站
-    pumped = true;
-    pumpReadable(conn.readable, send, () => closeWs(1000));
+    let w = conn.writable.getWriter();
+    if (firstPayload) await w.write(firstPayload);
+    // 首包看门狗：直连接通但目标不回数据时换备用线路重试（期间 writer 保持为空，客户端的后续数据留在队列里）。
+    // 这一步可能等几秒，所以放到后台继续：不占着数据帧的事件处理，出错同样走 fail
+    const colo = request.cf && request.cf.colo;
+    const resume = async () => {
+      let first = null;
+      if (firstPayload && payloadKind === 'tls') {
+        const r = await firstByteOrRetry(conn, firstPayload, cfg, colo, () => !closed);
+        if (r.conn !== conn) { try { w.releaseLock(); } catch (e) { /* 忽略 */ } w = r.conn ? r.conn.writable.getWriter() : null; }
+        if (!r.conn) { socket = null; throw new Error('目标没有响应'); }
+        socket = r.conn; first = r.first;
+        if (closed) { try { r.conn.close(); } catch (e) { /* 忽略 */ } return; }
+      }
+      writer = w;
+      if (first) send(first);
+      pumped = true;
+      pumpReadable(socket.readable, send, () => closeWs(1000));
+      drain();
+    };
+    resume().catch(fail);
   };
 
   // WS 0-RTT：先处理握手头中预发的首包，再处理数据帧；校验不通过时 earlyBytes 为 null，走原流程
@@ -115,15 +185,15 @@ async function handleWsProto(request, cfg) {
     try {
       const chunk = typeof ev.data === 'string' ? TE.encode(ev.data) : new Uint8Array(ev.data);
       if (!headerSent) await handleFirstChunk(chunk);
-      // 出站未就绪时暂存，避免头部之后的早期数据帧被丢弃（否则 TLS 握手不完整 → 连接通但流量为 0）
-      else if (writer) await writer.write(chunk);
-      else pending = pending ? concatBytes(pending, chunk) : chunk;
+      // 头部之后的数据帧一律先入上行队列：出站未就绪时暂存（避免早期数据帧被丢弃 → TLS 握手不完整 → 连接通但流量为 0），就绪后合并写出
+      else { if (!up.push(chunk)) throw new Error('上行缓冲溢出'); drain(); }
     } catch (err) { fail(err); }
   });
   // accept({ allowHalfOpen: true }) 下收到客户端的关闭帧不会自动回应：这里必须自己收尾。
   // 已有数据转发时，目标连接被关闭后由 pumpReadable 结束并关闭 WS；还没开始转发（握手 / 等首包 / 建连中）时直接关闭，避免连接悬挂
   function cleanup() {
     closed = true;
+    up.clear();
     if (protoWait) { clearTimeout(protoWait); protoWait = null; }
     if (socket) { try { socket.close(); } catch (e) { /* 忽略 */ } socket = null; }
     if (!pumped) closeWs(1000);
@@ -162,8 +232,16 @@ async function handleXhtProto(request, cfg) {
   if (firstPayload.byteLength) await writer.write(firstPayload);
   writer.releaseLock();
   bodyReader.releaseLock();
+  // 首包看门狗（同 WebSocket 路径）：直连接通但目标不回数据时换备用线路重试。TLS 里客户端要等到服务端回应才会继续发数据，
+  // 所以等首个数据期间先不接上行管道（请求体由运行时缓冲），拿到首包或重试完成后再接，数据面仍然是原生管道
+  let up = conn, firstChunk = null;
+  if (firstPayload.byteLength && payloadKindOf(firstPayload) === 'tls') {
+    const r = await firstByteOrRetry(conn, firstPayload, cfg, request.cf && request.cf.colo, () => !request.signal.aborted);
+    if (!r.conn) throw new Error('目标没有响应');
+    up = r.conn; firstChunk = r.first;
+  }
   // 上行：请求体 → 目标（请求体结束时关闭目标写端，即 TCP 半关闭）
-  request.body.pipeTo(conn.writable).catch(() => {});
+  request.body.pipeTo(up.writable).catch(() => {});
 
   // 下行：先写 2 字节 VLESS 响应头（version=0 + addonsLen=0，否则 xhttp 客户端报 unexpected response version）
   // 与 SOCKS5/HTTP 代理握手残留字节（目标端早期数据），再把目标连接原生管道接到响应体
@@ -172,12 +250,15 @@ async function handleXhtProto(request, cfg) {
     try {
       const w = ts.writable.getWriter();
       await w.write(new Uint8Array([0, 0]));
-      if (conn._preamble && conn._preamble.byteLength > 0) await w.write(conn._preamble);
+      if (up._preamble && up._preamble.byteLength > 0) await w.write(up._preamble);
+      if (firstChunk) await w.write(firstChunk);
       w.releaseLock();
-      await conn.readable.pipeTo(ts.writable);   // 客户端断开 → 取消目标读取；目标结束 → 响应结束
+      await up.readable.pipeTo(ts.writable);   // 客户端断开 → 取消目标读取；目标结束 → 响应结束
     } catch (e) { /* 忽略 */ }
-    try { conn.close(); } catch (e) { /* 忽略 */ }
+    try { up.close(); } catch (e) { /* 忽略 */ }
   })();
-  return new Response(ts.readable, { status: 200, headers: { 'content-type': 'application/octet-stream', 'x-accel-buffering': 'no', 'cache-control': 'no-store' } });
+  // 响应头与常见的 XHTTP 服务端一致：content-type 为 application/grpc，并带一条随机长度的填充头
+  const [padName, padValue] = xhtPaddingHeader(parsed.uuid, new URL(request.url).host);
+  return new Response(ts.readable, { status: 200, headers: { 'content-type': 'application/grpc', 'x-accel-buffering': 'no', 'cache-control': 'no-store', [padName]: padValue } });
 }
 

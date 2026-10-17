@@ -402,7 +402,7 @@ test('代理设置：保存在面板的代理记录里（落地 IP / 出站代�
   const hops = [['http://10.0.0.2:8080', { type: 'http', host: '10.0.0.2', port: 8080 }], ['https://h.example.com', { type: 'https', host: 'h.example.com', port: 443 }],
     ['10.0.0.3', { type: 'socks5', host: '10.0.0.3', port: 1080 }], ['socks5://us%40er:pa%3Ass@[2001:db8::1]:1081', { type: 'socks5', host: '2001:db8::1', port: 1081, user: 'us@er', pass: 'pa:ss' }], ['', null]];
   for (const [hop, want] of hops) { assert.equal((await (await upd({ hop, hopMode: '' })).json()).ok, true, hop); assert.deepEqual(proxyState(m).hop, want, hop); }
-  await upd({ altMode: 'auto' }); assert.deepEqual(proxyState(m).altPick, ['auto', 'HK', 'US']);
+  await upd({ altMode: 'auto' }); assert.deepEqual(proxyState(m).altPick, ['auto']);
   await upd({ altMode: 'off' }); assert.deepEqual(proxyState(m).altPick, []);
   // 校验：每项给出字段级错误，整批都不保存
   const before = JSON.stringify(storedProxies(env));
@@ -464,7 +464,7 @@ test('备用线路表：需登录；默认表是纯文本；保存前逐行校�
   assert.equal(all.ok, true); assert.deepEqual(all.data.results.map(r => [r.id, r.ok]), [['px-test-1', true], ['px-test-2', true]]);
   for (const m of [m1, m2]) {
     assert.deepEqual(proxyState(m).altTable, { HK: { host: 'hk.example.com', port: 8443, txt: true }, US: { host: 'us.example.com' }, v6: { host: '2001:db8::5', port: 9443 } });
-    assert.deepEqual(proxyState(m).altPick, ['auto', 'HK', 'US']);
+    assert.deepEqual(proxyState(m).altPick, ['auto']);
   }
   // 一个代理连不上：只有它失败
   m2.down = true;
@@ -621,7 +621,7 @@ test('面板路径（PATH）与代理节点路径互相独立：面板入口在 
     const ws = await worker.fetch(new Request('https://panel.example.com' + p, { headers: { Upgrade: 'websocket' } }), env, {});
     assert.notEqual(ws.status, 101, p);
     const post = await worker.fetch(new Request('https://panel.example.com' + p, { method: 'POST', body: 'x' }), env, {});
-    assert.notEqual(post.headers.get('content-type'), 'application/octet-stream', p);
+    assert.notEqual(post.headers.get('content-type'), 'application/grpc', p);
   }
 });
 

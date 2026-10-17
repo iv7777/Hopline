@@ -41,15 +41,15 @@ function uuidToBytes(u) {
   UUID_BYTES_CACHE.set(str, b);
   return b;
 }
-// 16 字节（getByte(i) 取第 i 个）是否匹配 cfg.uuids 里的任一项；逐项逐字节比较，不因提前不符而短路
+// 16 字节（getByte(i) 取第 i 个）匹配 cfg.uuids 里的哪一项：返回匹配的 UUID 文本，都不匹配返回 ''；逐项逐字节比较，不因提前不符而短路
 function uuidAccepted(getByte, cfg) {
-  let ok = false;
+  let ok = '';
   for (const u of (cfg && cfg.uuids) || []) {
     let want;
     try { want = uuidToBytes(u); } catch (e) { continue; }
     let diff = 0;
     for (let i = 0; i < 16; i++) diff |= (getByte(i) ^ want[i]);
-    if (diff === 0) ok = true;
+    if (diff === 0) ok = u;
   }
   return ok;
 }
@@ -59,7 +59,8 @@ function parseVssProtoHeader(data, cfg) {
   let offset = 0;
   if (view.getUint8(0) !== 0) throw new Error('不支持的 VSS 版本');
   if (data.byteLength < 17) throw new Error('VSS 头部过短');
-  if (!uuidAccepted((i) => view.getUint8(1 + i), cfg)) throw new Error('UUID 不匹配');
+  const uuid = uuidAccepted((i) => view.getUint8(1 + i), cfg);
+  if (!uuid) throw new Error('UUID 不匹配');
   offset += 1 + 16;                       // version + uuid
   if (offset >= data.byteLength) throw new Error('VSS 头部过短');
   const addonsLen = view.getUint8(offset); offset += 1;
@@ -71,7 +72,7 @@ function parseVssProtoHeader(data, cfg) {
   const { addr, len } = readAddress(data, view, offset, atyp);
   offset += len;
   return {
-    command, port, addr,
+    command, port, addr, uuid,
     headerLength: offset,
     earlyData: data.subarray(offset)
   };

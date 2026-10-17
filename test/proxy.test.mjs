@@ -13,7 +13,7 @@ const hooks = `
 export async function resolve(spec, ctx, next) {
   if (spec === 'cloudflare:sockets') {
     // 默认不可用；出站测试通过 globalThis.__connect 注入可控的假连接
-    return { url: 'data:text/javascript,export function connect(a){ if (globalThis.__connect) return globalThis.__connect(a); throw new Error("sockets unavailable in tests"); }', shortCircuit: true };
+    return { url: 'data:text/javascript,export function connect(a, b){ if (globalThis.__connect) return globalThis.__connect(a, b); throw new Error("sockets unavailable in tests"); }', shortCircuit: true };
   }
   return next(spec, ctx);
 }`;
@@ -28,10 +28,13 @@ const worker = proxyModule.default;
 const UUID = '11111111-2222-4333-8444-555555555555';
 const KEY = 'test-node-key-0123456789-abcdef';
 // 代理的环境变量只有 PATH 与 NODE_KEY；UUID 由面板下发、保存在 NODE_KV 的 state 里（这里直接预置）；路径取 UUID 的值，使 /<UUID> 即节点入口
-// 状态（UUID、启用、落地 / 出站 / 备用线路）整份来自面板：测试里默认是「一个 UUID + 内置地区线路表 + 默认顺序 auto,HK,US」，用 set 覆盖其中的项
+// 状态（UUID、启用、落地 / 出站 / 备用线路）整份来自面板：测试里默认是「一个 UUID + 内置地区线路表，但没有选用任何备用线路」；要用备用线路的测试用 altEnv（顺序 US,HK，固定，不受机房影响），用 set 覆盖其中的项
 const REGION_TABLE = Object.fromEntries(['HK', 'US', 'SG', 'JP', 'KR', 'DE', 'SE', 'NL', 'FI', 'GB'].map(r => [r, { host: `proxyip.${r.toLowerCase()}.cmliussss.net` }]));
-const stateWith = (set = {}) => ({ uuids: [[UUID, 0]], enabled: true, edgeIP: '', hop: null, hopMode: '', altTable: REGION_TABLE, altPick: ['auto', 'HK', 'US'], ...set });
+const stateWith = (set = {}) => ({ uuids: [[UUID, 0]], enabled: true, edgeIP: '', hop: null, hopMode: '', altTable: REGION_TABLE, altPick: [], ...set });
 const baseEnv = (extra = {}) => { const { set, ...rest } = extra; return { PATH: UUID, NODE_KEY: KEY, NODE_KV: memKv({ state: stateWith(set) }), ...rest }; };
+// 有备用线路的环境（先 US 再 HK）；默认的 baseEnv 没有备用线路，目标永远不回数据的假连接就不会触发首包看门狗（看门狗只在有备用线路时生效）
+const altEnv = (extra = {}) => baseEnv({ ...extra, set: { altPick: ['US', 'HK'], ...(extra.set || {}) } });
+const quietEnv = baseEnv;
 
 // ---------------- 优选 IP 来源开关：HostMonit / uouin / 自定义 API ----------------
 import { createHash } from 'node:crypto';
@@ -76,9 +79,9 @@ const closeBytes = (c) => { c.close(); if (c.byobRequest) c.byobRequest.respond(
 // 假网络：net[hostname] = { delay: 毫秒 | 'hang' | 'fail' }；记录每次连接与写入内容
 function fakeNet(net) {
   const log = [];
-  globalThis.__connect = ({ hostname, port }) => {
+  globalThis.__connect = ({ hostname, port }, opts) => {
     const b = net[hostname] || { delay: 'fail' };
-    const sock = { hostname, port, written: [], closedByUs: false };
+    const sock = { hostname, port, opts, written: [], closedByUs: false };
     log.push(sock);
     sock.opened = b.delay === 'hang' ? new Promise(() => {})
       : b.delay === 'fail' ? Promise.reject(new Error('refused'))
@@ -119,7 +122,7 @@ async function openWs(env, headers = {}) {
 test('出站竞速：直连挂起（Cloudflare 上的站点，SYN 被静默丢弃）时，直连优先窗口（1.5s）到期由内置反代接管', async () => {
   const log = fakeNet({ 'cf-site.example': { delay: 'hang' }, '203.0.113.10': { delay: 20 }, '203.0.113.20': { delay: 40 } });
   await withFetch(relayDoh, async () => {
-    const ws = await openWs(baseEnv());
+    const ws = await openWs(altEnv());
     const t0 = Date.now();
     await ws.emit('message', { data: vlessReq('cf-site.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));
@@ -136,14 +139,14 @@ test('学习型路由：直连失败、由反代接通的站点被记住，之�
   const log = fakeNet({ 'cf-learn.example': { delay: 'fail' }, '203.0.113.10': { delay: 10 }, '203.0.113.20': { delay: 10 } });
   const dns = [];
   await withFetch((url) => { dns.push(new URL(url).searchParams.get('name')); return relayDoh(url); }, async () => {
-    let ws = await openWs(baseEnv());
+    let ws = await openWs(altEnv());
     let t0 = Date.now();
     await ws.emit('message', { data: vlessReq('cf-learn.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));
     assert.ok(Date.now() - t0 < 500, '直连立即失败：反代马上接管，不等窗口');
     assert.equal(log.filter(s => s.hostname === 'cf-learn.example').length, 1);
     log.length = 0;
-    ws = await openWs(baseEnv());
+    ws = await openWs(altEnv());
     t0 = Date.now();
     await ws.emit('message', { data: vlessReq('cf-learn.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));
@@ -156,27 +159,27 @@ test('学习型路由：直连失败、由反代接通的站点被记住，之�
 test('学习型路由：直连只是慢（超出窗口但最终连通）的站点不记录；已记录的站点反代失败时回落直连并删除记录', async () => {
   let log = fakeNet({ 'slowok.example': { delay: 1800 }, '203.0.113.10': { delay: 10 }, '203.0.113.20': { delay: 10 } });
   await withFetch(relayDoh, async () => {
-    let ws = await openWs(baseEnv());
+    let ws = await openWs(altEnv());
     await ws.emit('message', { data: vlessReq('slowok.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));
     await until(() => log.find(s => s.hostname === 'slowok.example').closedByUs);   // 直连随后连通，被回收
     log.length = 0;
-    ws = await openWs(baseEnv());
+    ws = await openWs(altEnv());
     await ws.emit('message', { data: vlessReq('slowok.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));
     assert.equal(log.filter(s => s.hostname === 'slowok.example').length, 1, '未被记录：仍然尝试直连');
     // 已记录的站点：反代全部失败 → 回落直连，记录删除
     log = fakeNet({ 'flip.example': { delay: 'fail' }, '203.0.113.10': { delay: 10 }, '203.0.113.20': { delay: 10 } });
-    ws = await openWs(baseEnv());
+    ws = await openWs(altEnv());
     await ws.emit('message', { data: vlessReq('flip.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));   // 记录 flip.example
     log = fakeNet({ 'flip.example': { delay: 5 }, '203.0.113.10': { delay: 'fail' }, '203.0.113.20': { delay: 'fail' } });
-    ws = await openWs(baseEnv());
+    ws = await openWs(altEnv());
     await ws.emit('message', { data: vlessReq('flip.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));
     assert.equal(log.find(s => s.written.length).hostname, 'flip.example', '反代不通：回落直连');
     log = fakeNet({ 'flip.example': { delay: 5 }, '203.0.113.10': { delay: 'fail' }, '203.0.113.20': { delay: 'fail' } });
-    ws = await openWs(baseEnv());
+    ws = await openWs(altEnv());
     await ws.emit('message', { data: vlessReq('flip.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));
     assert.equal(log[0].hostname, 'flip.example', '记录已删除：直连优先');
@@ -187,13 +190,13 @@ test('目标为 Cloudflare IP：不发注定失败的直连，直接走反代；
   const req = new Uint8Array([0, ...uuidBytes, 0, 1, 1, 187, 1, 104, 16, 0, 5, ...TLS_HELLO]);   // 104.16.0.5:443
   let log = fakeNet({ '104.16.0.5': { delay: 5 }, '203.0.113.10': { delay: 10 }, '203.0.113.20': { delay: 10 } });
   await withFetch(relayDoh, async () => {
-    let ws = await openWs(baseEnv());
+    let ws = await openWs(altEnv());
     await ws.emit('message', { data: req.buffer });
     await until(() => log.some(s => s.written.length));
     assert.equal(log.find(s => s.written.length).hostname, '203.0.113.10');
     assert.equal(log.filter(s => s.hostname === '104.16.0.5').length, 0, '没有直连尝试');
     log = fakeNet({ '104.16.0.5': { delay: 5 }, '203.0.113.10': { delay: 'fail' }, '203.0.113.20': { delay: 'fail' } });
-    ws = await openWs(baseEnv());
+    ws = await openWs(altEnv());
     await ws.emit('message', { data: req.buffer });
     await until(() => log.some(s => s.written.length));
     assert.equal(log.find(s => s.written.length).hostname, '104.16.0.5', '反代不通：回落直连');
@@ -205,10 +208,10 @@ test('备用线路默认只查 A 记录；线路表里标了 txt 的才先查 TX
   const dns = [];
   const stub = dohStub({ 'cloudflare-dns.com': { answers: {
     'proxyip.jp.cmliussss.net|A': ['198.51.100.31'], 'proxyip.sg.cmliussss.net|A': ['198.51.100.32'], 'my-alt.example.net|A': ['198.51.100.31'] } } }, dns);
-  await withFetch(stub, () => connectVia(baseEnv({ set: { altPick: ['JP', 'SG'] } }), 'tx.example'));
+  await withFetch(stub, () => connectVia(altEnv({ set: { altPick: ['JP', 'SG'] } }), 'tx.example'));
   await until(() => dns.filter(d => /cmliussss/.test(d.name)).length >= 2);
   assert.deepEqual(dns.filter(d => /cmliussss/.test(d.name)).map(d => d.type), ['A', 'A']);
-  await withFetch(stub, () => connectVia(baseEnv({ set: { altTable: { 'my-alt': { host: 'my-alt.example.net', txt: true } }, altPick: ['my-alt'] } }), 'tx.example'));
+  await withFetch(stub, () => connectVia(altEnv({ set: { altTable: { 'my-alt': { host: 'my-alt.example.net', txt: true } }, altPick: ['my-alt'] } }), 'tx.example'));
   await until(() => dns.filter(d => d.name === 'my-alt.example.net').length >= 2);
   assert.deepEqual(dns.filter(d => d.name === 'my-alt.example.net').map(d => d.type).sort(), ['A', 'TXT']);
 });
@@ -216,7 +219,7 @@ test('备用线路默认只查 A 记录；线路表里标了 txt 的才先查 TX
 test('出站竞速：直连在优先窗口内成功时使用直连，已建立的反代连接被关闭', async () => {
   const log = fakeNet({ 'direct.example': { delay: 120 }, '203.0.113.10': { delay: 10 }, '203.0.113.20': { delay: 10 } });
   await withFetch(relayDoh, async () => {
-    const ws = await openWs(baseEnv());
+    const ws = await openWs(altEnv());
     await ws.emit('message', { data: vlessReq('direct.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));
     assert.equal(log.find(s => s.written.length).hostname, 'direct.example');
@@ -227,7 +230,7 @@ test('出站竞速：直连在优先窗口内成功时使用直连，已建立�
 test('出站竞速：直连较慢（600ms）但能通时仍用直连，不被反代抢走；直连失败则立即换反代', async () => {
   const log = fakeNet({ 'slow.example': { delay: 600 }, '203.0.113.10': { delay: 10 }, '203.0.113.20': { delay: 10 } });
   await withFetch(relayDoh, async () => {
-    const ws = await openWs(baseEnv());
+    const ws = await openWs(altEnv());
     await ws.emit('message', { data: vlessReq('slow.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));
     assert.equal(log.find(s => s.written.length).hostname, 'slow.example', '慢直连不应被反代取代');
@@ -237,7 +240,7 @@ test('出站竞速：直连较慢（600ms）但能通时仍用直连，不被反
 test('WS 下行：已到达的小块合并成一条消息（最多 64KB），字节顺序完整；之后到达的数据单独发出；目标结束后关闭 WS', async () => {
   const log = fakeNet({ 'batch.example': { delay: 5 } });
   await withFetch(relayDoh, async () => {
-    const ws = await openWs(baseEnv());
+    const ws = await openWs(altEnv());
     await ws.emit('message', { data: vlessReq('batch.example', 443, TLS_HELLO).buffer });
     await until(() => log.some(s => s.written.length));
     const sock = log.find(s => s.written.length);
@@ -271,7 +274,7 @@ test('WebSocket 不协商压缩：101 响应给出不含 permessage-deflate 的�
 test('非 TLS 首包（如 Telegram MTProto）只走直连，不送进 SNI 型反代', async () => {
   const log = fakeNet({ 'tg.example': { delay: 30 }, '203.0.113.10': { delay: 5 }, '203.0.113.20': { delay: 5 } });
   await withFetch(relayDoh, async () => {
-    const ws = await openWs(baseEnv());
+    const ws = await openWs(altEnv());
     await ws.emit('message', { data: vlessReq('tg.example', 443, [0xef, 0xef, 0xef, 0xef]).buffer });
     await until(() => log.some(s => s.written.length));
     assert.deepEqual(log.map(s => s.hostname), ['tg.example']);
@@ -281,7 +284,7 @@ test('非 TLS 首包（如 Telegram MTProto）只走直连，不送进 SNI 型�
 test('VLESS 响应头在头部解析后立即下发；头部与首包分帧到达时等待首包判定（不超过 80ms）', async () => {
   const log = fakeNet({ 'split.example': { delay: 10 } });
   await withFetch(relayDoh, async () => {
-    const ws = await openWs(baseEnv());
+    const ws = await openWs(altEnv());
     await ws.emit('message', { data: vlessReq('split.example', 443).buffer });   // 只有头部
     assert.deepEqual(ws.sent.map(x => [...x]), [[0, 0]], '收到头部即回响应头，早于建连');
     assert.equal(log.length, 0, '首包未到：暂不建连');
@@ -296,7 +299,7 @@ test('WS 0-RTT：Sec-WebSocket-Protocol 中的早数据在握手阶段即建连�
   const log = fakeNet({ 'early.example': { delay: 10 } });
   const b64url = (u8) => Buffer.from(u8).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   await withFetch(relayDoh, async () => {
-    const ws = await openWs(baseEnv(), { 'Sec-WebSocket-Protocol': b64url(vlessReq('early.example', 443, TLS_HELLO)) });
+    const ws = await openWs(quietEnv(), { 'Sec-WebSocket-Protocol': b64url(vlessReq('early.example', 443, TLS_HELLO)) });
     await until(() => log.some(s => s.written.length));
     assert.deepEqual([...log[0].written[0]], TLS_HELLO, '未收到任何 WS 数据帧即已转发首包');
     assert.deepEqual(ws.sent.map(x => [...x]), [[0, 0]]);
@@ -306,7 +309,7 @@ test('WS 0-RTT：Sec-WebSocket-Protocol 中的早数据在握手阶段即建连�
     const other = vlessReq('early.example', 443, TLS_HELLO); other[1] ^= 0xff;
     for (const proto of ['binary', b64url(other)]) {
       const n = log.length;
-      const w2 = await openWs(baseEnv(), { 'Sec-WebSocket-Protocol': proto });
+      const w2 = await openWs(quietEnv(), { 'Sec-WebSocket-Protocol': proto });
       await new Promise(r => setTimeout(r, 30));
       assert.equal(log.length, n, proto);
       assert.equal(w2.closed, null);
@@ -360,7 +363,7 @@ test('协议头：地址被截断时等待后续分片（不按错误地址建�
     // 域名只到一半：旧实现会把截断的域名当目标
     const full = vlessReq('split.example', 443, TLS_HELLO);
     const cut = full.length - TLS_HELLO.length - 5;
-    const ws = await openWs(baseEnv());
+    const ws = await openWs(altEnv());
     await ws.emit('message', { data: full.slice(0, cut).buffer });
     await new Promise(r => setTimeout(r, 30));
     assert.equal(log.length, 0);
@@ -370,7 +373,7 @@ test('协议头：地址被截断时等待后续分片（不按错误地址建�
     assert.equal(log[0].hostname, 'split.example');
     // VLESS MUX（cmd=3）
     const mux = vlessReq('x.example', 443, TLS_HELLO); mux[1 + 16 + 1] = 3;
-    const w2 = await openWs(baseEnv());
+    const w2 = await openWs(altEnv());
     await w2.emit('message', { data: mux.buffer });
     assert.equal(w2.closed.code, 1011);
     assert.match(w2.closed.reason, /不支持的命令/);
@@ -378,7 +381,7 @@ test('协议头：地址被截断时等待后续分片（不按错误地址建�
     const hex = createHash('sha224').update(UUID).digest('hex');
     const trojan = new Uint8Array([...Buffer.from(hex + '\r\n'), 1, 3, 9, ...Buffer.from('x.example'), 1, 187, 13, 10, ...TLS_HELLO]);
     const n = log.length;
-    const w3 = await openWs(baseEnv());
+    const w3 = await openWs(altEnv());
     await w3.emit('message', { data: trojan.buffer });
     assert.equal(w3.closed.code, 1011);
     assert.equal(log.length, n);
@@ -399,7 +402,7 @@ test('WebSocket 关闭原因按字节截断（含中文的长错误信息不会�
 
 test('XHTTP：首个请求体块短于 VLESS 头部时累积后再解析', async () => {
   const log = fakeNet({ 'xh.example': { delay: 5 } });
-  const env = baseEnv();
+  const env = quietEnv();
   const full = vlessReq('xh.example', 443, TLS_HELLO);
   const body = new ReadableStream({ async start(c) {
     c.enqueue(full.slice(0, 7)); await new Promise(r => setTimeout(r, 10));
@@ -434,7 +437,7 @@ const connectVia = async (env, host) => {
 test('反代 / 落地域名解析：每种记录只发 1 个 DoH 请求（Cloudflare 优先）；结果缓存复用，但不跨请求共享进行中的解析', async () => {
   const log = fakeNet({ '198.51.100.5': { delay: 5 } });
   const dns = [];
-  const env = baseEnv({ set: { edgeIP: 'dedupe.example.com' } });
+  const env = altEnv({ set: { edgeIP: 'dedupe.example.com' } });
   await withFetch(dohStub({ 'cloudflare-dns.com': { delay: 40, answers: { 'dedupe.example.com|A': ['198.51.100.5'] } } }, dns), async () => {
     const sockets = [];
     for (let i = 0; i < 4; i++) sockets.push(await openWs(env));
@@ -456,14 +459,14 @@ test('反代域名解析：首选 DoH 失败时才换下一个端点；全部失
   fakeNet({ '198.51.100.6': { delay: 5 }, 'neg.example.com': { delay: 5 } });
   // 首选端点 500 → 第二个端点接手，第三个不被访问
   let dns = [];
-  let env = baseEnv({ set: { edgeIP: 'fallback.example.com' } });
+  let env = altEnv({ set: { edgeIP: 'fallback.example.com' } });
   await withFetch(dohStub({ 'dns.alidns.com': { answers: { 'fallback.example.com|A': ['198.51.100.6'] } } }, dns), () => connectVia(env, 't.example'));
   let hosts = dns.filter(d => d.name === 'fallback.example.com').map(d => d.host);
   assert.deepEqual([...new Set(hosts)].sort(), ['cloudflare-dns.com', 'dns.alidns.com']);
   assert.ok(!hosts.includes('doh.pub'));
   // 全部失败：第一次尝试所有端点，第二次连接直接用缓存的「无结果」
   dns = [];
-  env = baseEnv({ set: { edgeIP: 'neg.example.com' } });
+  env = altEnv({ set: { edgeIP: 'neg.example.com' } });
   await withFetch(dohStub({}, dns), () => connectVia(env, 't.example'));
   const first = dns.filter(d => d.name === 'neg.example.com').length;
   assert.ok(first >= 6, `第一次查询了所有端点（${first}）`);
@@ -478,7 +481,7 @@ test('UDP DNS（VLESS UDP 53）转 DoH：Cloudflare 优先，失败才换端点'
   const run = async (table) => {
     const dns = [];
     await withFetch(dohStub(table, dns), async () => {
-      const ws = await openWs(baseEnv());
+      const ws = await openWs(altEnv());
       await ws.emit('message', { data: req().buffer });
       assert.equal(ws.sent.length, 1, 'DNS 应答');
       const resp = ws.sent[0];
@@ -576,21 +579,24 @@ const cfDoh = (map, log = []) => async (url) => {   // 简易 DoH：map[域名] 
   return new Response(JSON.stringify({ Status: 0, Answer: ips.map(data => ({ type: 1, data })) }));
 };
 
-test('备用线路计划：auto 按机房选最近的地区；按 altPick 的顺序取前 3 个不重复的线路，第一条取 2 个 IP，其余各 1 个；表里没有的标签跳过；altPick 为空 = 不使用', () => {
+test('备用线路计划：auto = 按机房选最近的地区、再依次补它相邻的地区；按 altPick 的顺序取前 3 个不重复的线路，第一条取 2 个 IP，其余各 1 个；表里没有的标签跳过；altPick 为空 = 不使用', () => {
   const plan = (st, colo) => internals.altPlan(st, colo).map(p => `${p.host}:${p.port}x${p.take}`);
   const R = (r) => REGION_TABLE[r].host;
-  const def = { altTable: REGION_TABLE, altPick: ['auto', 'HK', 'US'] };
-  assert.deepEqual(plan(def, 'NRT'), [`${R('JP')}:443x2`, `${R('HK')}:443x1`, `${R('US')}:443x1`], '机房对应的地区 + HK + US');
-  assert.deepEqual(plan(def, 'HKG'), [`${R('HK')}:443x2`, `${R('US')}:443x1`], 'auto 与 HK 重复：只留一个');
-  assert.deepEqual(plan(def, 'LAX'), [`${R('US')}:443x2`, `${R('HK')}:443x1`], '北美机房（表里没有的机房一律按 US）');
-  assert.deepEqual(plan(def, undefined), [`${R('US')}:443x2`, `${R('HK')}:443x1`]);
+  const def = { altTable: REGION_TABLE, altPick: ['auto'] };
+  assert.deepEqual(plan(def, 'NRT'), [`${R('JP')}:443x2`, `${R('SG')}:443x1`, `${R('KR')}:443x1`], '日本机房：JP + 相邻的 SG、KR');
+  assert.deepEqual(plan(def, 'HKG'), [`${R('HK')}:443x2`, `${R('SG')}:443x1`, `${R('JP')}:443x1`]);
+  assert.deepEqual(plan(def, 'FRA'), [`${R('DE')}:443x2`, `${R('NL')}:443x1`, `${R('GB')}:443x1`], '欧洲机房补欧洲的相邻地区，不会补到香港 / 美国');
+  assert.deepEqual(plan(def, 'LAX'), [`${R('US')}:443x2`, `${R('SG')}:443x1`, `${R('JP')}:443x1`], '表里没有的机房一律按 US');
+  assert.deepEqual(plan(def, undefined), [`${R('US')}:443x2`, `${R('SG')}:443x1`, `${R('JP')}:443x1`]);
+  assert.deepEqual(plan({ ...def, altPick: ['auto', 'HK'] }, 'NRT'), [`${R('JP')}:443x2`, `${R('SG')}:443x1`, `${R('KR')}:443x1`], '最多 3 条');
+  assert.deepEqual(plan({ ...def, altPick: ['HK', 'auto'] }, 'NRT'), [`${R('HK')}:443x2`, `${R('JP')}:443x1`, `${R('SG')}:443x1`], '固定的排前面，auto 的补在后面，重复的跳过');
+  assert.deepEqual(plan({ altTable: { JP: { host: 'jp.example.com' }, KR: { host: 'kr.example.com' } }, altPick: ['auto'] }, 'NRT'), ['jp.example.com:443x2', 'kr.example.com:443x1'], '相邻地区不在表里就跳过');
   assert.deepEqual(plan({ ...def, altPick: ['DE', 'NL'] }, 'NRT'), [`${R('DE')}:443x2`, `${R('NL')}:443x1`], '固定顺序不受机房影响');
   assert.deepEqual(plan({ ...def, altPick: ['DE', 'nope', 'DE', 'SE'] }, 'NRT'), [`${R('DE')}:443x2`, `${R('SE')}:443x1`], '表里没有的标签与重复的线路被跳过');
   const mine = { altTable: { a: { host: 'a.example.com' }, b: { host: 'b.example.com', port: 8443 }, c: { host: '203.0.113.9' }, d: { host: 'd.example.com' }, same: { host: 'a.example.com' } }, altPick: ['a', 'same', 'b', 'c', 'd'] };
   assert.deepEqual(plan(mine, 'NRT'), ['a.example.com:443x2', 'b.example.com:8443x1', '203.0.113.9:443x1'], '最多 3 条，同一条线路不重复');
   assert.deepEqual(plan({ ...def, altPick: [] }, 'NRT'), []);
-  assert.deepEqual(plan({ altTable: {}, altPick: ['auto', 'HK'] }, 'NRT'), [], '线路表是空的：没有备用线路');
-  // 机房 → 地区
+  assert.deepEqual(plan({ altTable: {}, altPick: ['auto'] }, 'NRT'), [], '线路表是空的：没有备用线路');
   for (const [colo, region] of [['HKG', 'HK'], ['sin', 'SG'], ['NRT', 'JP'], ['KIX', 'JP'], ['ICN', 'KR'], ['FRA', 'DE'], ['CDG', 'DE'], ['ARN', 'SE'], ['AMS', 'NL'], ['HEL', 'FI'], ['LHR', 'GB'], ['LAX', 'US'], ['SJC', 'US'], ['', 'US'], [undefined, 'US']]) {
     assert.equal(internals.selectAltRegion(colo), region, String(colo));
   }
@@ -600,7 +606,7 @@ test('备用线路：altPick 为空时不解析也不连接任何线路；自定
   // 空：目标直连失败后不尝试任何备用线路，连接被关闭
   let log = fakeNet({});
   let dns = [];
-  let env = baseEnv({ set: { altPick: [] } });
+  let env = altEnv({ set: { altPick: [] } });
   await withFetch(cfDoh({}, dns), async () => {
     const ws = await openWs(env);
     await ws.emit('message', { data: vlessReq('off-test.example', 443, TLS_HELLO).buffer });
@@ -611,7 +617,7 @@ test('备用线路：altPick 为空时不解析也不连接任何线路；自定
   // 自定义线路：直连挂起（目标在 Cloudflare 上）→ 自己的线路接管，地区线路不被碰
   log = fakeNet({ 'cf-custom.example': { delay: 'hang' }, '203.0.113.31': { delay: 10 }, '203.0.113.30': { delay: 40 } });
   dns = [];
-  env = baseEnv({ set: { altTable: { mine: { host: 'my-alt.example.com' }, ip: { host: '203.0.113.30', port: 8443 } }, altPick: ['mine', 'ip'] } });
+  env = altEnv({ set: { altTable: { mine: { host: 'my-alt.example.com' }, ip: { host: '203.0.113.30', port: 8443 } }, altPick: ['mine', 'ip'] } });
   await withFetch(cfDoh({ 'my-alt.example.com': ['203.0.113.31'] }, dns), async () => {
     const ws = await openWs(env);
     await ws.emit('message', { data: vlessReq('cf-custom.example', 443, TLS_HELLO).buffer });
@@ -625,7 +631,7 @@ test('备用线路：altPick 为空时不解析也不连接任何线路；自定
   // 固定地区：只用 SE → 只解析 SE
   log = fakeNet({ 'cf-se.example': { delay: 'hang' }, '203.0.113.50': { delay: 10 } });
   dns = [];
-  env = baseEnv({ set: { altPick: ['SE'] } });
+  env = altEnv({ set: { altPick: ['SE'] } });
   await withFetch(cfDoh({ 'proxyip.se.cmliussss.net': ['203.0.113.50'] }, dns), async () => {
     const ws = await openWs(env);
     await ws.emit('message', { data: vlessReq('cf-se.example', 443, TLS_HELLO).buffer });
@@ -640,7 +646,7 @@ const xhttpPost = (env, path, body) => worker.fetch(new Request(`https://node.ex
 
 test('XHTTP：Xray 风格请求（路径带结尾 / 与 x_padding 查询串）被接受，响应以 VLESS 响应头开始并转发上行数据', async () => {
   const log = fakeNet({ 'slash.example': { delay: 5 } });
-  const env = baseEnv();
+  const env = quietEnv();
   const res = await xhttpPost(env, `/${UUID}/?x_padding=${'x'.repeat(300)}`, vlessReq('slash.example', 443, TLS_HELLO));
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('cache-control'), 'no-store');
@@ -660,7 +666,7 @@ test('XHTTP 下行有背压：客户端不读取时不会无限缓冲目标连�
     readable: new ReadableStream({ pull(c) { pulls++; c.enqueue(new Uint8Array(64 * 1024)); } }),   // 目标不停地发数据
     close() { closed = true; },
   });
-  const env = baseEnv();
+  const env = quietEnv();
   const body = new ReadableStream({ start(c) { c.enqueue(vlessReq('bp.example', 443, TLS_HELLO)); } });   // 请求体保持打开
   const res = await xhttpPost(env, `/${UUID}`, body);
   const reader = res.body.getReader();
@@ -669,6 +675,7 @@ test('XHTTP 下行有背压：客户端不读取时不会无限缓冲目标连�
   await new Promise(r => setTimeout(r, 100));   // 客户端停止读取
   assert.ok(pulls <= 10, `目标连接被读取了 ${pulls} 次（无背压时会一直增长）`);
   await reader.cancel();
+  await until(() => closed);
   assert.equal(closed, true, '客户端断开后关闭目标连接');
 });
 
@@ -681,7 +688,7 @@ test('WS：客户端在握手 / 等首包 / 建连期间断开时，服务端 We
   await ws.emit('close', { code: 1000 });
   assert.ok(ws.closed, '服务端 WebSocket 已关闭，没有悬挂');
   await new Promise(r => setTimeout(r, 120));   // 超过首包等待：不得再建立出站连接
-  assert.equal(log.length, 0);
+  assert.equal(log.filter(s => s.hostname === 'half.example').length, 0);   // （其它测试遗留的连接可能还在重试，只看这个目标）
   // 2) 建连过程中断开：连接建好后立即释放
   log = fakeNet({ 'slow.example': { delay: 80 } });
   ws = await openWs(baseEnv());
@@ -701,13 +708,206 @@ test('WS：客户端在握手 / 等首包 / 建连期间断开时，服务端 We
 
 test('WS：同一帧内一次性到达的大量数据帧（建连完成前）按序、完整地转发', async () => {
   const log = fakeNet({ 'burst.example': { delay: 30 } });
-  const ws = await openWs(baseEnv());
+  const ws = await openWs(quietEnv());
   const frames = Array.from({ length: 300 }, (_, i) => new Uint8Array(500).fill(i & 255));
   ws.emit('message', { data: vlessReq('burst.example', 443).buffer });            // 先只有头部
   for (const f of frames) ws.emit('message', { data: f.buffer.slice(0) });         // 连接建立前一口气到达
   await until(() => log[0] && log[0].written.reduce((n, w) => n + w.length, 0) >= 300 * 500);
   const got = Buffer.concat(log[0].written.map(w => Buffer.from(w)));
   assert.equal(Buffer.compare(got, Buffer.concat(frames.map(f => Buffer.from(f)))), 0);
+});
+
+// ---------------- 借鉴改进：https 出站代理走 TLS、首包看门狗、上行队列、XHTTP 响应头 ----------------
+// 把首包看门狗的 3.5 秒等待缩短到 40 毫秒（只影响这一个定时器）
+const fastWatchdog = async (fn) => {
+  const real = globalThis.setTimeout;
+  globalThis.setTimeout = (f, ms, ...a) => real(f, ms === 3500 ? 40 : ms, ...a);
+  try { return await fn(); } finally { globalThis.setTimeout = real; }
+};
+const sendTls = async (ws, host) => ws.emit('message', { data: vlessReq(host, 443, TLS_HELLO).buffer });
+const hostLog = (log, host) => log.filter(x => x.hostname === host);
+
+test('https 出站代理先与代理建立 TLS（secureTransport），再在 TLS 里发 CONNECT；http / socks5 出站代理不带 TLS 选项', async () => {
+  const feed = async (sock, bytes) => { await until(() => sock.push); sock.push(new Uint8Array(bytes)); };
+  let log = fakeNet({ '10.0.1.1': { delay: 5 } });
+  let ws = await openWs(baseEnv({ set: { hop: { type: 'https', host: '10.0.1.1', port: 443 }, hopMode: 'only' } }));
+  ws.emit('message', { data: vlessReq('hop-tls.example', 443, TLS_HELLO).buffer });
+  await until(() => log.length && log[0].written.length);
+  assert.deepEqual(log[0].opts, { secureTransport: 'on', allowHalfOpen: false });
+  assert.match(Buffer.from(log[0].written[0]).toString(), /^CONNECT hop-tls\.example:443 HTTP\/1\.1\r\n/);
+  for (const hop of [{ type: 'http', host: '10.0.1.2', port: 8080 }, { type: 'socks5', host: '10.0.1.3', port: 1080 }]) {
+    log = fakeNet({ [hop.host]: { delay: 5 } });
+    ws = await openWs(baseEnv({ set: { hop, hopMode: 'only' } }));
+    ws.emit('message', { data: vlessReq('hop-plain.example', 443, TLS_HELLO).buffer });
+    await until(() => log.length && log[0].written.length);
+    assert.equal(log[0].opts, undefined, hop.type);
+  }
+  void feed;
+});
+
+test('首包看门狗（WS）：直连接通但目标不回数据 → 换备用线路并重发同一份首包；直连有数据 / 非 TLS / 没有备用线路时不重试；备用线路也不通时继续等慢的直连', async () => {
+  await fastWatchdog(async () => {
+    const TLS_REPLY = new Uint8Array([22, 3, 3, 0, 4, 9, 9, 9, 9]);
+    // 1) 直连静默 → 备用线路接管，首包原样重发，之后双向数据走新连接
+    let log = fakeNet({ 'silent.example': { delay: 5 }, '203.0.113.10': { delay: 5 }, '203.0.113.20': { delay: 5 } });
+    await withFetch(relayDoh, async () => {
+      const ws = await openWs(altEnv());
+      sendTls(ws, 'silent.example');
+      await until(() => hostLog(log, '203.0.113.10').some(x => x.written.length));
+      const alt = hostLog(log, '203.0.113.10').find(x => x.written.length);
+      assert.deepEqual([...alt.written[0]], TLS_HELLO, '同一份首包原样重发给备用线路');
+      assert.equal(hostLog(log, 'silent.example')[0].closedByUs, true, '静默的直连被关闭');
+      ws.emit('message', { data: new Uint8Array([7, 7]).buffer });   // 之后的上行数据走新连接
+      await until(() => alt.written.length >= 2);
+      alt.push(TLS_REPLY);
+      await until(() => ws.sent.some(m => m.byteLength === TLS_REPLY.byteLength));
+    });
+    // 2) 直连接通后没回数据就关闭 → 立即重试（不等超时）
+    log = fakeNet({ 'closing.example': { delay: 5 }, '203.0.113.10': { delay: 5 }, '203.0.113.20': { delay: 5 } });
+    await withFetch(relayDoh, async () => {
+      const ws = await openWs(altEnv());
+      sendTls(ws, 'closing.example');
+      await until(() => hostLog(log, 'closing.example')[0] && hostLog(log, 'closing.example')[0].end);
+      hostLog(log, 'closing.example')[0].end();
+      await until(() => hostLog(log, '203.0.113.10').some(x => x.written.length));
+    });
+    // 3) 直连有数据：不重试，备用线路连接被释放
+    log = fakeNet({ 'chatty.example': { delay: 5 }, '203.0.113.10': { delay: 5 }, '203.0.113.20': { delay: 5 } });
+    await withFetch(relayDoh, async () => {
+      const ws = await openWs(altEnv());
+      sendTls(ws, 'chatty.example');
+      await until(() => hostLog(log, 'chatty.example')[0] && hostLog(log, 'chatty.example')[0].push);
+      hostLog(log, 'chatty.example')[0].push(TLS_REPLY);
+      await until(() => ws.sent.some(m => m.byteLength === TLS_REPLY.byteLength));
+      await new Promise(r => setTimeout(r, 120));
+      assert.equal(log.filter(x => x.written.length && x.hostname.startsWith('203.')).length, 0, '没有向备用线路重发任何东西');
+    });
+    // 4) 非 TLS 首包：不启用看门狗（SNI 型备用线路本来就不接非 TLS）
+    log = fakeNet({ 'plain.example': { delay: 5 }, '203.0.113.10': { delay: 5 } });
+    await withFetch(relayDoh, async () => {
+      const ws = await openWs(altEnv());
+      ws.emit('message', { data: vlessReq('plain.example', 80, [71, 69, 84, 32, 47]).buffer });   // "GET /"
+      await until(() => hostLog(log, 'plain.example')[0] && hostLog(log, 'plain.example')[0].written.length);
+      await new Promise(r => setTimeout(r, 120));
+      assert.equal(hostLog(log, 'plain.example')[0].closedByUs, false);
+      assert.equal(log.filter(x => x.hostname.startsWith('203.') && x.written.length).length, 0);
+    });
+    // 5) 没有备用线路：静默的直连保持原样（不关闭、不重试）
+    log = fakeNet({ 'quiet.example': { delay: 5 } });
+    const wsq = await openWs(baseEnv());
+    sendTls(wsq, 'quiet.example');
+    await until(() => hostLog(log, 'quiet.example')[0] && hostLog(log, 'quiet.example')[0].written.length);
+    await new Promise(r => setTimeout(r, 120));
+    assert.equal(hostLog(log, 'quiet.example')[0].closedByUs, false);
+    // 6) 备用线路也连不上：慢的直连不被放弃，数据来了照常转发
+    log = fakeNet({ 'slowpoke.example': { delay: 5 } });   // 203.* 都不在网络表里 = 连接失败
+    await withFetch(relayDoh, async () => {
+      const ws = await openWs(altEnv());
+      sendTls(ws, 'slowpoke.example');
+      await until(() => hostLog(log, 'slowpoke.example')[0] && hostLog(log, 'slowpoke.example')[0].push);
+      await new Promise(r => setTimeout(r, 200));   // 超过看门狗等待，备用线路已经失败
+      assert.equal(hostLog(log, 'slowpoke.example')[0].closedByUs, false);
+      hostLog(log, 'slowpoke.example')[0].push(TLS_REPLY);
+      await until(() => ws.sent.some(m => m.byteLength === TLS_REPLY.byteLength));
+    });
+    // 7) 客户端等待期间走了：不再建立备用线路连接
+    log = fakeNet({ 'gone.example': { delay: 5 }, '203.0.113.10': { delay: 5 } });
+    await withFetch(relayDoh, async () => {
+      const ws = await openWs(altEnv());
+      sendTls(ws, 'gone.example');
+      await until(() => hostLog(log, 'gone.example')[0] && hostLog(log, 'gone.example')[0].written.length);
+      await ws.emit('close', { code: 1000 });
+      await new Promise(r => setTimeout(r, 150));
+      assert.equal(log.filter(x => x.hostname.startsWith('203.') && x.written.length).length, 0);
+    });
+  });
+});
+
+test('首包看门狗（XHTTP）：直连静默时换备用线路，响应里是备用线路的数据；直连有数据时数据面不变', async () => {
+  await fastWatchdog(async () => {
+    const TLS_REPLY = new Uint8Array([22, 3, 3, 0, 4, 5, 5, 5, 5]);
+    const readAll = async (res, n) => { const r = res.body.getReader(); let got = []; while (got.length < n) { const x = await r.read(); if (x.done) break; got.push(...x.value); } await r.cancel(); return got; };
+    let log = fakeNet({ 'xsilent.example': { delay: 5 }, '203.0.113.10': { delay: 5 }, '203.0.113.20': { delay: 5 } });
+    await withFetch(relayDoh, async () => {
+      const resP = xhttpPost(altEnv(), `/${UUID}`, new ReadableStream({ start(c) { c.enqueue(vlessReq('xsilent.example', 443, TLS_HELLO)); } }));
+      await until(() => hostLog(log, '203.0.113.10').some(x => x.written.length));
+      const alt = hostLog(log, '203.0.113.10').find(x => x.written.length);
+      assert.deepEqual([...alt.written[0]], TLS_HELLO);
+      alt.push(TLS_REPLY);
+      const res = await resP;
+      assert.equal(res.status, 200);
+      assert.deepEqual(await readAll(res, 2 + TLS_REPLY.length), [0, 0, ...TLS_REPLY]);
+    });
+    log = fakeNet({ 'xchatty.example': { delay: 5 }, '203.0.113.10': { delay: 5 } });
+    await withFetch(relayDoh, async () => {
+      const resP = xhttpPost(altEnv(), `/${UUID}`, new ReadableStream({ start(c) { c.enqueue(vlessReq('xchatty.example', 443, TLS_HELLO)); } }));
+      await until(() => hostLog(log, 'xchatty.example')[0] && hostLog(log, 'xchatty.example')[0].push);
+      hostLog(log, 'xchatty.example')[0].push(TLS_REPLY);
+      assert.deepEqual(await readAll(await resP, 2 + TLS_REPLY.length), [0, 0, ...TLS_REPLY]);
+      assert.equal(log.filter(x => x.hostname.startsWith('203.') && x.written.length).length, 0);
+    });
+  });
+});
+
+test('上行队列（WS）：目标写得慢时客户端的小帧合并成不超过 16KB 的块写出，字节顺序完整；积压超过上限就断开而不是无限占内存', async () => {
+  // 目标的写入被卡住：释放前客户端发来的帧都在队列里
+  let release, writes = [];
+  const gate = new Promise(r => { release = r; });
+  globalThis.__connect = () => ({
+    opened: Promise.resolve(), close() {},
+    writable: new WritableStream({ async write(c) { writes.push(new Uint8Array(c)); if (writes.length === 1) await gate; } }),
+    readable: new ReadableStream({ type: 'bytes' }),
+  });
+  let ws = await openWs(baseEnv());
+  ws.emit('message', { data: vlessReq('up.example', 443, TLS_HELLO).buffer });   // 首包的写入被卡住，这个事件处理要等到释放后才结束：不能 await
+  await until(() => writes.length === 1);   // 首包已写出（并卡住）
+  const frames = Array.from({ length: 200 }, (_, i) => new Uint8Array(100).fill(i));
+  for (const f of frames) ws.emit('message', { data: f.buffer.slice(0) });
+  release();
+  await until(() => writes.slice(1).reduce((n, w) => n + w.length, 0) >= 200 * 100);
+  const rest = writes.slice(1);
+  assert.ok(rest.length <= 3, `合并后只写了 ${rest.length} 次`);
+  assert.ok(rest.every(w => w.length <= 16 * 1024), '每块不超过 16KB');
+  assert.equal(Buffer.compare(Buffer.concat(rest.map(w => Buffer.from(w))), Buffer.concat(frames.map(f => Buffer.from(f)))), 0, '字节顺序完整');
+  // 积压超限：写入一直卡住，客户端继续发 → 断开
+  writes = [];
+  globalThis.__connect = () => ({
+    opened: Promise.resolve(), close() {},
+    writable: new WritableStream({ write() { return new Promise(() => {}); } }),
+    readable: new ReadableStream({ type: 'bytes' }),
+  });
+  ws = await openWs(baseEnv());
+  ws.emit('message', { data: vlessReq('flood.example', 443, TLS_HELLO).buffer });
+  await new Promise(r => setTimeout(r, 30));
+  for (let i = 0; i < 20 && !ws.closed; i++) ws.emit('message', { data: new Uint8Array(32 * 1024).buffer });
+  await until(() => ws.closed);
+  assert.equal(ws.closed.code, 1011); assert.match(ws.closed.reason, /上行缓冲溢出/);
+});
+
+test('XHTTP 响应头：content-type 为 application/grpc，并带一条填充头（头名 = UUID 第 2–7 位，值是带 100–1000 个随机字符的 URL，参数名 = _ + UUID 第 26–31 位），每次长度随机', async () => {
+  fakeNet({ 'hdr.example': { delay: 5 } });
+  const env = baseEnv();
+  const lens = new Set();
+  for (let i = 0; i < 6; i++) {
+    const res = await xhttpPost(env, `/${UUID}`, vlessReq('hdr.example', 443, TLS_HELLO));
+    assert.equal(res.headers.get('content-type'), 'application/grpc');
+    assert.equal(res.headers.get('cache-control'), 'no-store'); assert.equal(res.headers.get('x-accel-buffering'), 'no');
+    const v = res.headers.get(UUID.slice(1, 7));
+    const m = v.match(/^https:\/\/node\.example\.com\/\?_([0-9a-f]{6})=([0-9A-Za-z]+)$/);
+    assert.ok(m, v.slice(0, 60));
+    assert.equal(m[1], UUID.slice(25, 31));
+    assert.ok(m[2].length >= 100 && m[2].length <= 1000, String(m[2].length));
+    lens.add(m[2].length);
+    await res.body.cancel();
+  }
+  assert.ok(lens.size > 1, '长度是随机的');
+  // 宽限期里的旧 UUID 也用它自己的填充头名
+  const OLD = 'bbbbbbbb-2222-4333-8444-555555555555';
+  const env2 = baseEnv({ set: { uuids: [[UUID, 0], [OLD, Date.now() + 600000]] } });
+  const req = vlessReq('hdr.example', 443, TLS_HELLO); req.set(OLD.replace(/-/g, '').match(/../g).map(h => parseInt(h, 16)), 1);
+  const res = await xhttpPost(env2, `/${UUID}`, req);
+  assert.ok(res.headers.get(OLD.slice(1, 7)), '头名跟着匹配到的 UUID');
+  await res.body.cancel();
 });
 
 // ---------------- 代理配置（环境变量只有 PATH 与 NODE_KEY）与路由 ----------------
@@ -745,7 +945,7 @@ test('必填环境变量：PATH / NODE_KEY 缺失或非法时所有请求返回 
 
 test('路由：只有节点路径上的 WebSocket / XHTTP 进入代理，其余一律是 Hello World 伪装页（没有面板、登录、订阅与管理接口）', async () => {
   fakeNet({ 'route.example': { delay: 5 } });
-  const env = baseEnv({ PATH: 'mynode' });
+  const env = quietEnv({ PATH: 'mynode' });
   const hello = async (path, init) => {
     const res = await worker.fetch(new Request('https://node.example.com' + path, init), env, {});
     assert.equal(res.status, 200, path);
@@ -769,7 +969,7 @@ test('路由：只有节点路径上的 WebSocket / XHTTP 进入代理，其余�
   const ws = await worker.fetch(new Request('https://node.example.com/mynode/', { headers: { Upgrade: 'websocket' } }), env, {});
   assert.equal(ws.status, 101);
   const post = await xhttpPost(env, '/mynode', vlessReq('route.example', 443, TLS_HELLO));
-  assert.equal(post.headers.get('content-type'), 'application/octet-stream');
+  assert.equal(post.headers.get('content-type'), 'application/grpc');
 });
 
 test('构建产物：代理脚本不含面板 / 登录 / 订阅 / 面板 KV / 更新检测的代码，没有 Shadowsocks 与内置的第三方线路域名，也不导出任何 RPC 入口', () => {
@@ -948,7 +1148,7 @@ test('更换 UUID 的宽限期：状态里带失效时间的旧 UUID 在期内�
 
 test('停用：面板下发 enabled:false 后代理对外只显示 Hello World（WebSocket / XHTTP 都不进入），控制接口不受影响；启用后恢复', async () => {
   const kv = memKv({ state: stateWith() });
-  const env = baseEnv({ PATH: 'mynode', NODE_KV: kv });
+  const env = quietEnv({ PATH: 'mynode', NODE_KV: kv });
   const log = fakeNet({ 'off.example': { delay: 5 } });
   const wsReq = () => worker.fetch(new Request('https://node.example.com/mynode', { headers: { Upgrade: 'websocket' } }), env, {});
   assert.equal((await wsReq()).status, 101);
@@ -962,7 +1162,7 @@ test('停用：面板下发 enabled:false 后代理对外只显示 Hello World�
   assert.equal((await call(env, 'setState', JSON.stringify(stateWith()))).ok, true);
   assert.equal((await wsReq()).status, 101);
   const post = await xhttpPost(env, '/mynode', vlessReq('off.example', 443, TLS_HELLO));
-  assert.equal(post.headers.get('content-type'), 'application/octet-stream');
+  assert.equal(post.headers.get('content-type'), 'application/grpc');
 });
 
 test('KV 状态：损坏的内容被忽略（视为未下发，节点只显示 Hello World）并可被重新下发覆盖；读取失败时沿用上次读到的状态，写入失败明确报错', async () => {
@@ -1012,7 +1212,7 @@ test('混淆版代理脚本：只导出默认入口，控制接口、状态下�
 
 test('面板下发的状态真正生效：节点路径上的连接按状态出站；KV 读取有缓存、伪装页请求不读 KV；KV 故障时沿用上次的状态', async () => {
   const kv = memKv({ state: stateWith({ altPick: [] }) });
-  const env = baseEnv({ NODE_KV: kv });
+  const env = altEnv({ NODE_KV: kv });
   const realNow = Date.now;
   let t = realNow();
   Date.now = () => t;
@@ -1056,7 +1256,7 @@ test('面板下发的状态真正生效：节点路径上的连接按状态出�
   } finally { Date.now = realNow; }
   // 通过控制接口下发后，同一 isolate 立即生效（不等缓存过期）
   const kv2 = memKv({ state: stateWith() });
-  const env2 = baseEnv({ NODE_KV: kv2 });
+  const env2 = altEnv({ NODE_KV: kv2 });
   fakeNet({});
   const dns2 = [];
   await withFetch(cfDoh({}, dns2), async () => {

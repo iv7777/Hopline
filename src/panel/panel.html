@@ -241,14 +241,14 @@
         <p class="hint" style="margin-top:0">直连不通（例如目标站同在 Cloudflare 上）时，代理会把 TLS 流量交给备用线路按 SNI 转发，并与直连并发竞速。线路是第三方服务器，能看到目标域名与连接元数据；不想经第三方时选「关闭」。非 TLS 流量不会走备用线路。线路表见下方。</p>
         <div class="field"><label>选用方式</label>
           <select id="rl-mode" onchange="onRelayMode()">
-            <option value="auto">自动（按 Worker 所在机房选最近的地区，再补 HK、US）</option>
+            <option value="auto">自动（按 Worker 所在机房选最近的地区，再依次补它相邻的地区）</option>
             <option value="custom">自定义顺序（只用我列出的线路标签）</option>
             <option value="off">关闭（只直连 / 出站代理）</option>
           </select>
         </div>
         <div class="field" id="rl-custom-box" style="margin-bottom:0">
           <label>线路标签（按优先顺序，逗号分隔，最多 8 个；auto = 按机房自动选最近地区；第一条取 2 个 IP，其余各取 1 个，最多用 3 条）</label>
-          <input type="text" id="rl-custom" placeholder="auto,HK,US" autocomplete="off">
+          <input type="text" id="rl-custom" placeholder="auto" autocomplete="off">
           <div class="hint" id="rl-tags"></div>
         </div>
       </div>

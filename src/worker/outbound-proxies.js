@@ -11,8 +11,8 @@ function withTimeout(promise, ms, msg) {
 
 // connect + opened 超时：CF 回环保护会静默丢弃对 CF 托管站点的 SYN（连接永远挂起），
 // 带超时快速失败，由 openUpstream 按序走下一出站方式（反代兜底），解决「延迟有、流量 0」
-async function connectWithTimeout(hostname, port, ms) {
-  const socket = connect({ hostname, port });
+async function connectWithTimeout(hostname, port, ms, opts) {
+  const socket = opts ? connect({ hostname, port }, opts) : connect({ hostname, port });
   try {
     await withTimeout(socket.opened, ms || 6000, '连接超时（SYN 被静默丢弃）');
   } catch (e) {
@@ -88,8 +88,8 @@ async function connectViaS5(hop, target) {
 
 // 通过 HTTP/HTTPS CONNECT 代理建立连接
 async function connectViaHtHop(hop, target) {
-  // 6s 超时快速失败：代理不可达时不能永久挂起
-  const socket = await connectWithTimeout(hop.host, hop.port, 6000);
+  // 6s 超时快速失败：代理不可达时不能永久挂起；https 类型的出站代理要先与它建立 TLS（secureTransport），再在 TLS 里发 CONNECT
+  const socket = await connectWithTimeout(hop.host, hop.port, 6000, hop.type === 'https' ? { secureTransport: 'on', allowHalfOpen: false } : undefined);
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   let authHeader = '';

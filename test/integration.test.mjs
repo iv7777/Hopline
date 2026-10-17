@@ -44,7 +44,8 @@ globalThis.__connect = ({ hostname, port }) => {
   connections.push(sock);
   sock.opened = Promise.resolve();
   sock.writable = new WritableStream({ write(c) { sock.written.push(new Uint8Array(c)); } });
-  sock.readable = new ReadableStream({ type: 'bytes' });
+  // 目标在连接后很快回一条 TLS 记录（首包看门狗要等到目标的首个数据；真实的目标都会先回数据）
+  sock.readable = new ReadableStream({ type: 'bytes', start(c) { setTimeout(() => { try { c.enqueue(new Uint8Array([22, 3, 3, 0, 1, 0])); } catch (e) { /* 已关闭 */ } }, 5); } });
   sock.close = () => {};
   return sock;
 };
@@ -126,7 +127,7 @@ test('面板添加代理（域名 / 节点路径 / 密钥）→ 自动生成 UUI
   assert.deepEqual([...c.written[0]], TLS);
   const xhRes = await proxy.fetch(new Request(`https://${PROXY_HOST}${xh.searchParams.get('path')}`, { method: 'POST', body: reqFor(uuid, 'target.example'), duplex: 'half' }), m.env, {});
   assert.equal(xhRes.status, 200);
-  assert.equal(xhRes.headers.get('content-type'), 'application/octet-stream');
+  assert.equal(xhRes.headers.get('content-type'), 'application/grpc');
   // 不认识别的 UUID，也不接受面板路径
   connections.length = 0;
   await connect('/' + PROXY_PATH); await lastServer.emit('message', { data: reqFor('0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d', 'other.example').buffer });
@@ -165,7 +166,7 @@ test('面板里改代理设置：保存在面板的代理记录里，整份下�
   const id = add.body.data.proxy.id, uuid = add.body.data.proxy.uuid;
   assert.equal(add.body.data.sync.status.inSync, true);
   const base = state(m);
-  assert.deepEqual(base.altPick, ['auto', 'HK', 'US'], '默认的备用线路选用方式');
+  assert.deepEqual(base.altPick, ['auto'], '默认的备用线路选用方式');
   assert.equal(Object.keys(base.altTable).length, 14, '备用线路表来自面板（纯文本的默认表）');
   // 把线路换成自己的，再关闭备用线路
   assert.equal((await api('alt-routes', { method: 'POST', body: JSON.stringify({ text: 'mine panel-set.example:8443\n' }) })).status, 200);
@@ -193,7 +194,7 @@ test('面板里改代理设置：保存在面板的代理记录里，整份下�
   // 恢复默认（面板里的「恢复默认」）
   const reset = await api(`proxies/${id}`, { method: 'POST', body: JSON.stringify({ edgeIP: '', hop: '', hopMode: '', altMode: 'auto', altCustom: '' }) });
   assert.equal(reset.status, 200);
-  assert.equal(state(m).edgeIP, ''); assert.deepEqual(state(m).altPick, ['auto', 'HK', 'US']);
+  assert.equal(state(m).edgeIP, ''); assert.deepEqual(state(m).altPick, ['auto']);
   // 代理上的 NODE_KEY 被改过：面板连不上，给出可读的原因
   m.env.NODE_KEY = 'changed-key-0123456789-abcdefghij';
   const lost = await api('proxy-status');
