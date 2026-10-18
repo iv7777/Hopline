@@ -1055,8 +1055,9 @@ async function handleWsProto(request, cfg) {
   // workerd 实测上传每 MB CPU：1KB 帧约 22ms → 13ms，4KB 以上与原来持平
   // 出站未就绪或上一次写入还没完成时不再续定时器（避免等待期间空转）：写入循环这时不会中途让出，会一直写到队列清空
   const onBurst = () => { burst = null; if (up.empty || closed || !writer || draining) return; burst = setTimeout(onBurst, 0); drain(); };
+  // 窗口内攒满一块（UP_BATCH）就立即写出，不等定时器：否则高速上传时一个定时器周期内就可能攒到队列上限（UP_MAX_BYTES）而断开
   const kick = () => {
-    if (burst) return;
+    if (burst) { if (up.bytes >= UP_BATCH) drain(); return; }
     if (writer) burst = setTimeout(onBurst, 0);
     drain();
   };

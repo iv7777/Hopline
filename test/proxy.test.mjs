@@ -967,6 +967,11 @@ test('上行合并（WS）：目标写得快时，陆续到达的小帧（每帧
   assert.ok(rest.length < 30, `60 个小帧写了 ${rest.length} 次`);
   assert.ok(rest.every(w => w.length <= 16 * 1024), '每块不超过 16KB');
   assert.equal(Buffer.compare(Buffer.concat(rest.map(w => Buffer.from(w))), Buffer.concat(frames.map(f => Buffer.from(f)))), 0, '字节顺序完整');
+  // 合并窗口内（定时器还没到点）持续涌入的小帧：攒满一块就写出，不会因为等定时器而撑爆队列（UP_MAX_BYTES = 256KB）
+  writes = [];
+  for (let i = 0; i < 400 && !ws.closed; i++) { ws.emit('message', { data: new Uint8Array(1024).fill(i & 255).buffer }); for (let k = 0; k < 5; k++) await Promise.resolve(); }
+  assert.equal(ws.closed, null, '没有因上行缓冲溢出而断开');
+  await until(() => writes.reduce((n, w) => n + w.length, 0) >= 400 * 1024);
   // 大帧（>= 4KB）不走合并：每帧到达即写出
   writes = [];
   for (let i = 0; i < 5; i++) { ws.emit('message', { data: new Uint8Array(8192).fill(i).buffer }); await until(() => writes.length === i + 1); }
