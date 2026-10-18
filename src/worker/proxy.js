@@ -35,12 +35,13 @@ function closeReason(msg) {
 
 // 上行队列（WebSocket 路径）：客户端的数据帧先入队，由单个写入循环合并成不超过 UP_BATCH 的块再写给目标；
 // 队列有上限（字节数与块数），客户端发得比目标收得快时超限就断开，而不是在内存里无限堆积
-const UP_MAX_BYTES = 256 * 1024, UP_MAX_COUNT = 2048, UP_BATCH = 16 * 1024;
+const UP_MAX_BYTES = 256 * 1024, UP_MAX_COUNT = 2048, UP_BATCH = 16 * 1024, UP_SMALL = 4 * 1024;
 function uplinkQueue() {
   const q = [];
   let bytes = 0;
   return {
     get empty() { return !q.length; },
+    get bytes() { return bytes; },
     push(chunk) {
       if (!chunk.byteLength) return true;
       if (bytes + chunk.byteLength > UP_MAX_BYTES || q.length >= UP_MAX_COUNT) return false;
@@ -113,7 +114,7 @@ async function handleWsProto(request, cfg) {
   let socket = null, writer = null, headerSent = false, pending = null, protoWait = null, respSent = false, dnsFeed = null;
   let authed = false;   // 请求头已通过校验（UUID 正确）：此前出错时关闭帧不带原因，探测请求看不到任何内部信息
   const up = uplinkQueue();
-  let draining = false;
+  let draining = false, burst = null;
   let closed = false, pumped = false, wsClosed = false;   // closed：WS 已关闭（之后建好的出站连接要立即释放）；pumped：已开始把目标数据转给客户端（由它负责在结束时关闭 WS）
 
   const send = (data) => { try { server.send(data); } catch (e) { /* 忽略 */ } };
@@ -124,9 +125,25 @@ async function handleWsProto(request, cfg) {
   const drain = async () => {
     if (draining || !writer) return;
     draining = true;
-    try { for (let c; writer && (c = up.take());) await writer.write(c); }
-    catch (err) { fail(err); }
+    try {
+      for (let c; writer && (c = up.take());) {
+        await writer.write(c);
+        if (burst && up.bytes < UP_BATCH) break;   // 合并窗口内：凑不满一块的留给定时器一起写（见下方 kick）
+      }
+    } catch (err) { fail(err); }
     finally { draining = false; }
+  };
+  // 上行合并：CPU 主要花在 socket 写入次数上（每次写入约 15µs，与块大小关系不大）。写入循环在每次写完后立刻取下一帧，
+  // 与帧的到达步调一致，几乎合并不到（workerd 实测 1KB 帧时 32000 帧 = 32000 次写入）。
+  // 改为：空闲时到达的帧立即写出（交互流量不加延迟），同时开一个 0ms 定时器；定时器到点前到达的帧留在队列里，到点后合并写出，
+  // 期间仍有数据就继续下一轮，没有就结束（下一帧又是立即写出）。只对小帧（< UP_SMALL）这样做：8KB 以上的帧合并后 CPU 不再下降，定时器反而多花一点。
+  // workerd 实测上传每 MB CPU：1KB 帧约 22ms → 13ms，4KB 以上与原来持平
+  // 出站未就绪或上一次写入还没完成时不再续定时器（避免等待期间空转）：写入循环这时不会中途让出，会一直写到队列清空
+  const onBurst = () => { burst = null; if (up.empty || closed || !writer || draining) return; burst = setTimeout(onBurst, 0); drain(); };
+  const kick = () => {
+    if (burst) return;
+    if (writer) burst = setTimeout(onBurst, 0);
+    drain();
   };
 
   // 首包处理：WS 数据帧与 0-RTT 早数据共用。headerSent 在任何 await 之前置位，
@@ -216,7 +233,7 @@ async function handleWsProto(request, cfg) {
       if (!headerSent) await handleFirstChunk(chunk);
       else if (dnsFeed) dnsFeed(chunk);
       // 头部之后的数据帧一律先入上行队列：出站未就绪时暂存（避免早期数据帧被丢弃 → TLS 握手不完整 → 连接通但流量为 0），就绪后合并写出
-      else { if (!up.push(chunk)) throw new Error('上行缓冲溢出'); drain(); }
+      else { if (!up.push(chunk)) throw new Error('上行缓冲溢出'); if (chunk.byteLength < UP_SMALL) kick(); else drain(); }
     } catch (err) { fail(err); }
   });
   // accept({ allowHalfOpen: true }) 下收到客户端的关闭帧不会自动回应：这里必须自己收尾。
@@ -225,6 +242,7 @@ async function handleWsProto(request, cfg) {
     closed = true;
     up.clear();
     if (protoWait) { clearTimeout(protoWait); protoWait = null; }
+    if (burst) { clearTimeout(burst); burst = null; }
     if (socket) { try { socket.close(); } catch (e) { /* 忽略 */ } socket = null; }
     if (!pumped) closeWs(1000);
   }

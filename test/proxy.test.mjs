@@ -950,6 +950,29 @@ test('上行队列（WS）：目标写得慢时客户端的小帧合并成不超
   assert.equal(ws.closed.code, 1011); assert.match(ws.closed.reason, /上行缓冲溢出/);
 });
 
+test('上行合并（WS）：目标写得快时，陆续到达的小帧（每帧之间写入都已完成）也合并写出，字节顺序完整；大帧照常逐帧写出', async () => {
+  let writes = [];
+  globalThis.__connect = () => ({
+    opened: Promise.resolve(), close() {},
+    writable: new WritableStream({ write(c) { writes.push(new Uint8Array(c)); } }),
+    readable: new ReadableStream({ type: 'bytes' }),
+  });
+  const ws = await openWs(baseEnv());
+  ws.emit('message', { data: vlessReq('fastup.example', 443, TLS_HELLO).buffer });
+  await until(() => writes.length === 1);
+  const frames = Array.from({ length: 60 }, (_, i) => new Uint8Array(1000).fill(i));
+  for (const f of frames) { ws.emit('message', { data: f.buffer.slice(0) }); await new Promise(r => setImmediate(r)); }
+  await until(() => writes.slice(1).reduce((n, w) => n + w.length, 0) >= 60 * 1000);
+  const rest = writes.slice(1);
+  assert.ok(rest.length < 30, `60 个小帧写了 ${rest.length} 次`);
+  assert.ok(rest.every(w => w.length <= 16 * 1024), '每块不超过 16KB');
+  assert.equal(Buffer.compare(Buffer.concat(rest.map(w => Buffer.from(w))), Buffer.concat(frames.map(f => Buffer.from(f)))), 0, '字节顺序完整');
+  // 大帧（>= 4KB）不走合并：每帧到达即写出
+  writes = [];
+  for (let i = 0; i < 5; i++) { ws.emit('message', { data: new Uint8Array(8192).fill(i).buffer }); await until(() => writes.length === i + 1); }
+  assert.equal(writes.length, 5);
+});
+
 test('XHTTP 响应头：content-type 为 application/grpc，并带一条填充头（头名 = UUID 第 2–7 位，值是带 100–1000 个随机字符的 URL，参数名 = _ + UUID 第 26–31 位），每次长度随机', async () => {
   fakeNet({ 'hdr.example': { delay: 5 } });
   const env = baseEnv();
