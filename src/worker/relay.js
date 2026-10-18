@@ -2,10 +2,15 @@
 // 出站兜底：直连与自定义反代均失败后使用，透明代理模式发送去掉 VLESS 头部的原始
 // TLS 数据，由对端按 SNI 路由到目标
 // ---------------------------------------------------------------------------
-// Worker 所在机房（IATA 代码）→ 最近的地区标签（表里没有的机房按 US）。地区标签对应面板下发的备用线路表里的标签
+// Worker 所在机房（IATA 代码）→ 最近的地区标签（表里没有的机房按 US，主要是美洲）。地区标签对应面板下发的备用线路表里的标签。
+// 台湾、澳门归 HK；东南亚、南亚、大洋洲归 SG（这些地方离新加坡比离美国近得多）；中东、非洲、南欧与东欧归 DE
 const COLO_REGIONS = {
-  HK: 'HKG', SG: 'SIN', JP: 'NRT KIX TYO OSA', KR: 'ICN SEL', SE: 'ARN', NL: 'AMS', FI: 'HEL', GB: 'LHR MAN',
-  DE: 'FRA BER MUC DUS HAM STR CDG MAD VIE ZRH MXP PRG WAW',
+  HK: 'HKG TPE KHH MFM',
+  SG: 'SIN KUL JHB PEN BKK CNX HKT CGK SUB DPS MNL CEB SGN HAN DAD PNH RGN VTE CMB MLE DAC KTM BOM DEL MAA BLR HYD CCU AMD NAG PAT KHI LHE ISB SYD MEL BNE PER ADL CBR HBA AKL CHC NOU',
+  JP: 'NRT KIX TYO OSA FUK OKA CTS GUM', KR: 'ICN SEL',
+  SE: 'ARN GOT OSL', NL: 'AMS BRU LUX', FI: 'HEL TLL RIX VNO', GB: 'LHR MAN EDI DUB ORK',
+  DE: 'FRA BER MUC DUS HAM STR CDG MRS LYS MAD BCN LIS VIE ZRH GVA MXP FCO PMO PRG WAW BUD BTS LJU ZAG BEG SOF OTP KBP KIV ATH SKG IST ADB CPH ' +
+    'TLV AMM BEY DXB AUH DOH BAH KWI MCT RUH JED DMM BGW EBL TBS EVN GYD CAI ALG TUN CMN LOS ACC ABJ DKR NBO DAR JNB CPT DUR MPM LAD KGL ADD',
 };
 const COLO_TO_REGION = new Map(Object.entries(COLO_REGIONS).flatMap(([r, codes]) => codes.split(' ').map(c => [c, r])));
 function selectAltRegion(colo) { return COLO_TO_REGION.get(String(colo || '').toUpperCase().slice(0, 3)) || 'US'; }
@@ -269,8 +274,9 @@ async function openUpstream(parsed, cfg, colo, payloadKind) {
   const attempt = async (fn) => { try { const r = await fn(); if (r) return r; } catch (e) { lastErr = e; } return null; };
   const fail = () => { throw lastErr || new Error('所有出站方式均失败'); };
 
-  // 1) 用户填写的「反代 / 落地 IP」：作为固定出口优先使用（多个解析结果并发竞速），失败再走下面的流程
-  const edge = cfg.edgeIP ? parseHostPort(cfg.edgeIP, 443) : null;
+  // 1) 用户填写的「反代 / 落地 IP」：作为固定出口优先使用（多个解析结果并发竞速），失败再走下面的流程。
+  //    出站模式为 only 且配置了出站代理时不用它：only 的意思是流量只从出站代理出去，落地 IP 会绕过出站代理
+  const edge = cfg.edgeIP && !(mode === 'only' && viaHop) ? parseHostPort(cfg.edgeIP, 443) : null;
   if (edge && edge.host && allowSniAlt) {
     let customTargets = await resolveEdgeIPs(edge.host, edge.port);
     if (!customTargets.length) customTargets = [{ hostname: edge.host, port: edge.port }];

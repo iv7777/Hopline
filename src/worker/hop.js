@@ -45,7 +45,8 @@ function parseHopInput(addr) {
     const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
     const idx = u.indexOf(':');
     if (idx >= 0) { user = dec(u.slice(0, idx)); pass = dec(u.slice(idx + 1)); } else user = dec(u);
-    if (user.length > 255 || pass.length > 255) return { error: '用户名或密码过长' };
+    // SOCKS5 用 1 个字节表示长度：按 UTF-8 字节数限制（中文等每个字占 3 个字节）
+    if (TE.encode(user).length > 255 || TE.encode(pass).length > 255) return { error: '用户名或密码过长（最多 255 个字节）' };
   }
   const { host, port } = parseHostPort(rest, type === 'http' ? 80 : type === 'https' ? 443 : 1080);
   if (!hostValid(host)) return { error: '无法解析出站代理地址（格式如 socks5://user:pass@1.2.3.4:1080）' };

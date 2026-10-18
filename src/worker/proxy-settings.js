@@ -12,6 +12,7 @@
 // 面板是唯一的写入方，所以没有读-改-写，也不需要合并：整份覆盖，重复下发无副作用。状态的短哈希（stateHash）随 status 返回，面板据此判断两边是否一致。
 // 没有 NODE_KV 时无处保存状态，代理无法被面板配置好，节点路径上只会返回伪装页。
 // 读取走 isolate 内存缓存（STATE_MEM_TTL）+ KV 边缘缓存，每个 isolate 约每 20 秒读一次 KV；只有节点路径上的连接才会触发。
+// 因此面板下发后，其它 isolate 最长约 1 分钟才用上新状态（换 UUID、停用都是这样）；控制接口的 status 不走内存缓存，如实回报 KV 里的内容。
 // KV 读取失败时沿用上一次读到的状态（从没读到过就视为未配置），绝不因此影响已有连接。
 const STATE_KEY = 'state';
 const STATE_MEM_TTL = 20 * 1000;
@@ -30,6 +31,9 @@ function nodeKv(env) {
 const okHost = (h) => typeof h === 'string' && h.length <= 253 && (isValidIp(h) || HOSTNAME_RE.test(h));
 const okPort = (p) => Number.isInteger(p) && p >= 1 && p <= 65535;
 const isObj = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
+// 出站代理的用户名 / 密码：要么都没有，要么都是字符串；SOCKS5 用 1 个字节表示长度，所以按 UTF-8 字节数限制在 255 以内
+const okCred = (s) => typeof s === 'string' && TE.encode(s).length <= 255;
+const okHopAuth = (h) => (h.user === undefined && h.pass === undefined) || (okCred(h.user) && okCred(h.pass));
 
 // 校验面板发来的状态：返回错误说明，没问题返回 ''（只做类型与长度检查，防止坏数据让代理出错；内容的友好校验在面板里做）
 function checkState(st) {
@@ -41,7 +45,7 @@ function checkState(st) {
   if (st.edgeIP) { const e = parseHostPort(st.edgeIP, 443); if (!okHost(e.host) || !okPort(e.port)) return 'edgeIP 不是有效的 host 或 host:port'; }
   if (st.hopMode !== '' && st.hopMode !== 'only') return 'hopMode 不正确';
   const h = st.hop;
-  if (h !== null && !(isObj(h) && ['socks5', 'http', 'https'].includes(h.type) && okHost(h.host) && okPort(h.port) && (h.user === undefined || (typeof h.user === 'string' && h.user.length <= 255)) && (h.pass === undefined || (typeof h.pass === 'string' && h.pass.length <= 255)))) return 'hop 不正确';
+  if (h !== null && !(isObj(h) && ['socks5', 'http', 'https'].includes(h.type) && okHost(h.host) && okPort(h.port) && okHopAuth(h))) return 'hop 不正确';
   if (!isObj(st.altTable) || Object.keys(st.altTable).length > 32) return 'altTable 不正确';
   for (const [tag, e] of Object.entries(st.altTable)) {
     if (!TAG_RE.test(tag) || !isObj(e) || !okHost(e.host) || (e.port !== undefined && !okPort(e.port)) || (e.txt !== undefined && typeof e.txt !== 'boolean')) return 'altTable 里的「' + tag.slice(0, 20) + '」不正确';
@@ -50,14 +54,16 @@ function checkState(st) {
   return '';
 }
 
-// 读 KV 里保存的状态：返回 { raw, state, error }（error：'' / 'unavailable' / 'corrupt'）；带 isolate 内存缓存
+// 读 KV 里保存的状态：返回 { raw, state, error }（error：'' / 'unavailable' / 'corrupt'）；带 isolate 内存缓存。
+// fresh：跳过内存缓存直接读 KV（控制接口的 status 用）——面板下发后紧接着查状态，这次请求可能落在另一个 isolate 上，
+// 它内存里还是旧状态；KV 在写入的同一机房里立即可见，直接读 KV 才能如实回报（读到的结果也顺便更新这个 isolate 的缓存）
 const STATE_MEM = new WeakMap();
-async function readNodeState(kv) {
+async function readNodeState(kv, fresh) {
   const now = Date.now(), hit = STATE_MEM.get(kv);
-  if (hit && now - hit.t < STATE_MEM_TTL) return hit;
+  if (!fresh && hit && now - hit.t < STATE_MEM_TTL) return hit;
   let entry;
   try {
-    const raw = await kv.get(STATE_KEY, { cacheTtl: 30 });
+    const raw = fresh ? await kv.get(STATE_KEY) : await kv.get(STATE_KEY, { cacheTtl: 30 });
     let state = emptyState(), error = '';
     if (raw) {
       try { const obj = JSON.parse(raw); if (checkState(obj)) throw new SyntaxError('invalid'); state = obj; }
@@ -101,7 +107,7 @@ async function nodeStatus(env) {
   const base = nodeConfig(env);
   const kv = nodeKv(env);
   let entry = { raw: '', state: emptyState(), error: '' };
-  if (kv && !base._problems.length) entry = await readNodeState(kv);
+  if (kv && !base._problems.length) entry = await readNodeState(kv, true);
   return {
     ok: base._problems.length === 0,
     version: VERSION,

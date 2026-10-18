@@ -27,7 +27,7 @@ globalThis.fetch = async (url, opts = {}) => {
   m.hits++;
   if (m.down) throw new Error('connect failed');
   if (m.hang) return new Promise((_, rej) => opts.signal && opts.signal.addEventListener('abort', () => rej(new Error('aborted'))));
-  if (m.reply) return m.reply();
+  if (m.reply) return m.reply(String(url), opts);
   return proxyWorker.fetch(new Request(url, opts), m.env, {});
 };
 
@@ -260,6 +260,28 @@ test('代理同步：面板的状态整份下发（没有 UUID 就生成，代�
   assert.equal(k.data.sync.ok, false); assert.match(k.data.sync.error, /NODE_KV/);
 });
 
+test('代理同步以 setState 的回应为准：下发后不再另查 status——那次请求可能落在代理的另一个 isolate 上（内存里还是旧状态），不会误报「没有按下发的内容更新」', async () => {
+  const env = baseEnv({ CONFIG_KV: kv({ proxies: [] }) });
+  const cookie = await login(env);
+  const api = (path, init) => call(env, `/${UUID}/api/${path}`, { cookie, ...init });
+  const m = mountProxy('iso.example.com', { state: ps(UUID2) });
+  const staleIsolate = { ...m.env, NODE_KV: plainKv({ state: ps(UUID2) }) };   // 另一个 isolate：看到的还是旧状态
+  const ops = [];
+  m.reply = (url, opts) => {
+    const op = JSON.parse(opts.body).op;
+    ops.push(op);
+    // 第一次 status 与 setState 落在同一个 isolate；之后的 status 落在另一个
+    const e = op === 'status' && ops.includes('setState') ? staleIsolate : m.env;
+    return proxyWorker.fetch(new Request(url, opts), e, {});
+  };
+  const r = await (await api('proxies', { method: 'POST', body: { host: 'iso.example.com', nodePath: 'np', key: KEY } })).json();
+  assert.equal(r.data.sync.ok, true, r.data.sync.error);
+  assert.equal(r.data.sync.status.inSync, true);
+  assert.equal(r.data.sync.status.provisioned, true);
+  assert.deepEqual(ops, ['status', 'setState'], '下发后没有再查 status');
+  assert.equal(proxyState(m).uuid, r.data.proxy.uuid);
+});
+
 test('停用 / 启用：面板立刻不再下发该代理（订阅 400 提示），并通知代理只显示 Hello World；启用恢复；代理不可达时面板照样停用并给出提醒', async () => {
   const m = mountProxy('node.example.com', { PATH: UUID, state: ps(UUID) });
   const env = baseEnv({ CONFIG_KV: kv({ config: customCfg() }) });
@@ -408,7 +430,7 @@ test('代理设置：保存在面板的代理记录里（落地 IP / 出站代�
   const before = JSON.stringify(storedProxies(env));
   for (const [patch, field, re] of [
     [{ edgeIP: 'bad host' }, 'edgeIP', /格式为 host/], [{ edgeIP: 'bad_host.example' }, 'edgeIP', /域名或 IP/], [{ edgeIP: 'x.example:99999' }, 'edgeIP', /端口/], [{ hop: 'ss://aes-256-gcm:pw@1.2.3.4:8388' }, 'hop', /Shadowsocks/],
-    [{ hop: 'ftp://1.2.3.4' }, 'hop', /不支持的出站代理类型/], [{ hop: 'socks5://bad host:1' }, 'hop', /空格/], [{ hop: 'socks5://1.2.3.4:99999' }, 'hop', /端口/], [{ hop: 'socks5://' }, 'hop', /./],
+    [{ hop: 'ftp://1.2.3.4' }, 'hop', /不支持的出站代理类型/], [{ hop: 'socks5://bad host:1' }, 'hop', /空格/], [{ hop: 'socks5://1.2.3.4:99999' }, 'hop', /端口/], [{ hop: 'socks5://' }, 'hop', /./], [{ hop: 'socks5://' + 'é'.repeat(200) + ':p@1.2.3.4:1080' }, 'hop', /最多 255 个字节/],
     [{ hopMode: 'no' }, 'hopMode', /出站方式/], [{ hopMode: 'only' }, 'hop', /请先填写出站代理/], [{ altMode: 'sideways' }, 'altMode', /备用线路方式/],
     [{ altMode: 'custom', altCustom: '' }, 'altCustom', /请填写要用的线路标签/], [{ altCustom: 'bad tag!' }, 'altCustom', /不是有效的标签/], [{ altCustom: 'a,b,c,d,e,f,g,h,i' }, 'altCustom', /最多 8 项/],
   ]) {

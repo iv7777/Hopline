@@ -1,4 +1,4 @@
-/*!Hopline-proxy v3.2.1*/
+/*!Hopline-proxy v3.2.2*/
 // ============================================================================
 //  Hopline 代理 —— 只做一件事：在节点路径上接收 VLESS（WebSocket / XHTTP）并转发
 //  ----------------------------------------------------------------------------
@@ -17,7 +17,7 @@
 import { connect } from 'cloudflare:sockets';
 
 // 代理脚本（Hopline-proxy.js）的版本号：只通过服务绑定的 status() 报告（不会出现在任何公开响应里）。与面板脚本各自编号、各自升版本
-const VERSION = '3.2.1';
+const VERSION = '3.2.2';
 // ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
@@ -65,10 +65,6 @@ function fetchTimeout(url, opts, ms) {
 }
 // 限制缓存表大小：超出时淘汰最先插入的项（Map 按插入顺序遍历），避免长期运行的实例内存无限增长
 function capMap(map, max) { while (map.size > max) map.delete(map.keys().next().value); }
-
-function json(obj, status, headers) {
-  return new Response(JSON.stringify(obj), { status: status || 200, headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, headers || {}) });
-}
 
 // 路径不对（根路径、未知路由）时返回与 Cloudflare 默认的 Hello World Worker 完全相同的响应：
 //   return new Response('Hello World!');  → 200，纯文本，没有任何多余的头；
@@ -183,7 +179,10 @@ function readAddress(data, view, offset, atyp) {
     const len = view.getUint8(offset);
     need(1 + len);
     const bytes = data.subarray(offset + 1, offset + 1 + len);
-    return { addr: TD.decode(bytes), len: 1 + len };
+    const addr = TD.decode(bytes);
+    // 域名里不能有空白与控制字符：否则经 HTTP 出站代理时会被拼进 CONNECT 请求（如 \r\n 注入额外的请求头）
+    if (!addr || /[\x00-\x20\x7f]/.test(addr)) throw new Error('目标域名不正确');
+    return { addr, len: 1 + len };
   }
   if (atyp === 3) { // IPv6
     need(16);
@@ -247,12 +246,11 @@ function parseVssProtoHeader(data, cfg) {
 }
 
 // DoH 端点池（UDP/DNS → DoH 转换用，使 V2rayNG 关闭「本地 DNS」时远端 DNS 仍可用）
-// Cloudflare 优先（Worker 与其同机房，延迟最低，且用户的查询不必先经过第三方境内解析器），其余按序兜底
+// Cloudflare 优先（Worker 与其同机房，延迟最低），Google 兜底（JSON 接口是 /resolve；/dns-query 只收 RFC 8484 格式，用 name= 查询会返回 400）。
+// 不用境内解析器：这里解析的是用户自己访问的域名，境内解析器既会看到这些查询，回的也是面向境内优化（甚至被污染）的结果
 const DOH_ENDPOINTS = [
   'https://cloudflare-dns.com/dns-query',
-  'https://dns.google/dns-query',
-  'https://dns.alidns.com/resolve',
-  'https://doh.pub/dns-query'
+  'https://dns.google/resolve'
 ];
 // IPv6 字符串 → 16 字节（支持 :: 压缩）
 function ipv6ToBytes(ip) {
@@ -392,10 +390,27 @@ async function connectDirect(target, timeoutMs) {
   return connectWithTimeout(target.hostname, target.port, timeoutMs || 6000);
 }
 
+// 出站代理的握手（SOCKS5 协商 / HTTP CONNECT）：连上之后对方可能一直不回应（只接受 TCP、不说话），
+// 没有期限就会让这条连接永远挂着、也不会回落到直连。HOP_HANDSHAKE_MS 内没完成算失败；失败（含超时）时关闭这个 socket，
+// 否则它会一直占着 Workers 的同时连接名额，直到整个请求结束
+const HOP_HANDSHAKE_MS = 6000;
+async function hopHandshake(socket, fn) {
+  let timer = null;
+  try {
+    return await Promise.race([fn(), new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('出站代理握手超时')), HOP_HANDSHAKE_MS); })]);
+  } catch (e) {
+    try { socket.close(); } catch (e2) { /* 忽略 */ }
+    throw e;
+  } finally { clearTimeout(timer); }
+}
+
 // 通过 SOCKS5 代理建立到目标的连接
 async function connectViaS5(hop, target) {
   // 6s 超时快速失败：代理不可达时不能永久挂起
   const socket = await connectWithTimeout(hop.host, hop.port, 6000);
+  return hopHandshake(socket, () => s5Handshake(socket, hop, target));
+}
+async function s5Handshake(socket, hop, target) {
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   // 带缓存的读取器：多余字节保留，避免丢失后续 VLESS 数据流
@@ -456,6 +471,9 @@ async function connectViaS5(hop, target) {
 async function connectViaHtHop(hop, target) {
   // 6s 超时快速失败：代理不可达时不能永久挂起；https 类型的出站代理要先与它建立 TLS（secureTransport），再在 TLS 里发 CONNECT
   const socket = await connectWithTimeout(hop.host, hop.port, 6000, hop.type === 'https' ? { secureTransport: 'on', allowHalfOpen: false } : undefined);
+  return hopHandshake(socket, () => htHandshake(socket, hop, target));
+}
+async function htHandshake(socket, hop, target) {
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   let authHeader = '';
@@ -513,10 +531,15 @@ function b64FromBytes(bytes) {
 // 出站兜底：直连与自定义反代均失败后使用，透明代理模式发送去掉 VLESS 头部的原始
 // TLS 数据，由对端按 SNI 路由到目标
 // ---------------------------------------------------------------------------
-// Worker 所在机房（IATA 代码）→ 最近的地区标签（表里没有的机房按 US）。地区标签对应面板下发的备用线路表里的标签
+// Worker 所在机房（IATA 代码）→ 最近的地区标签（表里没有的机房按 US，主要是美洲）。地区标签对应面板下发的备用线路表里的标签。
+// 台湾、澳门归 HK；东南亚、南亚、大洋洲归 SG（这些地方离新加坡比离美国近得多）；中东、非洲、南欧与东欧归 DE
 const COLO_REGIONS = {
-  HK: 'HKG', SG: 'SIN', JP: 'NRT KIX TYO OSA', KR: 'ICN SEL', SE: 'ARN', NL: 'AMS', FI: 'HEL', GB: 'LHR MAN',
-  DE: 'FRA BER MUC DUS HAM STR CDG MAD VIE ZRH MXP PRG WAW',
+  HK: 'HKG TPE KHH MFM',
+  SG: 'SIN KUL JHB PEN BKK CNX HKT CGK SUB DPS MNL CEB SGN HAN DAD PNH RGN VTE CMB MLE DAC KTM BOM DEL MAA BLR HYD CCU AMD NAG PAT KHI LHE ISB SYD MEL BNE PER ADL CBR HBA AKL CHC NOU',
+  JP: 'NRT KIX TYO OSA FUK OKA CTS GUM', KR: 'ICN SEL',
+  SE: 'ARN GOT OSL', NL: 'AMS BRU LUX', FI: 'HEL TLL RIX VNO', GB: 'LHR MAN EDI DUB ORK',
+  DE: 'FRA BER MUC DUS HAM STR CDG MRS LYS MAD BCN LIS VIE ZRH GVA MXP FCO PMO PRG WAW BUD BTS LJU ZAG BEG SOF OTP KBP KIV ATH SKG IST ADB CPH ' +
+    'TLV AMM BEY DXB AUH DOH BAH KWI MCT RUH JED DMM BGW EBL TBS EVN GYD CAI ALG TUN CMN LOS ACC ABJ DKR NBO DAR JNB CPT DUR MPM LAD KGL ADD',
 };
 const COLO_TO_REGION = new Map(Object.entries(COLO_REGIONS).flatMap(([r, codes]) => codes.split(' ').map(c => [c, r])));
 function selectAltRegion(colo) { return COLO_TO_REGION.get(String(colo || '').toUpperCase().slice(0, 3)) || 'US'; }
@@ -780,8 +803,9 @@ async function openUpstream(parsed, cfg, colo, payloadKind) {
   const attempt = async (fn) => { try { const r = await fn(); if (r) return r; } catch (e) { lastErr = e; } return null; };
   const fail = () => { throw lastErr || new Error('所有出站方式均失败'); };
 
-  // 1) 用户填写的「反代 / 落地 IP」：作为固定出口优先使用（多个解析结果并发竞速），失败再走下面的流程
-  const edge = cfg.edgeIP ? parseHostPort(cfg.edgeIP, 443) : null;
+  // 1) 用户填写的「反代 / 落地 IP」：作为固定出口优先使用（多个解析结果并发竞速），失败再走下面的流程。
+  //    出站模式为 only 且配置了出站代理时不用它：only 的意思是流量只从出站代理出去，落地 IP 会绕过出站代理
+  const edge = cfg.edgeIP && !(mode === 'only' && viaHop) ? parseHostPort(cfg.edgeIP, 443) : null;
   if (edge && edge.host && allowSniAlt) {
     let customTargets = await resolveEdgeIPs(edge.host, edge.port);
     if (!customTargets.length) customTargets = [{ hostname: edge.host, port: edge.port }];
@@ -966,13 +990,43 @@ function xhtPaddingHeader(uuid, host) {
 }
 const B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
+// UDP-DNS（command=0x02、端口 53）：VLESS 的 UDP 数据在流里逐个以「2 字节长度 + 数据报」分帧（Xray / sing-box 都是这样发和收的），
+// 每个查询经 DoH 解析后，同样加上 2 字节长度回给客户端；同一连接上的多个查询（如 A 与 AAAA）都会应答。
+// 每个查询至少占 1 个子请求（免费版每个请求只有 50 个），客户端会长时间复用同一条连接：应答满 DNS_PER_CONN 个后
+// 调用 onDone 关闭连接，客户端下一次查询会新开一条（新的请求、新的子请求额度）。
+// 返回 feed(bytes)：喂入客户端发来的数据（可以是半个数据报，凑齐后再处理）
+const DNS_PER_CONN = 20;
+function dnsFeeder(send, onDone) {
+  let buf = new Uint8Array(0), count = 0, inflight = 0;
+  const settle = () => { inflight--; if (count >= DNS_PER_CONN && !inflight) onDone(); };
+  const reply = (resp) => {
+    const out = new Uint8Array(2 + resp.byteLength);
+    out[0] = resp.byteLength >> 8; out[1] = resp.byteLength & 255;
+    out.set(resp, 2);
+    send(out);
+  };
+  return (chunk) => {
+    if (chunk && chunk.byteLength) buf = buf.byteLength ? concatBytes(buf, chunk) : chunk;
+    while (buf.byteLength >= 2) {
+      const len = (buf[0] << 8) | buf[1];
+      if (buf.byteLength < 2 + len) break;   // 数据报还没收全
+      const pkt = buf.slice(2, 2 + len);
+      buf = buf.subarray(2 + len);
+      if (len < 12 || count >= DNS_PER_CONN) continue;   // 到数之后的查询不再处理（连接即将关闭，客户端会在新连接上重试）
+      count++; inflight++;
+      dnsToDoH(pkt).then((r) => { if (r) reply(r); }, () => { /* 解析失败不应答，客户端按超时处理 */ }).finally(settle);
+    }
+  };
+}
+
 async function handleWsProto(request, cfg) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
   try { server.accept({ allowHalfOpen: true }); } catch (e) { server.accept(); }
   // 关键：必须声明二进制类型，否则 CF 将二进制帧按 UTF-8 解码成 string，VLESS 头（含 16 字节原始 UUID）会被损坏导致隧道失败
   server.binaryType = 'arraybuffer';
-  let socket = null, writer = null, headerSent = false, pending = null, protoWait = null, respSent = false;
+  let socket = null, writer = null, headerSent = false, pending = null, protoWait = null, respSent = false, dnsFeed = null;
+  let authed = false;   // 请求头已通过校验（UUID 正确）：此前出错时关闭帧不带原因，探测请求看不到任何内部信息
   const up = uplinkQueue();
   let draining = false;
   let closed = false, pumped = false, wsClosed = false;   // closed：WS 已关闭（之后建好的出站连接要立即释放）；pumped：已开始把目标数据转给客户端（由它负责在结束时关闭 WS）
@@ -980,7 +1034,7 @@ async function handleWsProto(request, cfg) {
   const send = (data) => { try { server.send(data); } catch (e) { /* 忽略 */ } };
   // 只发一次关闭帧（重复 close 在运行时会抛异常，也会覆盖先发出的关闭码）
   const closeWs = (code, reason) => { if (wsClosed) return; wsClosed = true; try { server.close(code, reason); } catch (e) { /* 忽略 */ } };
-  const fail = (err) => { closeWs(1011, closeReason(err && err.message || err)); cleanup(); };
+  const fail = (err) => { closeWs(1011, authed ? closeReason(err && err.message || err) : ''); cleanup(); };
   // 上行写入循环：出站就绪（writer 已设置）后把队列里的数据合并写给目标；同一时刻只有一个循环在跑
   const drain = async () => {
     if (draining || !writer) return;
@@ -996,23 +1050,27 @@ async function handleWsProto(request, cfg) {
     // 累积缓冲：WS 消息可能分片到达，不足头部长度时等待后续数据
     if (chunk && chunk.byteLength) pending = pending ? concatBytes(pending, chunk) : chunk;
     if (!pending || headerSent) return;
-    // 握手头正常仅数十字节；持续收到不完整分片（异常 / 恶意）时限制缓冲，防内存膨胀
-    if (pending.byteLength > 65536) throw new Error('握手头超过 64KB');
     let parsed;
     try {
       parsed = parseVssProtoHeader(pending, cfg);
     } catch (err) {
-      if (/头部过短/.test(err.message || '')) return;   // 等下一个分片
-      throw err;
+      if (!/头部过短/.test(err.message || '')) throw err;
+      // 握手头正常仅数十字节；持续收到不完整分片（异常 / 恶意）时限制缓冲，防内存膨胀。
+      // 只限制「头部还不完整」的情况：头部完整时首个数据帧再大（头部 + 大块数据）也照常处理，与 XHTTP 一致
+      if (pending.byteLength > 65536) throw new Error('握手头超过 64KB');
+      return;   // 等下一个分片
     }
+    authed = true;
     // 仅支持 TCP（0x01）与 UDP-DNS（0x02）；VLESS MUX 等其它命令
     // 此前会被当成 TCP 连接目标地址，现在明确拒绝，客户端据此回退
     if (parsed.command !== 1 && parsed.command !== 2) {
       throw new Error('不支持的命令 ' + parsed.command);
     }
+    // UDP 只支持 DNS（端口 53）：CF Workers 没有 UDP socket，其余 UDP 直接关闭（客户端自动回退）
+    if (parsed.command === 2 && parsed.port !== 53) { headerSent = true; closeWs(1000); cleanup(); return; }
     // 头部解析成功立即回 VLESS 响应头（version=0 + addonsLen=0），早于首包判定与出站建连：
-    // 部分客户端（mihomo 等）收到这 2 字节才发送首个数据包，晚发会与服务端互相等待
-    if (!respSent && parsed.command !== 2) { respSent = true; send(new Uint8Array([0, 0])); }
+    // 部分客户端（mihomo 等）收到这 2 字节才发送首个数据包，晚发会与服务端互相等待。UDP-DNS 同样先回这 2 字节，再回各个应答
+    if (!respSent) { respSent = true; send(new Uint8Array([0, 0])); }
     // 首包判定出站方式（非 TLS 不走 SNI 型反代，见 payloadKindOf）；头部完整但暂无数据时短暂等待首包，
     // 超时（FIRST_WAIT_MS）仍无数据按 unknown 放行，不让连接悬挂
     const payload = pending.byteLength > parsed.headerLength ? pending.subarray(parsed.headerLength) : null;
@@ -1023,17 +1081,12 @@ async function handleWsProto(request, cfg) {
     }
     if (protoWait) { clearTimeout(protoWait); protoWait = null; }
     headerSent = true;
-    // UDP 请求（command=0x02）：CF Workers 无 UDP socket 无法原生转发数据报，
-    // DNS(53) 查询 → DoH(HTTPS) 转换后回标准 DNS 响应（使 V2rayNG 关闭「本地 DNS」时远端 DNS 仍可用）；
-    // 其余 UDP 快速失败关闭连接（客户端自动回退），TCP（VLESS WS/XHTTP）路径零影响
+    // UDP-DNS：查询经 DoH(HTTPS) 解析后回标准 DNS 应答（使 V2rayNG 关闭「本地 DNS」时远端 DNS 仍可用）；
+    // 之后到达的数据帧也交给 dnsFeed（见 dnsFeeder），连接保持到客户端关闭或应答满 DNS_PER_CONN 个
     if (parsed.command === 2) {
-      try {
-        if (parsed.port === 53 && payload && payload.byteLength >= 12) {
-          const resp = await dnsToDoH(payload);
-          if (resp) send(resp);
-        }
-      } catch (e) { /* UDP 处理失败不响应，客户端按超时/回退处理 */ }
-      closeWs(1000);
+      dnsFeed = dnsFeeder(send, () => { closeWs(1000); cleanup(); });
+      pending = null;
+      dnsFeed(payload);
       return;
     }
     const conn = await openUpstream(parsed, cfg, request.cf && request.cf.colo, payloadKind);
@@ -1076,6 +1129,7 @@ async function handleWsProto(request, cfg) {
     try {
       const chunk = typeof ev.data === 'string' ? TE.encode(ev.data) : new Uint8Array(ev.data);
       if (!headerSent) await handleFirstChunk(chunk);
+      else if (dnsFeed) dnsFeed(chunk);
       // 头部之后的数据帧一律先入上行队列：出站未就绪时暂存（避免早期数据帧被丢弃 → TLS 握手不完整 → 连接通但流量为 0），就绪后合并写出
       else { if (!up.push(chunk)) throw new Error('上行缓冲溢出'); drain(); }
     } catch (err) { fail(err); }
@@ -1099,12 +1153,13 @@ async function handleWsProto(request, cfg) {
 
 // xhttp 代理（stream-one 模式：请求体即 VLESS 流）
 async function handleXhtProto(request, cfg) {
+  if (!request.body) return stubPage();
   const bodyReader = request.body.getReader();
   // 首个数据块可能短于 VLESS 头部（分块到达）：累积到能完整解析为止（上限 64KB，与 WS 路径一致）
   let buf = new Uint8Array(0), parsed = null;
   while (!parsed) {
     const chunk = await bodyReader.read();
-    if (chunk.done) return new Response('empty', { status: 400 });
+    if (chunk.done) return stubPage();
     buf = buf.byteLength ? concatBytes(buf, chunk.value) : chunk.value;
     try { parsed = parseVssProtoHeader(buf, cfg); }
     catch (err) {
@@ -1188,6 +1243,7 @@ function nodeConfig(env) {
 // 面板是唯一的写入方，所以没有读-改-写，也不需要合并：整份覆盖，重复下发无副作用。状态的短哈希（stateHash）随 status 返回，面板据此判断两边是否一致。
 // 没有 NODE_KV 时无处保存状态，代理无法被面板配置好，节点路径上只会返回伪装页。
 // 读取走 isolate 内存缓存（STATE_MEM_TTL）+ KV 边缘缓存，每个 isolate 约每 20 秒读一次 KV；只有节点路径上的连接才会触发。
+// 因此面板下发后，其它 isolate 最长约 1 分钟才用上新状态（换 UUID、停用都是这样）；控制接口的 status 不走内存缓存，如实回报 KV 里的内容。
 // KV 读取失败时沿用上一次读到的状态（从没读到过就视为未配置），绝不因此影响已有连接。
 const STATE_KEY = 'state';
 const STATE_MEM_TTL = 20 * 1000;
@@ -1206,6 +1262,9 @@ function nodeKv(env) {
 const okHost = (h) => typeof h === 'string' && h.length <= 253 && (isValidIp(h) || HOSTNAME_RE.test(h));
 const okPort = (p) => Number.isInteger(p) && p >= 1 && p <= 65535;
 const isObj = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
+// 出站代理的用户名 / 密码：要么都没有，要么都是字符串；SOCKS5 用 1 个字节表示长度，所以按 UTF-8 字节数限制在 255 以内
+const okCred = (s) => typeof s === 'string' && TE.encode(s).length <= 255;
+const okHopAuth = (h) => (h.user === undefined && h.pass === undefined) || (okCred(h.user) && okCred(h.pass));
 
 // 校验面板发来的状态：返回错误说明，没问题返回 ''（只做类型与长度检查，防止坏数据让代理出错；内容的友好校验在面板里做）
 function checkState(st) {
@@ -1217,7 +1276,7 @@ function checkState(st) {
   if (st.edgeIP) { const e = parseHostPort(st.edgeIP, 443); if (!okHost(e.host) || !okPort(e.port)) return 'edgeIP 不是有效的 host 或 host:port'; }
   if (st.hopMode !== '' && st.hopMode !== 'only') return 'hopMode 不正确';
   const h = st.hop;
-  if (h !== null && !(isObj(h) && ['socks5', 'http', 'https'].includes(h.type) && okHost(h.host) && okPort(h.port) && (h.user === undefined || (typeof h.user === 'string' && h.user.length <= 255)) && (h.pass === undefined || (typeof h.pass === 'string' && h.pass.length <= 255)))) return 'hop 不正确';
+  if (h !== null && !(isObj(h) && ['socks5', 'http', 'https'].includes(h.type) && okHost(h.host) && okPort(h.port) && okHopAuth(h))) return 'hop 不正确';
   if (!isObj(st.altTable) || Object.keys(st.altTable).length > 32) return 'altTable 不正确';
   for (const [tag, e] of Object.entries(st.altTable)) {
     if (!TAG_RE.test(tag) || !isObj(e) || !okHost(e.host) || (e.port !== undefined && !okPort(e.port)) || (e.txt !== undefined && typeof e.txt !== 'boolean')) return 'altTable 里的「' + tag.slice(0, 20) + '」不正确';
@@ -1226,14 +1285,16 @@ function checkState(st) {
   return '';
 }
 
-// 读 KV 里保存的状态：返回 { raw, state, error }（error：'' / 'unavailable' / 'corrupt'）；带 isolate 内存缓存
+// 读 KV 里保存的状态：返回 { raw, state, error }（error：'' / 'unavailable' / 'corrupt'）；带 isolate 内存缓存。
+// fresh：跳过内存缓存直接读 KV（控制接口的 status 用）——面板下发后紧接着查状态，这次请求可能落在另一个 isolate 上，
+// 它内存里还是旧状态；KV 在写入的同一机房里立即可见，直接读 KV 才能如实回报（读到的结果也顺便更新这个 isolate 的缓存）
 const STATE_MEM = new WeakMap();
-async function readNodeState(kv) {
+async function readNodeState(kv, fresh) {
   const now = Date.now(), hit = STATE_MEM.get(kv);
-  if (hit && now - hit.t < STATE_MEM_TTL) return hit;
+  if (!fresh && hit && now - hit.t < STATE_MEM_TTL) return hit;
   let entry;
   try {
-    const raw = await kv.get(STATE_KEY, { cacheTtl: 30 });
+    const raw = fresh ? await kv.get(STATE_KEY) : await kv.get(STATE_KEY, { cacheTtl: 30 });
     let state = emptyState(), error = '';
     if (raw) {
       try { const obj = JSON.parse(raw); if (checkState(obj)) throw new SyntaxError('invalid'); state = obj; }
@@ -1277,7 +1338,7 @@ async function nodeStatus(env) {
   const base = nodeConfig(env);
   const kv = nodeKv(env);
   let entry = { raw: '', state: emptyState(), error: '' };
-  if (kv && !base._problems.length) entry = await readNodeState(kv);
+  if (kv && !base._problems.length) entry = await readNodeState(kv, true);
   return {
     ok: base._problems.length === 0,
     version: VERSION,
@@ -1357,9 +1418,10 @@ export default {
       // 还没下发 UUID 或已被停用：和其它路径一样是伪装页
       if (!live.enabled || !live.uuids.length) return stubPage();
       if (upgrade === 'websocket') return handleWsProto(request, live);
+      // XHTTP 出错（含 UUID 不符、请求体为空等）一律返回伪装页：错误信息不外露，探测请求看不出这条路径与其它路径有何不同
       if (request.method === 'POST') {
         try { return await handleXhtProto(request, live); }
-        catch (e) { return json({ ok: false, msg: 'xht 错误: ' + (e.message || e) }, 500); }
+        catch (e) { return stubPage(); }
       }
     } else if (path.startsWith(cfg.path + '/') && path.slice(cfg.path.length + 1) === await routeTag(cfg.key)) {
       return handleControl(request, env, cfg);

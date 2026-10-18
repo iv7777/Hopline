@@ -46,10 +46,6 @@ function fetchTimeout(url, opts, ms) {
 // 限制缓存表大小：超出时淘汰最先插入的项（Map 按插入顺序遍历），避免长期运行的实例内存无限增长
 function capMap(map, max) { while (map.size > max) map.delete(map.keys().next().value); }
 
-function json(obj, status, headers) {
-  return new Response(JSON.stringify(obj), { status: status || 200, headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, headers || {}) });
-}
-
 // 路径不对（根路径、未知路由）时返回与 Cloudflare 默认的 Hello World Worker 完全相同的响应：
 //   return new Response('Hello World!');  → 200，纯文本，没有任何多余的头；
 // 看起来像个刚创建的占位 Worker，既不暴露路径 / UUID，也不返回 404 引人注意

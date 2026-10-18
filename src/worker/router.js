@@ -1,6 +1,11 @@
 // ---------------------------------------------------------------------------
 // 路由与调度
 // ---------------------------------------------------------------------------
+// JSON 响应（面板的管理接口用；代理没有任何 JSON 响应，出错一律是伪装页）
+function json(obj, status, headers) {
+  return new Response(JSON.stringify(obj), { status: status || 200, headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, headers || {}) });
+}
+
 function isBrowserUA(ua) {
   // 任何包含 Mozilla 的 UA 视为浏览器；curl / ClashForAndroid / Sing-box 等客户端不含
   return (ua || '').toLowerCase().includes('mozilla');

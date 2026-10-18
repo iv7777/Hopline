@@ -67,12 +67,15 @@ async function syncProxy(proxy, table) {
   if (!proxy.uuid) { patch.uuid = crypto.randomUUID(); actions.push('已生成 UUID'); }
   if (proxy.prev && proxy.prevUntil <= Date.now()) { patch.prev = ''; patch.prevUntil = 0; }
   const next = Object.assign({}, proxy, patch);
-  const raw = JSON.stringify(buildState(next, table));
+  const state = buildState(next, table);
+  const raw = JSON.stringify(state);
   const want = await shortHash(raw);
   if (st.stateHash !== want) {
-    await callProxyOk(proxy, 'setState', null, raw);
+    const r = await callProxyOk(proxy, 'setState', null, raw);
     actions.push(st.provisioned ? '已把设置重新下发给代理' : '已把 UUID 与设置下发给代理');
-    st = await callProxyOk(proxy, 'status', {});
+    // 以 setState 的回应为准（代理写入 KV 后返回所存内容的哈希），不再另查一次 status：
+    // 那次请求可能落在代理的另一个 isolate 上，它内存里还是旧状态，会误报「没有按下发的内容更新」
+    st = Object.assign({}, st, { stateHash: String(r.stateHash || ''), provisioned: state.uuids.length > 0, enabled: state.enabled, kvError: '' });
   }
   return { status: st, actions, patch, inSync: st.stateHash === want };
 }

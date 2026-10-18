@@ -1,4 +1,4 @@
-/*!Hopline-panel v3.2.2*/
+/*!Hopline-panel v3.2.3*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -16,7 +16,7 @@
 //  代理的域名、节点路径、密钥在面板「面板设置 → 代理」里填写（保存在 CONFIG_KV）。
 // ============================================================================
 // 面板脚本（Hopline-panel.js）的版本号：用于检测更新与面板里显示。与代理脚本各自编号、各自升版本
-const VERSION = '3.2.2';
+const VERSION = '3.2.3';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
 // 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
@@ -491,10 +491,6 @@ function fetchTimeout(url, opts, ms) {
 // 限制缓存表大小：超出时淘汰最先插入的项（Map 按插入顺序遍历），避免长期运行的实例内存无限增长
 function capMap(map, max) { while (map.size > max) map.delete(map.keys().next().value); }
 
-function json(obj, status, headers) {
-  return new Response(JSON.stringify(obj), { status: status || 200, headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, headers || {}) });
-}
-
 // 路径不对（根路径、未知路由）时返回与 Cloudflare 默认的 Hello World Worker 完全相同的响应：
 //   return new Response('Hello World!');  → 200，纯文本，没有任何多余的头；
 // 看起来像个刚创建的占位 Worker，既不暴露路径 / UUID，也不返回 404 引人注意
@@ -818,7 +814,8 @@ function parseHopInput(addr) {
     const dec = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
     const idx = u.indexOf(':');
     if (idx >= 0) { user = dec(u.slice(0, idx)); pass = dec(u.slice(idx + 1)); } else user = dec(u);
-    if (user.length > 255 || pass.length > 255) return { error: '用户名或密码过长' };
+    // SOCKS5 用 1 个字节表示长度：按 UTF-8 字节数限制（中文等每个字占 3 个字节）
+    if (TE.encode(user).length > 255 || TE.encode(pass).length > 255) return { error: '用户名或密码过长（最多 255 个字节）' };
   }
   const { host, port } = parseHostPort(rest, type === 'http' ? 80 : type === 'https' ? 443 : 1080);
   if (!hostValid(host)) return { error: '无法解析出站代理地址（格式如 socks5://user:pass@1.2.3.4:1080）' };
@@ -969,12 +966,15 @@ async function syncProxy(proxy, table) {
   if (!proxy.uuid) { patch.uuid = crypto.randomUUID(); actions.push('已生成 UUID'); }
   if (proxy.prev && proxy.prevUntil <= Date.now()) { patch.prev = ''; patch.prevUntil = 0; }
   const next = Object.assign({}, proxy, patch);
-  const raw = JSON.stringify(buildState(next, table));
+  const state = buildState(next, table);
+  const raw = JSON.stringify(state);
   const want = await shortHash(raw);
   if (st.stateHash !== want) {
-    await callProxyOk(proxy, 'setState', null, raw);
+    const r = await callProxyOk(proxy, 'setState', null, raw);
     actions.push(st.provisioned ? '已把设置重新下发给代理' : '已把 UUID 与设置下发给代理');
-    st = await callProxyOk(proxy, 'status', {});
+    // 以 setState 的回应为准（代理写入 KV 后返回所存内容的哈希），不再另查一次 status：
+    // 那次请求可能落在代理的另一个 isolate 上，它内存里还是旧状态，会误报「没有按下发的内容更新」
+    st = Object.assign({}, st, { stateHash: String(r.stateHash || ''), provisioned: state.uuids.length > 0, enabled: state.enabled, kvError: '' });
   }
   return { status: st, actions, patch, inSync: st.stateHash === want };
 }
@@ -3316,7 +3316,7 @@ pre.code{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
             <option value="only">仅走出站代理，失败后只用备用线路、不直连（only）</option>
           </select>
         </div>
-        <p class="hint" style="margin-top:10px">未填写出站代理时，两种出站方式都按直连处理。</p>
+        <p class="hint" style="margin-top:10px">未填写出站代理时，两种出站方式都按直连处理。选「仅走出站代理」并填写了出站代理时，上面的反代 / 落地 IP 不会被使用（它会绕过出站代理）。</p>
       </div>
       <div class="card">
         <h3><span class="tick"></span>备用线路（这个代理）</h3>
@@ -4699,6 +4699,11 @@ function panelPage() {
 // ---------------------------------------------------------------------------
 // 路由与调度
 // ---------------------------------------------------------------------------
+// JSON 响应（面板的管理接口用；代理没有任何 JSON 响应，出错一律是伪装页）
+function json(obj, status, headers) {
+  return new Response(JSON.stringify(obj), { status: status || 200, headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, headers || {}) });
+}
+
 function isBrowserUA(ua) {
   // 任何包含 Mozilla 的 UA 视为浏览器；curl / ClashForAndroid / Sing-box 等客户端不含
   return (ua || '').toLowerCase().includes('mozilla');

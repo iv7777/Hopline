@@ -22,9 +22,10 @@ export default {
       // 还没下发 UUID 或已被停用：和其它路径一样是伪装页
       if (!live.enabled || !live.uuids.length) return stubPage();
       if (upgrade === 'websocket') return handleWsProto(request, live);
+      // XHTTP 出错（含 UUID 不符、请求体为空等）一律返回伪装页：错误信息不外露，探测请求看不出这条路径与其它路径有何不同
       if (request.method === 'POST') {
         try { return await handleXhtProto(request, live); }
-        catch (e) { return json({ ok: false, msg: 'xht 错误: ' + (e.message || e) }, 500); }
+        catch (e) { return stubPage(); }
       }
     } else if (path.startsWith(cfg.path + '/') && path.slice(cfg.path.length + 1) === await routeTag(cfg.key)) {
       return handleControl(request, env, cfg);

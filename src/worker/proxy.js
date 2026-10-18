@@ -75,13 +75,43 @@ function xhtPaddingHeader(uuid, host) {
 }
 const B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
+// UDP-DNS（command=0x02、端口 53）：VLESS 的 UDP 数据在流里逐个以「2 字节长度 + 数据报」分帧（Xray / sing-box 都是这样发和收的），
+// 每个查询经 DoH 解析后，同样加上 2 字节长度回给客户端；同一连接上的多个查询（如 A 与 AAAA）都会应答。
+// 每个查询至少占 1 个子请求（免费版每个请求只有 50 个），客户端会长时间复用同一条连接：应答满 DNS_PER_CONN 个后
+// 调用 onDone 关闭连接，客户端下一次查询会新开一条（新的请求、新的子请求额度）。
+// 返回 feed(bytes)：喂入客户端发来的数据（可以是半个数据报，凑齐后再处理）
+const DNS_PER_CONN = 20;
+function dnsFeeder(send, onDone) {
+  let buf = new Uint8Array(0), count = 0, inflight = 0;
+  const settle = () => { inflight--; if (count >= DNS_PER_CONN && !inflight) onDone(); };
+  const reply = (resp) => {
+    const out = new Uint8Array(2 + resp.byteLength);
+    out[0] = resp.byteLength >> 8; out[1] = resp.byteLength & 255;
+    out.set(resp, 2);
+    send(out);
+  };
+  return (chunk) => {
+    if (chunk && chunk.byteLength) buf = buf.byteLength ? concatBytes(buf, chunk) : chunk;
+    while (buf.byteLength >= 2) {
+      const len = (buf[0] << 8) | buf[1];
+      if (buf.byteLength < 2 + len) break;   // 数据报还没收全
+      const pkt = buf.slice(2, 2 + len);
+      buf = buf.subarray(2 + len);
+      if (len < 12 || count >= DNS_PER_CONN) continue;   // 到数之后的查询不再处理（连接即将关闭，客户端会在新连接上重试）
+      count++; inflight++;
+      dnsToDoH(pkt).then((r) => { if (r) reply(r); }, () => { /* 解析失败不应答，客户端按超时处理 */ }).finally(settle);
+    }
+  };
+}
+
 async function handleWsProto(request, cfg) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
   try { server.accept({ allowHalfOpen: true }); } catch (e) { server.accept(); }
   // 关键：必须声明二进制类型，否则 CF 将二进制帧按 UTF-8 解码成 string，VLESS 头（含 16 字节原始 UUID）会被损坏导致隧道失败
   server.binaryType = 'arraybuffer';
-  let socket = null, writer = null, headerSent = false, pending = null, protoWait = null, respSent = false;
+  let socket = null, writer = null, headerSent = false, pending = null, protoWait = null, respSent = false, dnsFeed = null;
+  let authed = false;   // 请求头已通过校验（UUID 正确）：此前出错时关闭帧不带原因，探测请求看不到任何内部信息
   const up = uplinkQueue();
   let draining = false;
   let closed = false, pumped = false, wsClosed = false;   // closed：WS 已关闭（之后建好的出站连接要立即释放）；pumped：已开始把目标数据转给客户端（由它负责在结束时关闭 WS）
@@ -89,7 +119,7 @@ async function handleWsProto(request, cfg) {
   const send = (data) => { try { server.send(data); } catch (e) { /* 忽略 */ } };
   // 只发一次关闭帧（重复 close 在运行时会抛异常，也会覆盖先发出的关闭码）
   const closeWs = (code, reason) => { if (wsClosed) return; wsClosed = true; try { server.close(code, reason); } catch (e) { /* 忽略 */ } };
-  const fail = (err) => { closeWs(1011, closeReason(err && err.message || err)); cleanup(); };
+  const fail = (err) => { closeWs(1011, authed ? closeReason(err && err.message || err) : ''); cleanup(); };
   // 上行写入循环：出站就绪（writer 已设置）后把队列里的数据合并写给目标；同一时刻只有一个循环在跑
   const drain = async () => {
     if (draining || !writer) return;
@@ -105,23 +135,27 @@ async function handleWsProto(request, cfg) {
     // 累积缓冲：WS 消息可能分片到达，不足头部长度时等待后续数据
     if (chunk && chunk.byteLength) pending = pending ? concatBytes(pending, chunk) : chunk;
     if (!pending || headerSent) return;
-    // 握手头正常仅数十字节；持续收到不完整分片（异常 / 恶意）时限制缓冲，防内存膨胀
-    if (pending.byteLength > 65536) throw new Error('握手头超过 64KB');
     let parsed;
     try {
       parsed = parseVssProtoHeader(pending, cfg);
     } catch (err) {
-      if (/头部过短/.test(err.message || '')) return;   // 等下一个分片
-      throw err;
+      if (!/头部过短/.test(err.message || '')) throw err;
+      // 握手头正常仅数十字节；持续收到不完整分片（异常 / 恶意）时限制缓冲，防内存膨胀。
+      // 只限制「头部还不完整」的情况：头部完整时首个数据帧再大（头部 + 大块数据）也照常处理，与 XHTTP 一致
+      if (pending.byteLength > 65536) throw new Error('握手头超过 64KB');
+      return;   // 等下一个分片
     }
+    authed = true;
     // 仅支持 TCP（0x01）与 UDP-DNS（0x02）；VLESS MUX 等其它命令
     // 此前会被当成 TCP 连接目标地址，现在明确拒绝，客户端据此回退
     if (parsed.command !== 1 && parsed.command !== 2) {
       throw new Error('不支持的命令 ' + parsed.command);
     }
+    // UDP 只支持 DNS（端口 53）：CF Workers 没有 UDP socket，其余 UDP 直接关闭（客户端自动回退）
+    if (parsed.command === 2 && parsed.port !== 53) { headerSent = true; closeWs(1000); cleanup(); return; }
     // 头部解析成功立即回 VLESS 响应头（version=0 + addonsLen=0），早于首包判定与出站建连：
-    // 部分客户端（mihomo 等）收到这 2 字节才发送首个数据包，晚发会与服务端互相等待
-    if (!respSent && parsed.command !== 2) { respSent = true; send(new Uint8Array([0, 0])); }
+    // 部分客户端（mihomo 等）收到这 2 字节才发送首个数据包，晚发会与服务端互相等待。UDP-DNS 同样先回这 2 字节，再回各个应答
+    if (!respSent) { respSent = true; send(new Uint8Array([0, 0])); }
     // 首包判定出站方式（非 TLS 不走 SNI 型反代，见 payloadKindOf）；头部完整但暂无数据时短暂等待首包，
     // 超时（FIRST_WAIT_MS）仍无数据按 unknown 放行，不让连接悬挂
     const payload = pending.byteLength > parsed.headerLength ? pending.subarray(parsed.headerLength) : null;
@@ -132,17 +166,12 @@ async function handleWsProto(request, cfg) {
     }
     if (protoWait) { clearTimeout(protoWait); protoWait = null; }
     headerSent = true;
-    // UDP 请求（command=0x02）：CF Workers 无 UDP socket 无法原生转发数据报，
-    // DNS(53) 查询 → DoH(HTTPS) 转换后回标准 DNS 响应（使 V2rayNG 关闭「本地 DNS」时远端 DNS 仍可用）；
-    // 其余 UDP 快速失败关闭连接（客户端自动回退），TCP（VLESS WS/XHTTP）路径零影响
+    // UDP-DNS：查询经 DoH(HTTPS) 解析后回标准 DNS 应答（使 V2rayNG 关闭「本地 DNS」时远端 DNS 仍可用）；
+    // 之后到达的数据帧也交给 dnsFeed（见 dnsFeeder），连接保持到客户端关闭或应答满 DNS_PER_CONN 个
     if (parsed.command === 2) {
-      try {
-        if (parsed.port === 53 && payload && payload.byteLength >= 12) {
-          const resp = await dnsToDoH(payload);
-          if (resp) send(resp);
-        }
-      } catch (e) { /* UDP 处理失败不响应，客户端按超时/回退处理 */ }
-      closeWs(1000);
+      dnsFeed = dnsFeeder(send, () => { closeWs(1000); cleanup(); });
+      pending = null;
+      dnsFeed(payload);
       return;
     }
     const conn = await openUpstream(parsed, cfg, request.cf && request.cf.colo, payloadKind);
@@ -185,6 +214,7 @@ async function handleWsProto(request, cfg) {
     try {
       const chunk = typeof ev.data === 'string' ? TE.encode(ev.data) : new Uint8Array(ev.data);
       if (!headerSent) await handleFirstChunk(chunk);
+      else if (dnsFeed) dnsFeed(chunk);
       // 头部之后的数据帧一律先入上行队列：出站未就绪时暂存（避免早期数据帧被丢弃 → TLS 握手不完整 → 连接通但流量为 0），就绪后合并写出
       else { if (!up.push(chunk)) throw new Error('上行缓冲溢出'); drain(); }
     } catch (err) { fail(err); }
@@ -208,12 +238,13 @@ async function handleWsProto(request, cfg) {
 
 // xhttp 代理（stream-one 模式：请求体即 VLESS 流）
 async function handleXhtProto(request, cfg) {
+  if (!request.body) return stubPage();
   const bodyReader = request.body.getReader();
   // 首个数据块可能短于 VLESS 头部（分块到达）：累积到能完整解析为止（上限 64KB，与 WS 路径一致）
   let buf = new Uint8Array(0), parsed = null;
   while (!parsed) {
     const chunk = await bodyReader.read();
-    if (chunk.done) return new Response('empty', { status: 400 });
+    if (chunk.done) return stubPage();
     buf = buf.byteLength ? concatBytes(buf, chunk.value) : chunk.value;
     try { parsed = parseVssProtoHeader(buf, cfg); }
     catch (err) {

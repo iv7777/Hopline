@@ -26,10 +26,27 @@ async function connectDirect(target, timeoutMs) {
   return connectWithTimeout(target.hostname, target.port, timeoutMs || 6000);
 }
 
+// 出站代理的握手（SOCKS5 协商 / HTTP CONNECT）：连上之后对方可能一直不回应（只接受 TCP、不说话），
+// 没有期限就会让这条连接永远挂着、也不会回落到直连。HOP_HANDSHAKE_MS 内没完成算失败；失败（含超时）时关闭这个 socket，
+// 否则它会一直占着 Workers 的同时连接名额，直到整个请求结束
+const HOP_HANDSHAKE_MS = 6000;
+async function hopHandshake(socket, fn) {
+  let timer = null;
+  try {
+    return await Promise.race([fn(), new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('出站代理握手超时')), HOP_HANDSHAKE_MS); })]);
+  } catch (e) {
+    try { socket.close(); } catch (e2) { /* 忽略 */ }
+    throw e;
+  } finally { clearTimeout(timer); }
+}
+
 // 通过 SOCKS5 代理建立到目标的连接
 async function connectViaS5(hop, target) {
   // 6s 超时快速失败：代理不可达时不能永久挂起
   const socket = await connectWithTimeout(hop.host, hop.port, 6000);
+  return hopHandshake(socket, () => s5Handshake(socket, hop, target));
+}
+async function s5Handshake(socket, hop, target) {
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   // 带缓存的读取器：多余字节保留，避免丢失后续 VLESS 数据流
@@ -90,6 +107,9 @@ async function connectViaS5(hop, target) {
 async function connectViaHtHop(hop, target) {
   // 6s 超时快速失败：代理不可达时不能永久挂起；https 类型的出站代理要先与它建立 TLS（secureTransport），再在 TLS 里发 CONNECT
   const socket = await connectWithTimeout(hop.host, hop.port, 6000, hop.type === 'https' ? { secureTransport: 'on', allowHalfOpen: false } : undefined);
+  return hopHandshake(socket, () => htHandshake(socket, hop, target));
+}
+async function htHandshake(socket, hop, target) {
   const writer = socket.writable.getWriter();
   const reader = socket.readable.getReader();
   let authHeader = '';

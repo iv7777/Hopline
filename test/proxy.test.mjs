@@ -475,24 +475,90 @@ test('反代域名解析：首选 DoH 失败时才换下一个端点；全部失
   assert.equal(dns.filter(d => d.name === 'neg.example.com').length, 0, '30 秒内不再重复查询');
 });
 
-test('UDP DNS（VLESS UDP 53）转 DoH：Cloudflare 优先，失败才换端点', async () => {
-  const query = new Uint8Array([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7, ...Buffer.from('example'), 3, ...Buffer.from('com'), 0, 0, 1, 0, 1]);
-  const req = () => new Uint8Array([0, ...uuidBytes, 0, 2, 0, 53, 1, 8, 8, 8, 8, ...query]);   // VLESS UDP（cmd=2）→ 8.8.8.8:53
+// UDP-DNS 的数据报与分帧：Xray / sing-box 的 VLESS UDP 每个数据报前加 2 字节长度（Xray encoding/addons.go 的 MultiLengthPacketWriter，
+// sing-vmess vless/client.go 的 PacketConn）；收的一方先读 2 字节 VLESS 响应头，再逐个读「2 字节长度 + 应答」
+const dnsQuery = (id, name) => [id >> 8, id & 255, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, ...name.split('.').flatMap(l => [l.length, ...Buffer.from(l)]), 0, 0, 1, 0, 1];
+const framed = (...pkts) => pkts.flatMap(p => [p.length >> 8, p.length & 255, ...p]);
+// VLESS UDP 请求头（command=0x02，目标为 IPv4）+ 数据
+const udpReq = (ip, port, payload = []) => new Uint8Array([0, ...uuidBytes, 0, 2, port >> 8, port & 255, 1, ...ip.split('.').map(Number), ...payload]);
+// 把发给客户端的全部字节按 VLESS UDP 的格式拆开：[0,0] 响应头 + 若干「2 字节长度 + 应答」；返回 { header, packets }
+const unframe = (sent) => {
+  const all = Buffer.concat(sent.map(m => Buffer.from(m)));
+  const packets = [];
+  for (let o = 2; o + 2 <= all.length;) { const n = all.readUInt16BE(o); packets.push(all.subarray(o + 2, o + 2 + n)); o += 2 + n; }
+  return { header: [...all.subarray(0, 2)], packets };
+};
+
+test('UDP DNS（VLESS UDP 53）：按 Xray / sing-box 的分帧收发——先回 [0,0] 响应头，每个应答前加 2 字节长度；同一连接上的多个查询（含跨帧、半个数据报）都应答，连接保持', async () => {
+  const ans = { 'example.com|A': ['93.184.216.34'], 'example.org|A': ['93.184.216.35'], 'example.net|A': ['93.184.216.36'] };
+  await withFetch(dohStub({ 'cloudflare-dns.com': { answers: ans } }), async () => {
+    const ws = await openWs(baseEnv());
+    const second = framed(dnsQuery(0x2222, 'example.org'));
+    // 首帧：请求头 + 一个完整查询 + 第二个查询的前 5 个字节；第二帧：第二个查询的其余部分 + 第三个查询
+    await ws.emit('message', { data: udpReq('8.8.8.8', 53, [...framed(dnsQuery(0x1111, 'example.com')), ...second.slice(0, 5)]).buffer });
+    await ws.emit('message', { data: new Uint8Array([...second.slice(5), ...framed(dnsQuery(0x3333, 'example.net'))]).buffer });
+    await until(() => unframe(ws.sent).packets.length === 3);
+    const { header, packets } = unframe(ws.sent);
+    assert.deepEqual(header, [0, 0], '先回 VLESS 响应头');
+    const byId = Object.fromEntries(packets.map(p => [p.readUInt16BE(0), [...p.subarray(-4)]]));
+    assert.deepEqual(byId, { 0x1111: [93, 184, 216, 34], 0x2222: [93, 184, 216, 35], 0x3333: [93, 184, 216, 36] });
+    assert.equal(ws.closed, null, '连接保持，直到客户端关闭');
+    await ws.emit('close', {});
+    assert.ok(ws.closed);
+  });
+});
+
+test('UDP DNS：一条连接最多应答 20 个查询（每个查询至少占 1 个子请求，免费版每个请求只有 50 个），应答完后关闭连接，客户端会新开一条', async () => {
+  const ans = Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`q${i}.example.com|A`, ['93.184.216.' + i]]));
+  await withFetch(dohStub({ 'cloudflare-dns.com': { answers: ans } }), async () => {
+    const ws = await openWs(baseEnv());
+    const pkts = Array.from({ length: 25 }, (_, i) => dnsQuery(i, `q${i}.example.com`));
+    await ws.emit('message', { data: udpReq('8.8.8.8', 53, framed(...pkts.slice(0, 5))).buffer });
+    await until(() => unframe(ws.sent).packets.length === 5);
+    assert.equal(ws.closed, null, '不到 20 个时连接保持');
+    await ws.emit('message', { data: new Uint8Array(framed(...pkts.slice(5))).buffer });
+    await until(() => ws.closed);
+    const { packets } = unframe(ws.sent);
+    assert.equal(packets.length, 20);
+    assert.deepEqual(packets.map(p => p.readUInt16BE(0)).sort((a, b) => a - b), Array.from({ length: 20 }, (_, i) => i));
+    assert.equal(ws.closed.code, 1000);
+  });
+});
+
+test('UDP DNS：Cloudflare 优先，失败才换 Google（JSON 接口是 /resolve）；不再使用境内解析器；非 53 端口的 UDP 直接关闭', async () => {
+  const ans = { 'example.com|A': ['93.184.216.34'] };
   const run = async (table) => {
     const dns = [];
     await withFetch(dohStub(table, dns), async () => {
-      const ws = await openWs(altEnv());
-      await ws.emit('message', { data: req().buffer });
-      assert.equal(ws.sent.length, 1, 'DNS 应答');
-      const resp = ws.sent[0];
-      assert.deepEqual([...resp.slice(0, 2)], [0x12, 0x34]);
-      assert.deepEqual([...resp.slice(-4)], [93, 184, 216, 34]);
+      const ws = await openWs(baseEnv());
+      await ws.emit('message', { data: udpReq('8.8.8.8', 53, framed(dnsQuery(0x1234, 'example.com'))).buffer });
+      await new Promise(r => setTimeout(r, 1600));   // 等所有端点都试过（含 0.7 秒的提前并发）
+      const { packets } = unframe(ws.sent);
+      if (table['cloudflare-dns.com'] || table['dns.google']) assert.equal(packets.length, 1, '有应答');
+      else assert.equal(packets.length, 0, '全部失败时不应答');
     });
-    return dns.map(d => d.host);
+    return [...new Set(dns.map(d => d.host))];
   };
-  const ans = { 'example.com|A': ['93.184.216.34'] };
   assert.deepEqual(await run({ 'cloudflare-dns.com': { answers: ans } }), ['cloudflare-dns.com']);
   assert.deepEqual(await run({ 'dns.google': { answers: ans } }), ['cloudflare-dns.com', 'dns.google']);
+  assert.deepEqual(await run({}), ['cloudflare-dns.com', 'dns.google'], '只有这两个端点');
+  // 实际请求的地址：Cloudflare 是 /dns-query，Google 是 /resolve
+  const calls = [];
+  await withFetch(async (url) => {
+    calls.push(url);
+    if (url.includes('cloudflare-dns.com')) return new Response('x', { status: 500 });
+    return new Response(JSON.stringify({ Status: 0, Answer: ans['example.com|A'].map(data => ({ type: 1, data })) }));
+  }, async () => {
+    const ws = await openWs(baseEnv());
+    await ws.emit('message', { data: udpReq('8.8.8.8', 53, framed(dnsQuery(1, 'example.com'))).buffer });
+    await until(() => unframe(ws.sent).packets.length === 1);
+  });
+  assert.deepEqual(calls, ['https://cloudflare-dns.com/dns-query?name=example.com&type=1', 'https://dns.google/resolve?name=example.com&type=1']);
+  // 非 53 端口：没有 UDP socket，直接关闭，也不回响应头
+  const ws = await openWs(baseEnv());
+  await ws.emit('message', { data: udpReq('1.1.1.1', 443, [0, 3, 1, 2, 3]).buffer });
+  assert.equal(ws.closed.code, 1000);
+  assert.equal(ws.sent.length, 0);
 });
 
 // ---------------- 纯函数已知答案 / 协议头模糊测试 ----------------
@@ -505,7 +571,7 @@ import { assemble } from '../build.mjs';
 const internals = (() => {
   const src = assemble('proxy')
     .replace(/^import .*$/gm, '').replace('export default {', 'const __default = {').replace(/^export class /gm, 'class ');
-  return new Function('connect', src + '\n;return { parseVssProtoHeader, isValidIp, altPlan, selectAltRegion, nodeConfig, checkState, pumpReadable, routeTag, shortHash };')(() => { throw new Error('no sockets'); });
+  return new Function('connect', src + '\n;return { parseVssProtoHeader, isValidIp, altPlan, selectAltRegion, COLO_REGIONS, nodeConfig, checkState, pumpReadable, routeTag, shortHash };')(() => { throw new Error('no sockets'); });
 })();
 
 const hex = (u8) => Buffer.from(u8).toString('hex');
@@ -1268,4 +1334,135 @@ test('面板下发的状态真正生效：节点路径上的连接按状态出�
     await after.emit('message', { data: vlessReq('save-live.example', 443, TLS_HELLO).buffer });
   });
   assert.equal(dns2.filter(d => d.name.startsWith('proxyip.')).length, 0, '下发后新连接不再用备用线路');
+});
+
+// ---------------- 审查修复（代理 3.2.2）：探测伪装、出站代理握手期限、状态如实回报、only 模式、首帧大小、机房地区、输入校验 ----------------
+test('探测：节点路径上的 XHTTP 出错（UUID 不符 / 乱码 / 空请求体 / 没有请求体）都返回 Hello World；WebSocket 在请求头通过校验前出错时关闭帧不带原因', async () => {
+  fakeNet({});
+  const env = baseEnv();
+  const wrong = vlessReq('x.example', 443, TLS_HELLO); wrong[1] ^= 0xff;
+  for (const body of [wrong, new Uint8Array(20).fill(1), new Uint8Array(0)]) await isHello(await xhttpPost(env, `/${UUID}`, body));
+  await isHello(await worker.fetch(new Request(`https://node.example.com/${UUID}`, { method: 'POST' }), env, {}));
+  for (const bad of [wrong, new Uint8Array(20).fill(1)]) {
+    const ws = await openWs(env);
+    await ws.emit('message', { data: bad.buffer });
+    assert.deepEqual(ws.closed, { code: 1011, reason: '' }, '不透露 UUID 不符等内部信息');
+  }
+  // 请求头通过校验之后的错误仍带原因（客户端日志里能看到）
+  const mux = vlessReq('x.example', 443, TLS_HELLO); mux[1 + 16 + 1] = 3;
+  const ws = await openWs(env);
+  await ws.emit('message', { data: mux.buffer });
+  assert.match(ws.closed.reason, /不支持的命令/);
+});
+
+test('出站代理握手有期限：只接受 TCP、不回应的出站代理超时后回落直连；握手失败（含超时）时关闭与出站代理的连接', async () => {
+  const feed = async (sock, bytes) => { await until(() => sock.push && sock.written.length); sock.push(new Uint8Array(bytes)); };
+  const real = globalThis.setTimeout;
+  globalThis.setTimeout = (f, ms, ...a) => real(f, ms === 6000 ? 60 : ms, ...a);   // 握手期限 6 秒缩短到 60 毫秒
+  try {
+    const log = fakeNet({ 'hop.example': { delay: 5 }, 'target.example': { delay: 5 } });
+    const ws = await openWs(baseEnv({ set: { hop: { type: 'socks5', host: 'hop.example', port: 1080 } } }));
+    sendTls(ws, 'target.example');
+    await until(() => hostLog(log, 'target.example').some(s => s.written.length));
+    assert.equal(hostLog(log, 'hop.example')[0].closedByUs, true, '超时的出站代理连接被关闭');
+    assert.equal(ws.closed, null);
+  } finally { globalThis.setTimeout = real; }
+  for (const [hop, reply] of [
+    [{ type: 'socks5', host: 'hop.example', port: 1080 }, [5, 0xff]],
+    [{ type: 'http', host: 'hop.example', port: 8080 }, [...Buffer.from('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n')]],
+  ]) {
+    const log = fakeNet({ 'hop.example': { delay: 5 }, 'target.example': { delay: 5 } });
+    const ws = await openWs(baseEnv({ set: { hop } }));
+    sendTls(ws, 'target.example');
+    await until(() => log.length);
+    await feed(log[0], reply);
+    await until(() => hostLog(log, 'target.example').some(s => s.written.length));
+    assert.equal(hostLog(log, 'hop.example')[0].closedByUs, true, hop.type + '：握手被拒绝后连接被关闭');
+  }
+});
+
+test('控制接口 status 如实回报 KV 里的状态（不走 20 秒的内存缓存）：别的 isolate 刚下发的新状态立即可见；节点连接仍走缓存', async () => {
+  fakeNet({});
+  const kv = memKv({ state: stateWith() });
+  const env = baseEnv({ NODE_KV: kv });
+  const before = await call(env, 'status');
+  assert.equal(before.stateHash, shortHashOf(JSON.stringify(stateWith())));
+  // 另一个 isolate 写入了新状态（这里直接改 KV 模拟）
+  const next = JSON.stringify(stateWith({ uuids: [['99999999-2222-4333-8444-555555555555', 0]] }));
+  kv.m.set('state', next);
+  assert.equal((await call(env, 'status')).stateHash, shortHashOf(next), 'status 读到的是 KV 的最新内容');
+  const ws = await openWs(env);   // 这次 status 顺便刷新了本 isolate 的缓存：新 UUID 立即可用、旧的不再接受
+  await ws.emit('message', { data: vlessReq('x.example', 443, TLS_HELLO).buffer });
+  assert.equal(ws.closed.code, 1011);
+});
+
+test('出站方式 only：配置了出站代理时不用反代 / 落地 IP（它会绕过出站代理）；没配出站代理时落地 IP 照常使用', async () => {
+  let log = fakeNet({ '198.51.100.7': { delay: 5 }, 'hop.example': { delay: 5 }, 'target.example': { delay: 5 } });
+  let ws = await openWs(baseEnv({ set: { edgeIP: '198.51.100.7', hop: { type: 'socks5', host: 'hop.example', port: 1080 }, hopMode: 'only' } }));
+  sendTls(ws, 'target.example');
+  await until(() => log.length);
+  assert.deepEqual(log.map(s => s.hostname), ['hop.example'], '只连出站代理');
+  log = fakeNet({ '198.51.100.7': { delay: 5 }, 'target.example': { delay: 5 } });
+  ws = await openWs(baseEnv({ set: { edgeIP: '198.51.100.7', hopMode: 'only' } }));
+  await sendTls(ws, 'target.example');
+  await until(() => log.some(s => s.written.length));
+  assert.equal(log.find(s => s.written.length).hostname, '198.51.100.7');
+  // 默认出站方式：落地 IP 仍然优先于出站代理（行为不变）
+  log = fakeNet({ '198.51.100.7': { delay: 5 }, 'hop.example': { delay: 5 } });
+  ws = await openWs(baseEnv({ set: { edgeIP: '198.51.100.7', hop: { type: 'socks5', host: 'hop.example', port: 1080 } } }));
+  await sendTls(ws, 'target.example');
+  await until(() => log.some(s => s.written.length));
+  assert.equal(log.find(s => s.written.length).hostname, '198.51.100.7');
+});
+
+test('WS 首帧：请求头完整时，头部 + 大块数据（超过 64KB）照常转发（64KB 的限制只针对还不完整的请求头）', async () => {
+  const log = fakeNet({ 'big.example': { delay: 5 } });
+  const big = vlessReq('big.example', 443, [...TLS_HELLO, ...new Array(70000).fill(7)]);
+  const ws = await openWs(baseEnv());
+  await ws.emit('message', { data: big.buffer });
+  await until(() => log.some(s => s.written.length));
+  assert.equal(ws.closed, null);
+  assert.equal(log[0].written.reduce((n, c) => n + c.byteLength, 0), TLS_HELLO.length + 70000);
+  // 请求头不完整（域名只到一半）：继续等后续分片
+  const head = vlessReq('x'.repeat(200), 443).slice(0, 25);
+  const w2 = await openWs(baseEnv());
+  await w2.emit('message', { data: head.buffer });
+  assert.equal(w2.closed, null, '还在等后续分片');
+});
+
+test('机房 → 地区：台湾 / 澳门归 HK，东南亚 / 南亚 / 大洋洲归 SG，中东 / 非洲 / 南欧 / 东欧归 DE，北欧与英爱各归其地区；美洲与未知机房为 US；每个机房只属于一个地区', () => {
+  const want = { TPE: 'HK', KHH: 'HK', MFM: 'HK', HKG: 'HK', BKK: 'SG', KUL: 'SG', MNL: 'SG', CGK: 'SG', SGN: 'SG', BOM: 'SG', DEL: 'SG', SYD: 'SG', AKL: 'SG',
+    DXB: 'DE', TLV: 'DE', IST: 'DE', JNB: 'DE', CAI: 'DE', LIS: 'DE', ATH: 'DE', CPH: 'DE', OSL: 'SE', ARN: 'SE', BRU: 'NL', AMS: 'NL', TLL: 'FI', HEL: 'FI',
+    DUB: 'GB', EDI: 'GB', LHR: 'GB', KIX: 'JP', GUM: 'JP', ICN: 'KR', PPT: 'US', LAX: 'US', GRU: 'US', YYZ: 'US', XYZ: 'US', '': 'US' };
+  for (const [colo, region] of Object.entries(want)) assert.equal(internals.selectAltRegion(colo), region, colo);
+  const seen = new Map();
+  for (const [region, codes] of Object.entries(internals.COLO_REGIONS)) {
+    for (const c of codes.split(' ')) {
+      assert.match(c, /^[A-Z]{3}$/, region + ' 里的「' + c + '」');
+      assert.ok(!seen.has(c), c + ' 同时出现在 ' + seen.get(c) + ' 与 ' + region);
+      seen.set(c, region);
+    }
+  }
+});
+
+test('目标域名里有空白或控制字符（如 \\r\\n）时拒绝，不会被拼进发给 HTTP 出站代理的 CONNECT 请求', async () => {
+  const log = fakeNet({ 'hop.example': { delay: 5 } });
+  for (const host of ['a.com:443 HTTP/1.1\r\nX-Injected: yes\r\n\r\nGET /', 'bad host.example', 'tab\there.example']) {
+    const ws = await openWs(baseEnv({ set: { hop: { type: 'http', host: 'hop.example', port: 8080 } } }));
+    await ws.emit('message', { data: vlessReq(host, 443, TLS_HELLO).buffer });
+    assert.deepEqual(ws.closed, { code: 1011, reason: '' }, JSON.stringify(host));
+  }
+  assert.equal(log.length, 0, '没有建立任何连接');
+  assert.throws(() => internals.parseVssProtoHeader(new Uint8Array([0, ...uuidBytes, 0, 1, 1, 187, 2, 0, ...TLS_HELLO]), { uuids: [UUID] }), /目标域名不正确/, '空域名');
+});
+
+test('setState 校验出站代理的凭据：用户名与密码要么都有、要么都没有；按 UTF-8 字节数限制在 255 以内（SOCKS5 的长度字段只有 1 个字节）', () => {
+  const hop = (extra) => stateWith({ hop: { type: 'socks5', host: 'hop.example', port: 1080, ...extra } });
+  assert.equal(internals.checkState(hop({})), '');
+  assert.equal(internals.checkState(hop({ user: 'u', pass: '' })), '');
+  assert.equal(internals.checkState(hop({ user: 'é'.repeat(127), pass: 'p' })), '', '254 个字节');
+  assert.equal(internals.checkState(hop({ user: 'u' })), 'hop 不正确', '有用户名没密码');
+  assert.equal(internals.checkState(hop({ pass: 'p' })), 'hop 不正确', '有密码没用户名');
+  assert.equal(internals.checkState(hop({ user: 'é'.repeat(200), pass: 'p' })), 'hop 不正确', '200 个字但 400 个字节');
+  assert.equal(internals.checkState(hop({ user: 'u', pass: 'x'.repeat(256) })), 'hop 不正确');
 });

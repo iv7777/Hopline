@@ -15,7 +15,10 @@ function readAddress(data, view, offset, atyp) {
     const len = view.getUint8(offset);
     need(1 + len);
     const bytes = data.subarray(offset + 1, offset + 1 + len);
-    return { addr: TD.decode(bytes), len: 1 + len };
+    const addr = TD.decode(bytes);
+    // 域名里不能有空白与控制字符：否则经 HTTP 出站代理时会被拼进 CONNECT 请求（如 \r\n 注入额外的请求头）
+    if (!addr || /[\x00-\x20\x7f]/.test(addr)) throw new Error('目标域名不正确');
+    return { addr, len: 1 + len };
   }
   if (atyp === 3) { // IPv6
     need(16);
@@ -79,12 +82,11 @@ function parseVssProtoHeader(data, cfg) {
 }
 
 // DoH 端点池（UDP/DNS → DoH 转换用，使 V2rayNG 关闭「本地 DNS」时远端 DNS 仍可用）
-// Cloudflare 优先（Worker 与其同机房，延迟最低，且用户的查询不必先经过第三方境内解析器），其余按序兜底
+// Cloudflare 优先（Worker 与其同机房，延迟最低），Google 兜底（JSON 接口是 /resolve；/dns-query 只收 RFC 8484 格式，用 name= 查询会返回 400）。
+// 不用境内解析器：这里解析的是用户自己访问的域名，境内解析器既会看到这些查询，回的也是面向境内优化（甚至被污染）的结果
 const DOH_ENDPOINTS = [
   'https://cloudflare-dns.com/dns-query',
-  'https://dns.google/dns-query',
-  'https://dns.alidns.com/resolve',
-  'https://doh.pub/dns-query'
+  'https://dns.google/resolve'
 ];
 // IPv6 字符串 → 16 字节（支持 :: 压缩）
 function ipv6ToBytes(ip) {
