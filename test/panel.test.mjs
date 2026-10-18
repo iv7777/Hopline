@@ -597,8 +597,8 @@ test('登录会话：使用面板时顺延 24 小时（10 分钟内不重复签�
 test('默认配置的订阅：含 XHTTP 节点（.X），不含 IPv6 地址', async () => {
   const env = baseEnv({ CONFIG_KV: kv({ config: fixedNodes('104.16.9.1:443#a\n[2606:4700::1]:443#v6', { enableXhttp: undefined, filter: undefined }) }) });
   const links = await withFetch(nodesFetch, async () => (await (await call(env, `/${UUID}/sub`, { ua: 'v2rayN/7.0' })).text()).split('\n').filter(Boolean));
-  assert.deepEqual(links.map(nameOf), ['a', 'a.X']);
-  assert.ok(/type=xhttp/.test(links[1]));
+  assert.deepEqual(links.map(nameOf), ['a.X', 'a']);   // 同一地址 XHTTP 排在前面
+  assert.ok(/type=xhttp/.test(links[0]));
 });
 
 test('必填环境变量：PATH 未设置 / 非法时所有请求返回 503 设置说明；PATH 首尾斜杠自动去掉', async () => {
@@ -1135,8 +1135,8 @@ test('订阅：TLS ws 节点带 ed=2048、ALPN 随面板下发；多协议时 XH
   const env = baseEnv({ CONFIG_KV: kv({ config: fixedNodes('104.16.9.1:443#dup\n104.16.9.2:443#dup', { enableXhttp: true, alpn: 'h2, http/1.1' }) }) });
   const get = (fmt) => withFetch(nodesFetch, async () => (await call(env, `/${UUID}/sub/${fmt}`, { ua: 'x' })).text());
   const links = (await get('plain')).split('\n').filter(Boolean);
-  assert.deepEqual(links.map(nameOf), ['dup', 'dup.X', 'dup·2', 'dup.X·2']);
-  const [v, x] = links;
+  assert.deepEqual(links.map(nameOf), ['dup.X', 'dup', 'dup.X·2', 'dup·2']);
+  const [x, v] = links;
   assert.match(v, /path=%2F[0-9a-f-]+%3Fed%3D2048&/, 'VLESS ws 带 ed=2048');
   assert.ok(!/ed%3D2048/.test(x), 'XHTTP 不带 ed');
   for (const l of [v, x]) assert.match(l, /&alpn=h2,http\/1\.1(&|#)/, 'ALPN 原样逗号分隔');
@@ -1195,7 +1195,7 @@ test('sing-box：仅启用 XHTTP（无可用节点）时报错，而不是输出
 test('原生地址节点同样遵循多协议命名（XHTTP .X）', async () => {
   const env = baseEnv({ CONFIG_KV: kv({ config: { enableXhttp: true, src: { native: true, prefDomain: false, prefIp: false }, filter: { ipType: ['IPv4'] } } }) });
   const links = (await (await subOf(env, 'plain')).text()).split('\n').filter(Boolean);
-  assert.deepEqual(links.filter(l => nameOf(l).startsWith('原生地址')).map(nameOf), ['原生地址', '原生地址.X']);
+  assert.deepEqual(links.filter(l => nameOf(l).startsWith('原生地址')).map(nameOf), ['原生地址.X', '原生地址']);
 });
 
 test('Trojan 已移除：KV 中遗留的 enableTrojan / trojanPassword 与旧环境变量被忽略，订阅里没有 trojan 节点，配置接口不再返回这些字段', async () => {
@@ -1664,10 +1664,10 @@ test('XHTTP 链接：未设置 ALPN 时显式带 alpn=h2（stream-one 依赖 HTT
     const env = baseEnv({ CONFIG_KV: kv({ config: customCfg({ enableXhttp: true, ...(alpn ? { alpn } : {}) }) }) });
     return (await (await subOf(env, 'plain')).text()).split('\n').filter(Boolean);
   };
-  let [ws, x] = await links();
+  let [x, ws] = await links();
   assert.ok(!/alpn=/.test(ws) && /type=ws/.test(ws), 'WS 节点未设置 ALPN 时不带 alpn 参数');
   assert.match(x, /type=xhttp&mode=stream-one&extra=[^&]+&path=%2F[0-9a-f-]+&alpn=h2(&|#)/);
-  [ws, x] = await links('h2,http/1.1');
+  [x, ws] = await links('h2,http/1.1');
   assert.match(x, /&alpn=h2,http\/1\.1(&|#)/);
   assert.match(ws, /&alpn=h2,http\/1\.1(&|#)/);
 });
