@@ -1,4 +1,4 @@
-/*!Hopline-panel v3.2.3*/
+/*!Hopline-panel v3.2.4*/
 // ============================================================================
 //  Hopline 面板 —— 管理面板 + 订阅生成 · 全新独立编写
 //  ----------------------------------------------------------------------------
@@ -16,7 +16,7 @@
 //  代理的域名、节点路径、密钥在面板「面板设置 → 代理」里填写（保存在 CONFIG_KV）。
 // ============================================================================
 // 面板脚本（Hopline-panel.js）的版本号：用于检测更新与面板里显示。与代理脚本各自编号、各自升版本
-const VERSION = '3.2.3';
+const VERSION = '3.2.4';
 // 更新检测：点击版本号后拉取仓库代码比对版本号；有新版本时返回最新代码供面板复制
 // 版本基准与复制的代码都是仓库 main 分支根目录下的 Hopline-panel.js（只检测面板脚本；代理脚本没有面板，它的版本通过服务绑定的 status() 查看）
 const UPDATE_REPO = 'iv7777/Hopline';
@@ -1857,8 +1857,10 @@ async function buildNodes(cfg, cap = NODE_CAP) {
     const finalPort = Number(port);
     const enVss = cfg['enableVl' + 'ess'];
     const nm = protoNames(name, enVss, cfg.enableXhttp && isTls);
-    if (enVss) nodes.push(vssProtoNode(cfg, server, finalPort, nm.v));
+    // 同一地址的 XHTTP 节点排在 VLESS（WebSocket）前面：默认选第一个节点的客户端会先用 XHTTP。
+    // XHTTP 的数据由运行时原生管道转发，workerd 实测每 MB 下行 CPU 约 0.9ms（WebSocket 约 2.3ms），交互往返约为一半
     if (cfg.enableXhttp && isTls) nodes.push(vssProtoNode(cfg, server, finalPort, nm.x, { type: 'xhttp' }));  // XHTTP 仅 TLS 端口
+    if (enVss) nodes.push(vssProtoNode(cfg, server, finalPort, nm.v));
   };
   // 按源端口（通常 443）下发；关闭「仅 TLS 端口」时，443 节点另追加一个 80 明文端口节点（名称加「·80」）
   const multiPort = (server, port, name) => {
