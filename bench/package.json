@@ -1,0 +1,13 @@
+{
+  "name": "hopline-proxy-cpu-bench",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "node run.mjs",
+    "profile": "node profile.mjs"
+  },
+  "dependencies": {
+    "workerd": "1.20261018.1",
+    "ws": "^8.18.0"
+  }
+}

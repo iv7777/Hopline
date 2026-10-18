@@ -310,6 +310,7 @@
 | `build.mjs` | 构建脚本：按入口文件的清单拼接 `src/worker/*.js`，把登录页、面板页面（HTML + CSS + JS 合并，按语言各自去注释）与 Clash 模板以 `String.raw` 模板字符串内联进面板脚本，顶部加版本横幅后原样输出（不压缩、不重命名）。两个脚本各自编号：横幅分别取自 `src/worker/version-panel.js` 与 `src/worker/version-proxy.js` 里的 `VERSION` |
 | `eslint.config.mjs` | 静态检查配置（`npm run lint`）：两个产物分别检查，任一脚本引用了另一个脚本才有的名字（`no-undef`）或留下用不到的代码（`no-unused-vars`）都会报错 |
 | `test/` | `node:test` 测试，`proxy.test.mjs`（代理）与 `panel.test.mjs`（面板），模拟 KV 与 Workers 运行时，无需安装依赖 |
+| `bench/` | 代理 CPU 基准测试：在真实的 workerd 里运行 `Hopline-proxy.js`，测每个请求 / 每条连接 / 每 MB 的 CPU，并可做 V8 CPU 采样；依赖（workerd、ws）只装在 `bench/` 里，不在 CI 中运行，用法见 [`bench/README.md`](bench/README.md) |
 | `.github/workflows/ci.yml` | 每次推送运行：两个产物与 `src/` 同步检查 → 语法检查 → lint → 测试 |
 | `obfuscate.mjs` | 在 `Hopline-proxy.js` 基础上用 javascript-obfuscator（通过 npx 获取，版本固定）做改名与压缩空白，产出 `obf_Hopline-proxy.js`（非部署必需，供不想公开可读源码的场景用）。代理整个就是 WebSocket / XHTTP 数据面，因此不加字符串数组 / 控制流平坦化等有运行时开销的变换，避免持续代理连接下触发 Worker CPU 时间超限。面板脚本没有混淆版 |
 | `.github/workflows/obfuscate.yml` | 推送到 `main` 且 `Hopline-proxy.js` 有变化时自动重新生成并提交 `obf_Hopline-proxy.js`；也可手动触发 |
